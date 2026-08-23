@@ -44,8 +44,12 @@ pixel diff ~3-4/255, which is the rasterizer floor (see below). Widgets live in
    `star_half`, `my_location`, `arrow_outward` match closely. True glyph parity
    requires bundling the Material Symbols Rounded font and mapping codepoints.
 6. **CSS `border-top` on a rounded box is a tapered wedge**, not a straight
-   strip: it wraps the top corner arcs to ~45 deg. Implemented as a custom
-   BoxPainter stroking the top path; a plain 2px Container reads clearly wrong.
+   strip. Exact Chrome geometry: with zero-width side borders the whole corner
+   belongs to the top border, and the painted region is the area between the
+   outer circular arc (r) and an inner *elliptical* arc (rx = r, ry = r - t),
+   so the border is t thick at the top and tapers to zero exactly where the
+   sides begin. Implemented as a filled Path in a custom BoxPainter; verified
+   pixel-identical to the reference (straight run diff 0, corners AA-only).
 7. **CSS `linear-gradient(135deg, ...)` is not `Alignment.topLeft ->
    bottomRight`** on non-square boxes (angle vs corner semantics). Visually
    negligible here; left as-is.
