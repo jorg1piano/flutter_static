@@ -108,7 +108,11 @@ Future<void> _serve(Stories stories, int port) async {
         await response.close();
       } else if (path == '/' || path == '/index.html') {
         response.headers.contentType = ContentType.html;
-        response.write(_indexHtml);
+        response.write(
+          _indexHtml
+              .replaceFirst('{{GROUPS}}', _galleryGroupsHtml(stories.build()))
+              .replaceFirst('{{VERSION}}', '$_version'),
+        );
         await response.close();
       } else if (path == '/events') {
         response.bufferOutput = false;
@@ -187,6 +191,35 @@ Future<Uint8List> _capture(String id) async {
   return bytes!.buffer.asUint8List();
 }
 
+/// Server-rendered grid so the initial document contains every <img>:
+/// the browser load event then waits for them, which makes headless
+/// screenshots deterministic. The inline script only re-renders on /events.
+String _galleryGroupsHtml(List<Story> stories) {
+  final groups = <String, List<Story>>{};
+  for (final story in stories) {
+    groups.putIfAbsent(story.id.split('/').first, () => []).add(story);
+  }
+  final buffer = StringBuffer();
+  groups.forEach((group, members) {
+    buffer.write('<h2>${_escape(group)}</h2><div class="grid">');
+    for (final story in members) {
+      final id = _escape(story.id);
+      buffer.write(
+        '<figure><img src="/story/$id.png?v=$_version" alt="$id">'
+        '<figcaption>$id</figcaption></figure>',
+      );
+    }
+    buffer.write('</div>');
+  });
+  return buffer.toString();
+}
+
+String _escape(String s) => s
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+
 /// Story gallery served at / and /index.html: every render in a grid,
 /// grouped by the id's first path segment, live-reloading via /events.
 const _indexHtml = """
@@ -202,7 +235,7 @@ img{display:block;max-width:420px;height:auto;border-radius:8px;background:#0A0B
 figcaption{margin-top:8px;font-size:12px;color:#6B6E7A;font-family:ui-monospace,monospace}
 </style></head><body>
 <h1>flutter_static</h1>
-<div id="groups"></div>
+<div id="groups">{{GROUPS}}</div>
 <script>
 async function load(v){
   const idx = await (await fetch('/index.json')).json();
@@ -227,7 +260,6 @@ async function load(v){
     root.appendChild(grid);
   }
 }
-load();
 // Automation (headless screenshots, drivers) waits for network idle;
 // the ever-open SSE stream would hang it, so only humans get live reload.
 if (!navigator.webdriver)
