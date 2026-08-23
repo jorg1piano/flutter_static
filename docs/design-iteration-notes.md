@@ -82,3 +82,19 @@ pixel diff ~3-4/255, which is the rasterizer floor (see below). Widgets live in
 14. Tracking corrections are per-style and non-linear across font sizes
     (Chrome's variable-font optical sizing): measure per band with the
     shift-correlation script rather than scaling one value by em.
+
+## Round 3 (Torget widgets), operational notes
+
+15. **Outer widths can differ per card inside one design file**: padded
+    content-box cards (378 + 15px padding) are 408 outer while an unpadded
+    card is 378. Check each card's own padding before sizing the story.
+16. **The diff floor scales with bold-text density**: a card dominated by a
+    21px Black title floors at ~4.4/255 while sparse cards floor at ~2.3.
+    Confirm suspicious cards by zooming glyph crops before chasing ghosts;
+    positions can be pixel-identical while the amplified heatmap looks red.
+17. Reference screenshots are only as good as their font loading: give
+    headless Chrome a generous --virtual-time-budget and re-shoot before
+    debugging a "wider text" mismatch. (One case here turned out to be an
+    amplified-AA illusion, but the check is cheap.)
+18. Small design-project assets (this avatar was 2.8KB) fetch fine through
+    DesignSync base64; only large binaries hit the 256KiB truncation.
