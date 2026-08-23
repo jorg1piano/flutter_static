@@ -59,3 +59,26 @@ pixel diff ~3-4/255, which is the rasterizer floor (see below). Widgets live in
 9. Diff-metric caveat: mean pixel diff rewards misaligned-but-blurry over
    crisp-but-one-word-different; it dropped when wraps were wrong and rose
    when they were fixed. Use it to find regions, not as the target.
+
+## Round 2 (Legg til bilde-kort), two more systematic converters
+
+10. **Material's DefaultTextStyle leaks `height: 1.43` into every Text that
+    doesn't set its own height** (style merge via `inherit: true`). An 11px
+    label becomes 15.7px tall instead of Inter's natural 13.3, shifting every
+    row below it. CSS `line-height: normal` for Inter = 1.21; set
+    `height: 1.21` explicitly on any text the CSS leaves at normal.
+11. **Flutter's `height` multiplier distributes extra leading proportionally
+    (glyphs sink); CSS splits it half above, half below.** Add
+    `leadingDistribution: TextLeadingDistribution.even` to every style that
+    sets `height` when matching CSS.
+12. **An icon `<span>` in a flex row occupies fontSize x ~1.222 (Material
+    Symbols line box), not fontSize** - and that sets the row height. An 18px
+    icon made Chrome's chip 44px tall where Flutter's exact 18px `Icon` gave
+    40. Wrap `Icon` in `SizedBox(height: size * 1.222)` where the icon is the
+    tallest row child.
+13. **CSS default `box-sizing: content-box` bites on fixed widths**:
+    `width: 346 + padding: 15` is a 376px-wide card; `76px + 2px dashed
+    border` is an 80px avatar. Translate outer sizes, not the CSS numbers.
+14. Tracking corrections are per-style and non-linear across font sizes
+    (Chrome's variable-font optical sizing): measure per band with the
+    shift-correlation script rather than scaling one value by em.
