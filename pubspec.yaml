@@ -1,14 +1,19 @@
 name: flutter_static
-description: "A new Flutter project."
+description: "Widget story catalog: PNG renders and change events over HTTP."
 publish_to: 'none'
 version: 0.1.0+1
 
 environment:
   sdk: ^3.12.2
 
+executables:
+  flutter_static:
+
 dependencies:
+  args: ^2.7.0
   flutter:
     sdk: flutter
+  watcher: ^1.1.0
 
 dev_dependencies:
   flutter_test:
