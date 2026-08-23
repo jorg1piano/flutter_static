@@ -98,3 +98,41 @@ pixel diff ~3-4/255, which is the rasterizer floor (see below). Widgets live in
     amplified-AA illusion, but the check is cheap.)
 18. Small design-project assets (this avatar was 2.8KB) fetch fine through
     DesignSync base64; only large binaries hit the 256KiB truncation.
+
+## Round 4 (Ferdig-kort), flex translation bug + ops traps
+
+19. **CSS `margin-left: auto` must translate to a single Expanded, never
+    Flexible + Spacer.** Two flex children split the free space by factor;
+    a loose-fit Flexible's unused allocation is NOT redistributed - it ends
+    up after the last child (MainAxisAlignment.start), so the "pinned right"
+    text lands mid-row. The status-line clock sat 98 logical px left of the
+    edge while the story's mean diff read 0.60/255 - a small displaced text
+    patch dilutes below both the mean floor and the 8/255 band flag. The
+    amplified heatmap showed the glyphs twice; band means alone would never
+    have caught it. Always eyeball the heatmap.
+20. Round-4 tracking corrections (static Inter vs Chrome variable):
+    body 13px/w400: -0.05 (wrap flips somewhere in (-0.10, -0.05]; measure
+    by watching where line 2 starts, the band-end numbers can mislead) ·
+    button 15.5px/w800: -0.15 (interpolated from ink widths at -0.31 and 0) ·
+    receipt values 15px/w800: -0.2. Positive design trackings (.06em, .08em
+    on 10.5/9.5px labels) translate exactly; no correction needed.
+21. **Chrome renders 13px/line-height-1.5 body ink 1 logical px lower than
+    Flutter's even leading distribution predicts**, and switching the style
+    to proportional distribution changes nothing (measured ink identical).
+    Block positions before/after the paragraph still match exactly, so it's
+    Chrome's within-line-box baseline rounding. Accepted: 1px, invisible in
+    crops, worth ~2/255 on the story mean.
+22. **CSS `border-left` on a rounded box is the border-top wedge rotated**:
+    both left corners belong to the left border, painted between the outer
+    circular arc (r) and an inner elliptical arc (rx = r - t, ry = r).
+    `CssLeftBorder` in ui_library, same construction as `CssTopBorder`.
+    Layout-wise the 3px border adds to padding-left (content-box).
+23. **Ops trap: a stale catalog app from an earlier session holds :8474.**
+    The new runner's server dies on bind ("Address already in use" scrolls
+    by in the log) while its app and hot reload run fine - so renders hit
+    the zombie serving old code and edits "don't apply". Kill port holders
+    (`lsof -ti tcp:8474 | xargs kill`) before `flutter_static run`.
+24. **The runner can silently lose its app** ("Lost connection to device"
+    mid-session); the server keeps answering but subsequent edits stop
+    landing. If a render stops reflecting saves, check the run log tail and
+    restart the runner.

@@ -228,7 +228,10 @@ async function load(v){
   }
 }
 load();
-new EventSource('/events').onmessage = (e) => load(JSON.parse(e.data).version);
+// Automation (headless screenshots, drivers) waits for network idle;
+// the ever-open SSE stream would hang it, so only humans get live reload.
+if (!navigator.webdriver)
+  new EventSource('/events').onmessage = (e) => load(JSON.parse(e.data).version);
 </script>
 </body></html>
 """;
