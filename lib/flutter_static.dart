@@ -106,6 +106,10 @@ Future<void> _serve(Stories stories, int port) async {
           }),
         );
         await response.close();
+      } else if (path == '/' || path == '/index.html') {
+        response.headers.contentType = ContentType.html;
+        response.write(_indexHtml);
+        await response.close();
       } else if (path == '/events') {
         response.bufferOutput = false;
         response.headers.contentType = ContentType('text', 'event-stream');
@@ -182,3 +186,49 @@ Future<Uint8List> _capture(String id) async {
   image.dispose();
   return bytes!.buffer.asUint8List();
 }
+
+/// Story gallery served at / and /index.html: every render in a grid,
+/// grouped by the id's first path segment, live-reloading via /events.
+const _indexHtml = """
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>flutter_static</title>
+<style>
+body{margin:0;background:#0A0B0D;color:#E2E4E9;font:14px system-ui,sans-serif;padding:32px}
+h1{font-size:18px;margin:0 0 8px}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#9B9FAB;margin:32px 0 12px}
+.grid{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start}
+figure{margin:0;background:#131518;border-radius:12px;padding:12px}
+img{display:block;max-width:420px;height:auto;border-radius:8px;background:#0A0B0D}
+figcaption{margin-top:8px;font-size:12px;color:#6B6E7A;font-family:ui-monospace,monospace}
+</style></head><body>
+<h1>flutter_static</h1>
+<div id="groups"></div>
+<script>
+async function load(v){
+  const idx = await (await fetch('/index.json')).json();
+  const groups = {};
+  for (const s of idx.stories){
+    const g = s.id.split('/')[0];
+    (groups[g] ??= []).push(s);
+  }
+  const root = document.getElementById('groups');
+  root.innerHTML = '';
+  for (const [g, stories] of Object.entries(groups)){
+    const h = document.createElement('h2'); h.textContent = g; root.appendChild(h);
+    const grid = document.createElement('div'); grid.className = 'grid';
+    for (const s of stories){
+      const f = document.createElement('figure');
+      const img = document.createElement('img');
+      img.src = s.png + '?v=' + (v ?? idx.version);
+      img.alt = s.id;
+      const c = document.createElement('figcaption'); c.textContent = s.id;
+      f.append(img, c); grid.appendChild(f);
+    }
+    root.appendChild(grid);
+  }
+}
+load();
+new EventSource('/events').onmessage = (e) => load(JSON.parse(e.data).version);
+</script>
+</body></html>
+""";
