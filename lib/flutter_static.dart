@@ -41,6 +41,9 @@ void _prewarm(Stories stories) {
   Future(() async {
     await Future<void>.delayed(const Duration(milliseconds: 300));
     for (final story in stories.build()) {
+      if (_needsWindow.contains(story.id)) _mountWindowStory(story);
+    }
+    for (final story in stories.build()) {
       if (_version != version) return;
       // Let interactive requests drain first; warming is idle work.
       while (_foregroundWaiters > 0) {
@@ -55,8 +58,22 @@ void _prewarm(Stories stories) {
   });
 }
 
-final _boundaryKey = GlobalKey();
-final _currentId = ValueNotifier<String?>(null);
+/// Stories mounted in the window's Stack (the ones that need a real View).
+/// Each paints into its own RepaintBoundary layer, so any of them can be
+/// snapshotted regardless of stacking order. Mounts persist across reloads:
+/// reassemble preserves State, so entrance animations never replay and the
+/// one-time settle stays paid.
+final _windowStories = ValueNotifier<List<Story>>([]);
+final _windowKeys = <String, GlobalKey>{};
+Future<void>? _windowSettled;
+
+void _mountWindowStory(Story story) {
+  if (_windowKeys.containsKey(story.id)) return;
+  _windowKeys[story.id] = GlobalKey();
+  _windowStories.value = [..._windowStories.value, story];
+  _windowSettled = null; // new mount: settle once for the whole batch
+}
+
 int _version = 0;
 final _renderCache = <String, Uint8List>{};
 int _renderCacheVersion = -1;
@@ -101,28 +118,29 @@ class _CatalogAppState extends State<_CatalogApp> {
       debugShowCheckedModeBanner: false,
       home: Scaffold(
         body: Center(
-          child: ValueListenableBuilder<String?>(
-            valueListenable: _currentId,
-            builder: (context, id, _) {
-              final all = widget.stories.build();
-              if (all.isEmpty) return const Text('no stories registered');
-              final story = all.firstWhere(
-                (s) => s.id == id,
-                orElse: () => all.first,
-              );
-              // Decouple story constraints from the window: a story larger
-              // than the window must still lay out (and capture) at its
-              // natural size, not clamp to the viewport.
-              return OverflowBox(
-                minWidth: 0,
-                minHeight: 0,
-                maxWidth: double.infinity,
-                maxHeight: double.infinity,
+          child: ValueListenableBuilder<List<Story>>(
+            valueListenable: _windowStories,
+            builder: (context, mounted, _) {
+              if (mounted.isEmpty) return const Text('flutter_static');
+              return Stack(
                 alignment: Alignment.center,
-                child: RepaintBoundary(
-                  key: _boundaryKey,
-                  child: story.builder(),
-                ),
+                children: [
+                  for (final story in mounted)
+                    // Decouple story constraints from the window: a story
+                    // larger than the window must still lay out (and
+                    // capture) at its natural size.
+                    OverflowBox(
+                      minWidth: 0,
+                      minHeight: 0,
+                      maxWidth: double.infinity,
+                      maxHeight: double.infinity,
+                      alignment: Alignment.center,
+                      child: RepaintBoundary(
+                        key: _windowKeys[story.id],
+                        child: story.builder(),
+                      ),
+                    ),
+                ],
               );
             },
           ),
@@ -250,7 +268,7 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
 final _needsWindow = <String>{};
 
 Future<Uint8List> _capture(Story story) async {
-  if (_needsWindow.contains(story.id)) return _captureOnWindow(story.id);
+  if (_needsWindow.contains(story.id)) return _captureOnWindow(story);
   try {
     return await _captureOffscreen(story);
   } catch (e) {
@@ -261,7 +279,7 @@ Future<Uint8List> _capture(Story story) async {
       'flutter_static: offscreen capture failed for ${story.id} ($e); '
       'falling back to window capture',
     );
-    return _captureOnWindow(story.id);
+    return _captureOnWindow(story);
   }
 }
 
@@ -387,23 +405,22 @@ Future<Uint8List> _captureOffscreen(Story story) async {
   }
 }
 
-Future<Uint8List> _captureOnWindow(String id) async {
-  _currentId.value = id;
+Future<Uint8List> _captureOnWindow(Story story) async {
+  _mountWindowStory(story);
+  await (_windowSettled ??= _settleWindow());
+  final boundary =
+      _windowKeys[story.id]!.currentContext!.findRenderObject()
+          as RenderRepaintBoundary;
+  final image = await boundary.toImage(pixelRatio: 2);
+  final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
+  image.dispose();
+  return bytes!.buffer.asUint8List();
+}
+
+/// One settle for the whole mounted batch: entrance animations of newly
+/// mounted stories run concurrently, bounded by a single budget.
+Future<void> _settleWindow() async {
   final binding = WidgetsBinding.instance;
-  // Pump frames until the tree settles: implicit animations (e.g.
-  // CircleAvatar's 200ms theme-change tween) keep scheduling frames until
-  // they finish, and capturing the first frame would freeze them at t=0.
-  // The deadline bounds stories that animate forever.
-  //
-  // An occluded or hidden window gets no vsync on macOS, so once a natural
-  // frame times out we pump frames manually with an advancing timestamp.
-  // (Warm-up frames are no good here: they reuse the last frame's timestamp,
-  // so tickers see zero elapsed time and animations never progress.)
-  // A hidden app has framesEnabled == false: scheduleFrame() is silently
-  // ignored, so hasScheduledFrame can't be trusted as a settle signal.
-  // transientCallbackCount counts active tickers and works either way.
-  // Short budget: fallback stories are usually entrance-animated full
-  // screens; 700ms reaches a presentable state without stalling the queue.
   final deadline = DateTime.now().add(const Duration(milliseconds: 700));
   var noVsync = !binding.framesEnabled;
   var synthetic = binding.currentSystemFrameTimeStamp;
@@ -422,12 +439,6 @@ Future<Uint8List> _captureOnWindow(String id) async {
     }
   } while ((binding.hasScheduledFrame || binding.transientCallbackCount > 0) &&
       DateTime.now().isBefore(deadline));
-  final boundary =
-      _boundaryKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
-  final image = await boundary.toImage(pixelRatio: 2);
-  final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
-  image.dispose();
-  return bytes!.buffer.asUint8List();
 }
 
 /// Server-rendered grid so the initial document contains every <img>:
