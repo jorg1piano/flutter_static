@@ -606,7 +606,7 @@ String _storyDetailPage(List<Story> all, int index) {
   final next = all[(index + 1) % all.length].id;
   return '''
 <!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>$id - flutter_static</title>
+<html><head><meta charset="utf-8"><base href="/live/"><title>$id - flutter_static</title>
 <style>
 body{margin:0;background:#0A0B0D;color:#E2E4E9;font:14px system-ui,sans-serif;padding:32px}
 a{color:#9B9FAB;text-decoration:none}a:hover{color:#E2E4E9}
