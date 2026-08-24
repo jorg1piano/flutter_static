@@ -330,11 +330,28 @@ class _BuildWebCommand extends Command<int> {
     }
     if (!Directory('web').existsSync()) {
       stdout.writeln('flutter_static: adding web platform...');
-      final create = await Process.run('flutter', [
+      var create = await Process.run('flutter', [
         'create',
         '--platforms=web',
         '.',
       ]);
+      if (create.exitCode != 0) {
+        // Projects with mixed org identifiers need --org to be explicit.
+        final ambiguous = RegExp(
+          r'Ambiguous organization in existing files: \{([^,}]+)',
+        ).firstMatch('${create.stderr}${create.stdout}');
+        if (ambiguous != null) {
+          final org = ambiguous.group(1)!.trim();
+          stdout.writeln('flutter_static: retrying with --org $org');
+          create = await Process.run('flutter', [
+            'create',
+            '--platforms=web',
+            '--org',
+            org,
+            '.',
+          ]);
+        }
+      }
       if (create.exitCode != 0) {
         stderr.writeln(create.stderr);
         return create.exitCode;
