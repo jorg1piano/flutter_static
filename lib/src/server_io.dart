@@ -9,7 +9,18 @@ import 'package:flutter/material.dart';
 import 'story.dart';
 import 'package:flutter/rendering.dart';
 
-void runFlutterStatic(Stories stories, {int port = 8474}) {
+/// Ports, overridable at build time (flutter_static run --port/--web-port
+/// passes them as dart-defines).
+const _catalogPort = int.fromEnvironment(
+  'FLUTTER_STATIC_PORT',
+  defaultValue: 8474,
+);
+const _webDevPort = int.fromEnvironment(
+  'FLUTTER_STATIC_WEB_PORT',
+  defaultValue: 8476,
+);
+
+void runFlutterStatic(Stories stories, {int port = _catalogPort}) {
   runApp(_CatalogApp(stories: stories));
   _serve(stories, port);
   _prewarm(stories);
@@ -81,6 +92,26 @@ void _mountWindowStories(Iterable<Story> stories) {
 void _mountWindowStory(Story story) => _mountWindowStories([story]);
 
 int _version = 0;
+
+/// Bumped by the CLI (POST /web-reloaded) when the live web dev server
+/// finishes a hot restart, with the outcome it reported.
+int _webVersion = 0;
+String _webStatus = '';
+
+String _eventData() =>
+    '{"version": $_version, "web": $_webVersion, "webStatus": "$_webStatus"}';
+
+void _broadcastEvent() {
+  for (final client in _eventClients) {
+    try {
+      client.write('data: ${_eventData()}\n\n');
+      client.flush();
+    } catch (_) {
+      // Dead client; removed by its done handler.
+    }
+  }
+}
+
 final _renderCache = <String, Uint8List>{};
 int _renderCacheVersion = -1;
 String _lastTrace = '';
@@ -108,14 +139,7 @@ class _CatalogAppState extends State<_CatalogApp> {
     super.reassemble();
     _version++;
     _prewarm(widget.stories);
-    for (final client in _eventClients) {
-      try {
-        client.write('data: {"version": $_version}\n\n');
-        client.flush();
-      } catch (_) {
-        // Dead client; removed by its done handler.
-      }
-    }
+    _broadcastEvent();
   }
 
   @override
@@ -243,10 +267,17 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         response.bufferOutput = false;
         response.headers.contentType = ContentType('text', 'event-stream');
         response.headers.set('Cache-Control', 'no-cache');
-        response.write('data: {"version": $_version}\n\n');
+        response.write('data: ${_eventData()}\n\n');
         response.flush();
         _eventClients.add(response);
         response.done.whenComplete(() => _eventClients.remove(response));
+      } else if (path == '/web-reloaded') {
+        final status = request.uri.queryParameters['status'] ?? '';
+        _webStatus = RegExp(r'^[a-z]+$').hasMatch(status) ? status : '';
+        _webVersion++;
+        _broadcastEvent();
+        response.statusCode = HttpStatus.noContent;
+        await response.close();
       } else if (path.startsWith('/story/') && path.endsWith('.png')) {
         final id = path.substring(
           '/story/'.length,
@@ -273,10 +304,20 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
           response.statusCode = HttpStatus.notFound;
           await response.close();
         } else {
+          // A running dev server (flutter_static run --live) beats the
+          // static /live build: it hot reloads. The dev page is embedded
+          // cross-origin in an iframe, so the wasm isolation headers must
+          // stay off in that mode (the dev build is JS and needs neither).
+          final liveDev = await _liveDevAvailable();
           response.headers.contentType = ContentType.html;
-          response.headers.set('Cross-Origin-Opener-Policy', 'same-origin');
-          response.headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
-          response.write(_storyDetailPage(all, index));
+          if (!liveDev) {
+            response.headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+            response.headers.set(
+              'Cross-Origin-Embedder-Policy',
+              'require-corp',
+            );
+          }
+          response.write(_storyDetailPage(all, index, liveDev: liveDev));
           await response.close();
         }
       } else if (path.startsWith('/live/') || path == '/live') {
@@ -318,6 +359,30 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
 /// View.of has no answer in an offscreen tree). Routed directly on later
 /// renders instead of re-attempting offscreen.
 final _needsWindow = <String>{};
+
+/// Whether the hot-reloading web dev server (flutter_static run --live)
+/// answers on the web dev port. Probed at most every few seconds.
+var _liveDevUp = false;
+var _liveDevChecked = DateTime.fromMillisecondsSinceEpoch(0);
+Future<bool> _liveDevAvailable() async {
+  final now = DateTime.now();
+  if (now.difference(_liveDevChecked) < const Duration(seconds: 3)) {
+    return _liveDevUp;
+  }
+  _liveDevChecked = now;
+  try {
+    final socket = await Socket.connect(
+      '127.0.0.1',
+      _webDevPort,
+      timeout: const Duration(milliseconds: 300),
+    );
+    socket.destroy();
+    _liveDevUp = true;
+  } catch (_) {
+    _liveDevUp = false;
+  }
+  return _liveDevUp;
+}
 
 /// The consumer project root, derived from the debug binary's location
 /// (`<project>/build/macos/.../app`); the server process's cwd is not the
@@ -598,12 +663,17 @@ Future<void> _settleWindow() async {
       DateTime.now().isBefore(deadline));
 }
 
-String _storyDetailPage(List<Story> all, int index) {
+String _storyDetailPage(List<Story> all, int index, {required bool liveDev}) {
   final story = all[index];
   final id = _escape(story.id);
   final group = _escape(story.id.split('/').first);
   final prev = all[(index - 1 + all.length) % all.length].id;
   final next = all[(index + 1) % all.length].id;
+  final live = liveDev
+      ? '<iframe id="devframe" '
+            'src="http://localhost:$_webDevPort/?storyId=${Uri.encodeComponent(story.id)}" '
+            'allow="clipboard-write"></iframe>'
+      : '<div id="host"></div>';
   return '''
 <!DOCTYPE html>
 <html><head><meta charset="utf-8"><base href="/live/"><title>$id - flutter_static</title>
@@ -612,36 +682,74 @@ body{margin:0;background:#0A0B0D;color:#E2E4E9;font:14px system-ui,sans-serif;pa
 a{color:#9B9FAB;text-decoration:none}a:hover{color:#E2E4E9}
 h1{font-size:16px;margin:12px 0 24px;font-family:ui-monospace,monospace}
 .nav{font-size:12px;display:flex;gap:16px}
-section{margin:0 0 28px}
+.cols{display:flex;gap:28px;align-items:flex-start;flex-wrap:wrap}
+.cols section{margin:0;flex:1 1 460px;min-width:min(460px,100%)}
 section h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#6B6E7A;margin:0 0 10px}
-.png{background:#131518;border-radius:12px;padding:16px;display:inline-block}
+.png{background:#131518;border-radius:12px;padding:16px;display:inline-block;max-width:100%}
 .png img{display:block;max-width:min(840px,100%);height:auto;border-radius:8px}
-#live{background:#131518;border-radius:12px;padding:16px;min-height:120px;display:flex;align-items:center;justify-content:center}
+#live{background:#131518;border-radius:12px;padding:16px;min-height:120px;display:flex;align-items:center;justify-content:center;resize:vertical;overflow:hidden}
 #live .hint{color:#6B6E7A;font-size:12.5px}
-#host{width:100%;min-height:120px}
+#host{width:100%;height:100%;min-height:120px}
+#devframe{border:0;width:100%;height:100%;min-height:120px;border-radius:8px;background:#131518}
 </style></head><body>
 <div class="nav"><a href="/">&larr; alle</a><a href="/$group">$group</a>
 <a href="/story/${_escape(prev)}">&larr; forrige</a><a href="/story/${_escape(next)}">neste &rarr;</a></div>
 <h1>$id</h1>
+<div class="cols">
 <section><h2>Render</h2>
 <a class="png" href="/story/$id.png"><img src="/story/$id.png?v=$_version" alt="$id"></a></section>
-<section><h2>Live</h2><div id="live"><div id="host"></div></div></section>
+<section><h2>Live${liveDev ? ' (hot reload)' : ''}</h2><div id="live">$live</div></section>
+</div>
 <script>
 const STORY = '$id';
+const LIVE_DEV = $liveDev;
 document.addEventListener('keydown', (e) => {
   if (e.key === 'ArrowLeft') location.href = '/story/${_escape(prev)}';
   if (e.key === 'ArrowRight') location.href = '/story/${_escape(next)}';
 });
-fetch('/live/flutter_bootstrap.js', {method: 'HEAD'}).then((r) => {
-  if (!r.ok) throw 0;
-  window._flutterStaticStory = STORY;
-  const s = document.createElement('script');
-  s.src = '/live/flutter_bootstrap.js';
-  document.body.appendChild(s);
-}).catch(() => {
-  document.getElementById('live').innerHTML =
-    '<div class="hint">Ingen web-bygg enn&aring; - kj&oslash;r flutter_static build-web for &aring; f&aring; en interaktiv versjon her.</div>';
-});
+// The PNG knows the story's real size (rendered at 2x): give the live view
+// the same logical height so tall stories are not squeezed into a strip.
+const img = document.querySelector('.png img');
+const liveBox = document.getElementById('live');
+const sizeLive = () => {
+  if (img.naturalHeight) {
+    liveBox.style.height = Math.max(152, img.naturalHeight / 2 + 32) + 'px';
+  }
+};
+img.addEventListener('load', sizeLive);
+sizeLive();
+if (!navigator.webdriver) {
+  // Keep the PNG in sync with hot reloads. The live frame: when the dev
+  // server had this page as a client it hot restarted the app in place
+  // ('restarted'); when it only recompiled, reload the frame to fetch the
+  // new bundle. A static /live build cannot change underneath us.
+  let seen = $_version, webSeen = $_webVersion;
+  new EventSource('/events').onmessage = (e) => {
+    const d = JSON.parse(e.data);
+    if (d.version !== seen) {
+      seen = d.version;
+      img.src = '/story/' + STORY + '.png?v=' + d.version;
+    }
+    if (LIVE_DEV && d.web !== webSeen) {
+      webSeen = d.web;
+      const frame = document.getElementById('devframe');
+      frame.style.outline = d.webStatus === 'failed' ? '2px solid #E5484D' : '';
+      if (d.webStatus === 'recompiled') frame.src = frame.src;
+    }
+  };
+}
+if (!LIVE_DEV) {
+  fetch('/live/flutter_bootstrap.js', {method: 'HEAD'}).then((r) => {
+    if (!r.ok) throw 0;
+    window._flutterStaticStory = STORY;
+    const s = document.createElement('script');
+    s.src = '/live/flutter_bootstrap.js';
+    document.body.appendChild(s);
+  }).catch(() => {
+    document.getElementById('live').innerHTML =
+      '<div class="hint">Ingen web-bygg enn&aring; - kj&oslash;r flutter_static build-web for &aring; f&aring; en interaktiv versjon her.</div>';
+  });
+}
 </script>
 </body></html>
 ''';

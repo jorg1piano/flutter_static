@@ -38,7 +38,21 @@ class _RunCommand extends Command<int> {
         defaultsTo: 'story/main.dart',
         help: 'Entry point that calls runFlutterStatic().',
       )
-      ..addOption('device', abbr: 'd', defaultsTo: 'macos');
+      ..addOption('device', abbr: 'd', defaultsTo: 'macos')
+      ..addOption('port', defaultsTo: '8474', help: 'Catalog server port.')
+      ..addOption(
+        'web-port',
+        defaultsTo: '8476',
+        help: 'Port for the live web dev server.',
+      )
+      ..addFlag(
+        'live',
+        defaultsTo: true,
+        help:
+            'Also run a hot-reloading web dev server that the story detail '
+            'pages embed as the live view. Needs a one-time '
+            'flutter_static build-web to scaffold web support.',
+      );
   }
 
   @override
@@ -63,6 +77,8 @@ class _RunCommand extends Command<int> {
       );
       return 1;
     }
+    _port = argResults!['port'] as String;
+    final webPort = argResults!['web-port'] as String;
     final pidFile = File('.dart_tool/flutter_static.pid');
     pidFile.parent.createSync(recursive: true);
     final child = await Process.start('flutter', [
@@ -71,14 +87,55 @@ class _RunCommand extends Command<int> {
       argResults!['device'] as String,
       '-t',
       target,
+      '--dart-define=FLUTTER_STATIC_PORT=$_port',
+      '--dart-define=FLUTTER_STATIC_WEB_PORT=$webPort',
       '--pid-file',
       pidFile.path,
     ], mode: ProcessStartMode.inheritStdio);
-    _watchSources(pidFile);
-    return child.exitCode;
+    final webPidFile = File('.dart_tool/flutter_static_web.pid');
+    Process? webChild;
+    final webTarget =
+        argResults!['live'] as bool &&
+            File('story/web_main.dart').existsSync() &&
+            Directory('web').existsSync()
+        ? _linkedWebTarget()
+        : null;
+    if (webTarget != null) {
+      stdout.writeln(
+        'flutter_static: starting live web dev server on :$webPort',
+      );
+      webChild = await Process.start('flutter', [
+        'run',
+        '-d',
+        'web-server',
+        '--web-port',
+        webPort,
+        '-t',
+        webTarget,
+        '--pid-file',
+        webPidFile.path,
+      ]);
+      // Not inheritStdio: the macOS run owns the terminal; surface the web
+      // tool's output line-prefixed instead.
+      webChild.stdout
+          .transform(const SystemEncoding().decoder)
+          .transform(const LineSplitter())
+          .listen((l) {
+            stdout.writeln('[web] $l');
+            _onWebOutput(l, webPidFile);
+          });
+      webChild.stderr
+          .transform(const SystemEncoding().decoder)
+          .transform(const LineSplitter())
+          .listen((l) => stderr.writeln('[web] $l'));
+    }
+    _watchSources(pidFile, webChild == null ? null : webPidFile);
+    final code = await child.exitCode;
+    webChild?.kill();
+    return code;
   }
 
-  void _watchSources(File pidFile) {
+  void _watchSources(File pidFile, File? webPidFile) {
     final roots = _localPackageRoots();
     Timer? debounce;
     void watchRoot(String root) {
@@ -93,11 +150,10 @@ class _RunCommand extends Command<int> {
           }
           debounce?.cancel();
           debounce = Timer(const Duration(milliseconds: 250), () {
-            final raw = pidFile.existsSync()
-                ? pidFile.readAsStringSync().trim()
-                : '';
-            final pid = int.tryParse(raw);
-            if (pid != null) Process.killPid(pid, ProcessSignal.sigusr1);
+            _signal(pidFile, ProcessSignal.sigusr1);
+            // Restart, not reload: only a web hot restart updates the bundle
+            // served to fresh page loads (each story navigation is one).
+            if (webPidFile != null) _requestWebRestart(webPidFile);
           });
         },
         onError: (Object e) {
@@ -127,6 +183,118 @@ class _RunCommand extends Command<int> {
     }
     targets.forEach(watchRoot);
     stdout.writeln('flutter_static: watching ${targets.join(', ')}');
+  }
+
+  var _port = '8474';
+
+  void _signal(File pidFile, ProcessSignal s) {
+    final raw = pidFile.existsSync() ? pidFile.readAsStringSync().trim() : '';
+    final pid = int.tryParse(raw);
+    if (pid != null) Process.killPid(pid, s);
+  }
+
+  /// Entry point for the web dev server, reached through the symlink
+  /// lib/flutter_static_story -> ../story.
+  ///
+  /// A target outside lib/ is compiled under a private org-dartlang-app:
+  /// scheme (flutter_tools, ResidentWebRunner._generateEntrypoint) that the
+  /// hot-restart file invalidator cannot stat, so edits under story/ never
+  /// recompile: the restart reports success and serves the old bundle.
+  /// Through the link every story file has a package: URI, which restart
+  /// tracks like any other source.
+  String? _linkedWebTarget() {
+    const dir = 'lib/flutter_static_story';
+    final link = Link(dir);
+    if (link.existsSync()) {
+      final target = link.targetSync();
+      if (target != '../story') {
+        stderr.writeln(
+          'flutter_static: $dir points at $target, expected ../story; '
+          'not starting the live web server.',
+        );
+        return null;
+      }
+    } else if (FileSystemEntity.typeSync(dir) !=
+        FileSystemEntityType.notFound) {
+      stderr.writeln(
+        'flutter_static: $dir exists and is not a symlink; '
+        'not starting the live web server.',
+      );
+      return null;
+    } else {
+      link.createSync('../story');
+      stdout.writeln(
+        'flutter_static: created $dir -> ../story '
+        '(the live web server compiles stories through it)',
+      );
+    }
+    return '$dir/web_main.dart';
+  }
+
+  // The web runner drops SIGUSR2 while a restart is in flight, so a save
+  // that lands mid-restart is re-signalled once the runner reports back.
+  var _webBusy = false;
+  var _webSignaledAt = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime? _webChangedAt;
+  var _webErrors = false;
+
+  void _requestWebRestart(File webPidFile) {
+    _webChangedAt = DateTime.now();
+    final stuck =
+        DateTime.now().difference(_webSignaledAt) > const Duration(seconds: 60);
+    if (!_webBusy || stuck) _signalWeb(webPidFile);
+  }
+
+  void _signalWeb(File webPidFile) {
+    _webBusy = true;
+    _webErrors = false;
+    _webSignaledAt = DateTime.now();
+    _signal(webPidFile, ProcessSignal.sigusr2);
+  }
+
+  /// Follows a restart on the web runner's stdout. The progress line prints
+  /// when the restart stops, before the outcome line on success and after
+  /// the compiler's errors on failure.
+  void _onWebOutput(String line, File webPidFile) {
+    if (line.contains(': Error: ')) {
+      _webErrors = true;
+      return;
+    }
+    final String status;
+    if (line.contains('Restarted application')) {
+      status = 'restarted';
+    } else if (line.contains('Recompile complete')) {
+      status = 'recompiled';
+    } else if (line.contains('Performing hot re') && _webErrors) {
+      status = 'failed';
+    } else {
+      return;
+    }
+    _webBusy = false;
+    final changed = _webChangedAt;
+    if (changed != null && changed.isAfter(_webSignaledAt)) {
+      _signalWeb(webPidFile);
+    }
+    _notifyCatalog(status);
+  }
+
+  /// Tells the catalog server the web bundle changed so open detail pages
+  /// refresh their live frame.
+  Future<void> _notifyCatalog(String status) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+    try {
+      final request = await client.postUrl(
+        Uri.parse('http://localhost:$_port/web-reloaded?status=$status'),
+      );
+      final response = await request.close().timeout(
+        const Duration(seconds: 5),
+      );
+      await response.drain<void>();
+    } catch (_) {
+      // Catalog not up (yet): its pages load the current bundle anyway.
+    } finally {
+      client.close();
+    }
   }
 
   /// The app package itself plus every path dependency: exactly the code the
@@ -365,11 +533,14 @@ class _BuildWebCommand extends Command<int> {
       bootstrap.writeAsStringSync("""$marker
 {{flutter_js}}
 {{flutter_build_config}}
+// Works from two origins: the catalog's /live/ static build and the
+// hot-reloading dev server's root. Resolve bases from this script's own URL.
+const BASE = new URL('.', document.currentScript.src).pathname;
 _flutter.loader.load({
   config: {
-    entrypointBaseUrl: '/live/',
-    assetBase: '/live/',
-    canvasKitBaseUrl: '/live/canvaskit/',
+    entrypointBaseUrl: BASE,
+    assetBase: BASE,
+    canvasKitBaseUrl: BASE + 'canvaskit/',
   },
   onEntrypointLoaded: async (engineInitializer) => {
     const engine = await engineInitializer.initializeEngine({
@@ -377,12 +548,19 @@ _flutter.loader.load({
     });
     const app = await engine.runApp();
     window.flutterStaticApp = app;
-    const host = document.getElementById('host');
-    if (host) {
-      app.addView({
-        hostElement: host,
-        initialData: {storyId: window._flutterStaticStory},
-      });
+    let host = document.getElementById('host');
+    const storyId = window._flutterStaticStory ||
+        new URLSearchParams(location.search).get('storyId');
+    if (!host) {
+      // Standalone (dev server) page: fill it with a single view.
+      document.body.style.cssText = 'margin:0;height:100vh;background:#131518';
+      host = document.createElement('div');
+      host.id = 'host';
+      host.style.cssText = 'position:absolute;inset:0';
+      document.body.appendChild(host);
+    }
+    if (storyId) {
+      app.addView({hostElement: host, initialData: {storyId: storyId}});
     }
   },
 });
