@@ -35,6 +35,8 @@ void runFlutterStatic(Stories stories, {int port = 8474}) {
 final _boundaryKey = GlobalKey();
 final _currentId = ValueNotifier<String?>(null);
 int _version = 0;
+final _renderCache = <String, Uint8List>{};
+int _renderCacheVersion = -1;
 final _eventClients = <HttpResponse>[];
 
 class _CatalogApp extends StatefulWidget {
@@ -76,7 +78,20 @@ class _CatalogAppState extends State<_CatalogApp> {
                 (s) => s.id == id,
                 orElse: () => all.first,
               );
-              return RepaintBoundary(key: _boundaryKey, child: story.builder());
+              // Decouple story constraints from the window: a story larger
+              // than the window must still lay out (and capture) at its
+              // natural size, not clamp to the viewport.
+              return OverflowBox(
+                minWidth: 0,
+                minHeight: 0,
+                maxWidth: double.infinity,
+                maxHeight: double.infinity,
+                alignment: Alignment.center,
+                child: RepaintBoundary(
+                  key: _boundaryKey,
+                  child: story.builder(),
+                ),
+              );
             },
           ),
         ),
@@ -131,7 +146,14 @@ Future<void> _serve(Stories stories, int port) async {
           response.statusCode = HttpStatus.notFound;
           await response.close();
         } else {
-          final png = await _capture(id);
+          // Renders are pure per (story, reload version): cache them so a
+          // gallery full of images costs one capture per story per reload
+          // instead of re-rendering on every page view.
+          if (_renderCacheVersion != _version) {
+            _renderCache.clear();
+            _renderCacheVersion = _version;
+          }
+          final png = _renderCache[id] ??= await _capture(id);
           response.headers.contentType = ContentType('image', 'png');
           response.add(png);
           await response.close();
@@ -205,7 +227,7 @@ String _galleryGroupsHtml(List<Story> stories) {
     for (final story in members) {
       final id = _escape(story.id);
       buffer.write(
-        '<figure><img src="/story/$id.png?v=$_version" alt="$id">'
+        '<figure><img src="/story/$id.png?v=$_version" alt="$id" loading="lazy" decoding="async">'
         '<figcaption>$id</figcaption></figure>',
       );
     }
@@ -252,6 +274,8 @@ async function load(v){
     for (const s of stories){
       const f = document.createElement('figure');
       const img = document.createElement('img');
+      img.loading = 'lazy';
+      img.decoding = 'async';
       img.src = s.png + '?v=' + (v ?? idx.version);
       img.alt = s.id;
       const c = document.createElement('figcaption'); c.textContent = s.id;

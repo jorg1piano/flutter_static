@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:args/command_runner.dart';
+import 'package:path/path.dart' as p;
 import 'package:watcher/watcher.dart';
 
 const _defaultUrl = 'http://localhost:8474';
@@ -15,6 +17,7 @@ Future<void> main(List<String> arguments) async {
         )
         ..addCommand(_RunCommand())
         ..addCommand(_InitCommand())
+        ..addCommand(_SetupCommand())
         ..addCommand(_ListCommand())
         ..addCommand(_RenderCommand());
   try {
@@ -48,7 +51,14 @@ class _RunCommand extends Command<int> {
     final target = argResults!['target'] as String;
     if (!File(target).existsSync()) {
       stderr.writeln(
-        'Target $target not found. Scaffold one with: flutter_static init',
+        'Target $target not found. Scaffold one with: flutter_static setup',
+      );
+      return 1;
+    }
+    if (argResults!['device'] == 'macos' && !Directory('macos').existsSync()) {
+      stderr.writeln(
+        'This project has no macOS runner (the catalog renders on desktop). '
+        'Add one with: flutter_static setup',
       );
       return 1;
     }
@@ -144,6 +154,138 @@ class _InitCommand extends Command<int> {
     stdout.writeln('Created ${file.path}. Start the catalog with:');
     stdout.writeln('  flutter_static run');
     return 0;
+  }
+}
+
+class _SetupCommand extends Command<int> {
+  _SetupCommand() {
+    argParser
+      ..addOption(
+        'path',
+        help:
+            'Path to the flutter_static package '
+            '(default: auto-detected from the binary or package config).',
+      )
+      ..addOption(
+        'org',
+        help:
+            'Bundle-id org for the generated macOS runner, forwarded to '
+            'flutter create (needed when existing platforms disagree).',
+      );
+  }
+
+  @override
+  String get name => 'setup';
+  @override
+  String get description =>
+      'Create the story/ folder, add the flutter_static dependency to '
+      'pubspec.yaml, and run flutter pub get. Idempotent.';
+
+  @override
+  Future<int> run() async {
+    final pubspec = File('pubspec.yaml');
+    if (!pubspec.existsSync()) {
+      stderr.writeln(
+        'No pubspec.yaml here. Run setup from the root of the Flutter '
+        'project that should host the stories.',
+      );
+      return 1;
+    }
+    final file = File('story/main.dart');
+    if (file.existsSync()) {
+      stdout.writeln('${file.path} already exists; keeping it.');
+    } else {
+      file.parent.createSync(recursive: true);
+      file.writeAsStringSync(_storyTemplate);
+      stdout.writeln('Created ${file.path}.');
+    }
+
+    final content = pubspec.readAsStringSync();
+    final hasDep = RegExp(
+      r'^  flutter_static\s*:',
+      multiLine: true,
+    ).hasMatch(content);
+    if (hasDep) {
+      stdout.writeln('flutter_static already in pubspec.yaml.');
+    } else {
+      final root = (argResults!['path'] as String?) ?? await _packageRoot();
+      final lines = content.split('\n');
+      final depsIndex = lines.indexWhere(
+        (l) => RegExp(r'^dependencies:\s*$').hasMatch(l),
+      );
+      if (root == null || depsIndex == -1) {
+        stdout.writeln('');
+        stdout.writeln(
+          root == null
+              ? 'Could not locate the flutter_static package '
+                    '(pass --path). Add manually:'
+              : 'No plain "dependencies:" section found. Add manually:',
+        );
+        stdout.writeln('');
+        stdout.writeln('  dependencies:');
+        stdout.writeln('    flutter_static:');
+        stdout.writeln('      path: ${root ?? '<path to flutter_static>'}');
+        stdout.writeln('');
+        stdout.writeln('then run: flutter pub get');
+        return 1;
+      }
+      final rel = p.relative(root, from: Directory.current.path);
+      // A nearby repo reads well as ../flutter_static; a far-away one is
+      // clearer (and no longer) as an absolute path.
+      final dep = p.split(rel).where((s) => s == '..').length > 3 ? root : rel;
+      lines.insertAll(depsIndex + 1, [
+        '  flutter_static:',
+        '    path: $dep',
+      ]);
+      pubspec.writeAsStringSync(lines.join('\n'));
+      stdout.writeln('Added flutter_static (path: $dep) to pubspec.yaml.');
+      final pub = await Process.start('flutter', [
+        'pub',
+        'get',
+      ], mode: ProcessStartMode.inheritStdio);
+      final code = await pub.exitCode;
+      if (code != 0) return code;
+    }
+
+    // The catalog renders on the desktop; mobile-only projects need a
+    // macOS runner added once.
+    if (!Directory('macos').existsSync()) {
+      stdout.writeln('No macOS runner; adding one (flutter create '
+          '--platforms=macos .)');
+      final org = argResults!['org'] as String?;
+      final create = await Process.start('flutter', [
+        'create',
+        '--platforms=macos',
+        if (org != null) ...['--org', org],
+        '.',
+      ], mode: ProcessStartMode.inheritStdio);
+      final code = await create.exitCode;
+      if (code != 0) {
+        stderr.writeln(
+          'flutter create failed. If it reported an ambiguous organization, '
+          're-run with: flutter_static setup --org <your.org>',
+        );
+        return code;
+      }
+    }
+    stdout.writeln('Start the catalog with: flutter_static run');
+    return 0;
+  }
+
+  /// Where the flutter_static package lives: baked in at compile time for
+  /// the global binary (-DFLUTTER_STATIC_ROOT=...), resolved from the
+  /// package config when running via `dart run flutter_static`.
+  Future<String?> _packageRoot() async {
+    const compiled = String.fromEnvironment('FLUTTER_STATIC_ROOT');
+    if (compiled.isNotEmpty && Directory(compiled).existsSync()) {
+      return compiled;
+    }
+    final uri = await Isolate.resolvePackageUri(
+      Uri.parse('package:flutter_static/'),
+    );
+    if (uri == null) return null;
+    final lib = Directory.fromUri(uri);
+    return lib.existsSync() ? lib.parent.path : null;
   }
 }
 

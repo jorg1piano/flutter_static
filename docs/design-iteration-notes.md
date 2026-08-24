@@ -136,3 +136,19 @@ pixel diff ~3-4/255, which is the rasterizer floor (see below). Widgets live in
     mid-session); the server keeps answering but subsequent edits stop
     landing. If a render stops reflecting saves, check the run log tail and
     restart the runner.
+
+## Round 5 (morning_ui, bitmap mockup instead of CSS reference)
+
+25. **Stories used to clamp to the window's constraints**: every capture
+    came out at the window size (390x600) and shrink-wrap Columns stretched.
+    The catalog now wraps each story in an unbounded OverflowBox before the
+    RepaintBoundary, so stories lay out and capture at natural size no
+    matter the window. Symptom to remember: all renders identical size.
+26. Working from a bitmap mockup (no CSS to screenshot) the loop is
+    eyeball-only: render, view, compare proportions by measuring the mockup
+    (find the phone edges, scale = phone_px / 390) rather than trusting
+    guessed font sizes. Fonts bundled per-package work fine:
+    `fonts:` in the package's own pubspec + `TextStyle(package: ...)`;
+    pubspec changes still need a full runner restart.
+27. Colour emoji (avatar stand-in) renders fine in macOS captures via the
+    Apple Color Emoji fallback - no asset needed for placeholder avatars.
