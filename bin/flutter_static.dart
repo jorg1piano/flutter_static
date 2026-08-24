@@ -113,10 +113,19 @@ class _RunCommand extends Command<int> {
       );
     }
 
+    // Watch only the Dart-bearing subdirectories: watching a whole package
+    // root means the watcher's initial scan crawls deps/_build/node_modules
+    // (minutes on a big repo) before delivering a single event.
+    final targets = <String>[];
     for (final root in roots) {
-      watchRoot(root);
+      final narrow = [
+        '$root/lib',
+        '$root/story',
+      ].where((d) => Directory(d).existsSync()).toList();
+      targets.addAll(narrow.isEmpty ? [root] : narrow);
     }
-    stdout.writeln('flutter_static: watching ${roots.join(', ')}');
+    targets.forEach(watchRoot);
+    stdout.writeln('flutter_static: watching ${targets.join(', ')}');
   }
 
   /// The app package itself plus every path dependency: exactly the code the
