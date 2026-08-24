@@ -361,33 +361,34 @@ Future<Uint8List> _captureOffscreen(Story story) async {
   pipelineOwner.rootNode = renderView;
   renderView.prepareInitialFrame();
 
-  final adapter = RenderObjectToWidgetAdapter<RenderBox>(
-    container: container,
-    child: MediaQuery(
-      data: const MediaQueryData(size: Size(430, 932), devicePixelRatio: 2),
-      child: Localizations(
-        locale: const Locale('en'),
-        delegates: const [
-          DefaultWidgetsLocalizations.delegate,
-          DefaultMaterialLocalizations.delegate,
-        ],
-        child: Directionality(
-          textDirection: TextDirection.ltr,
-          child: Theme(
-            data: theme,
-            child: DefaultTextStyle(
-              style: theme.textTheme.bodyMedium!,
-              child: Material(
-                type: MaterialType.transparency,
-                child: RepaintBoundary(child: story.builder()),
-              ),
+  Widget shell(Widget inner) => MediaQuery(
+    data: const MediaQueryData(size: Size(430, 932), devicePixelRatio: 2),
+    child: Localizations(
+      locale: const Locale('en'),
+      delegates: const [
+        DefaultWidgetsLocalizations.delegate,
+        DefaultMaterialLocalizations.delegate,
+      ],
+      child: Directionality(
+        textDirection: TextDirection.ltr,
+        child: Theme(
+          data: theme,
+          child: DefaultTextStyle(
+            style: theme.textTheme.bodyMedium!,
+            child: Material(
+              type: MaterialType.transparency,
+              child: RepaintBoundary(child: inner),
             ),
           ),
         ),
       ),
     ),
   );
-  final root = adapter.attachToRenderTree(buildOwner);
+
+  final root = RenderObjectToWidgetAdapter<RenderBox>(
+    container: container,
+    child: shell(story.builder()),
+  ).attachToRenderTree(buildOwner);
 
   // Painting is the expensive pass for complex stories, so the pump loop
   // only builds and lays out; paint happens exactly once, at capture.
@@ -409,13 +410,30 @@ Future<Uint8List> _captureOffscreen(Story story) async {
   try {
     pump();
     mark('first-pump');
+    // Expanders fill the loose canvas (content at the top of a mile of
+    // empty card): detect the cap hit and re-layout phone-tight.
+    final firstSize = _findBoundary(container)?.size;
+    if (firstSize != null &&
+        (firstSize.width >= 1599 || firstSize.height >= 3199)) {
+      RenderObjectToWidgetAdapter<RenderBox>(
+        container: container,
+        child: shell(
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 430, maxHeight: 932),
+            child: story.builder(),
+          ),
+        ),
+      ).attachToRenderTree(buildOwner, root);
+      pump();
+      mark('clamped');
+    }
     // A few real-time microturns so async work (image decoding) can land,
     // then synthetic frame pumps so animations reach a settled-looking
     // state without waiting wall-clock time. The budget bounds stories
     // whose single frame is genuinely expensive.
     var synthetic = binding.currentSystemFrameTimeStamp;
     final budget = DateTime.now().add(const Duration(seconds: 2));
-    for (var i = 0; i < 24 && DateTime.now().isBefore(budget); i++) {
+    for (var i = 0; i < 60 && DateTime.now().isBefore(budget); i++) {
       final animating = binding.transientCallbackCount > baselineTickers;
       if (i >= 3 && !animating) break;
       if (animating) {
