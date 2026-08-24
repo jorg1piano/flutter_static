@@ -313,9 +313,10 @@ Future<Uint8List> _capture(Story story, {bool offscreenOnly = false}) async {
   }
   try {
     return await _captureOffscreen(story);
-  } catch (e) {
+  } catch (e, st) {
     _needsWindow.add(story.id);
-    _lastTrace = 'FALLBACK ${story.id}: $e';
+    final where = st.toString().split('\n').take(4).join(' | ');
+    _lastTrace = 'FALLBACK ${story.id}: $e @ $where';
     _traceLog(_lastTrace);
     if (offscreenOnly) rethrow;
     debugPrint(
@@ -398,6 +399,8 @@ Future<Uint8List> _captureOffscreen(Story story) async {
     sw.reset();
   }
 
+  final baselineTickers = binding.transientCallbackCount;
+
   try {
     pump();
     mark('first-pump');
@@ -408,7 +411,7 @@ Future<Uint8List> _captureOffscreen(Story story) async {
     var synthetic = binding.currentSystemFrameTimeStamp;
     final budget = DateTime.now().add(const Duration(seconds: 2));
     for (var i = 0; i < 24 && DateTime.now().isBefore(budget); i++) {
-      final animating = binding.transientCallbackCount > 0;
+      final animating = binding.transientCallbackCount > baselineTickers;
       if (i >= 3 && !animating) break;
       if (animating) {
         synthetic += const Duration(milliseconds: 16);
