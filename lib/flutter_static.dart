@@ -514,7 +514,11 @@ async function load(v){
   const root = document.getElementById('groups');
   root.innerHTML = '';
   for (const [g, stories] of Object.entries(groups)){
-    const h = document.createElement('h2'); h.textContent = g; root.appendChild(h);
+    const h = document.createElement('h2');
+    const hl = document.createElement('a');
+    hl.href = '/' + encodeURIComponent(g);
+    hl.textContent = g;
+    h.appendChild(hl); root.appendChild(h);
     const grid = document.createElement('div'); grid.className = 'grid';
     for (const s of stories){
       const a = document.createElement('a');
