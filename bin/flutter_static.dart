@@ -80,24 +80,41 @@ class _RunCommand extends Command<int> {
   void _watchSources(File pidFile) {
     final roots = _localPackageRoots();
     Timer? debounce;
+    void watchRoot(String root) {
+      DirectoryWatcher(root).events.listen(
+        (event) {
+          final path = event.path;
+          if (!path.endsWith('.dart')) return;
+          if (path.contains('/.dart_tool/') ||
+              path.contains('/build/') ||
+              path.contains('/.git/')) {
+            return;
+          }
+          debounce?.cancel();
+          debounce = Timer(const Duration(milliseconds: 250), () {
+            final raw = pidFile.existsSync()
+                ? pidFile.readAsStringSync().trim()
+                : '';
+            final pid = int.tryParse(raw);
+            if (pid != null) Process.killPid(pid, ProcessSignal.sigusr1);
+          });
+        },
+        onError: (Object e) {
+          stderr.writeln(
+            'flutter_static: watcher error on $root: $e; '
+            'restarting watcher',
+          );
+          watchRoot(root);
+        },
+        onDone: () {
+          stderr.writeln('flutter_static: watcher for $root ended; restarting');
+          watchRoot(root);
+        },
+      );
+    }
+
     for (final root in roots) {
-      DirectoryWatcher(root).events.listen((event) {
-        final path = event.path;
-        if (!path.endsWith('.dart')) return;
-        if (path.contains('/.dart_tool/') ||
-            path.contains('/build/') ||
-            path.contains('/.git/')) {
-          return;
-        }
-        debounce?.cancel();
-        debounce = Timer(const Duration(milliseconds: 250), () {
-          final raw = pidFile.existsSync()
-              ? pidFile.readAsStringSync().trim()
-              : '';
-          final pid = int.tryParse(raw);
-          if (pid != null) Process.killPid(pid, ProcessSignal.sigusr1);
-        });
-      }, onError: (Object _) {});
+      watchRoot(root);
     }
     stdout.writeln('flutter_static: watching ${roots.join(', ')}');
   }
@@ -233,10 +250,7 @@ class _SetupCommand extends Command<int> {
       // A nearby repo reads well as ../flutter_static; a far-away one is
       // clearer (and no longer) as an absolute path.
       final dep = p.split(rel).where((s) => s == '..').length > 3 ? root : rel;
-      lines.insertAll(depsIndex + 1, [
-        '  flutter_static:',
-        '    path: $dep',
-      ]);
+      lines.insertAll(depsIndex + 1, ['  flutter_static:', '    path: $dep']);
       pubspec.writeAsStringSync(lines.join('\n'));
       stdout.writeln('Added flutter_static (path: $dep) to pubspec.yaml.');
       final pub = await Process.start('flutter', [
@@ -250,8 +264,10 @@ class _SetupCommand extends Command<int> {
     // The catalog renders on the desktop; mobile-only projects need a
     // macOS runner added once.
     if (!Directory('macos').existsSync()) {
-      stdout.writeln('No macOS runner; adding one (flutter create '
-          '--platforms=macos .)');
+      stdout.writeln(
+        'No macOS runner; adding one (flutter create '
+        '--platforms=macos .)',
+      );
       final org = argResults!['org'] as String?;
       final create = await Process.start('flutter', [
         'create',

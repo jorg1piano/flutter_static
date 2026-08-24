@@ -491,6 +491,15 @@ Future<Uint8List> _captureOffscreen(Story story) async {
     _traceLog(_lastTrace);
     return bytes!.buffer.asUint8List();
   } finally {
+    // Drain one binding frame while the tree is still mounted: widgets
+    // like EditableText schedule post-frame callbacks that must run
+    // against a live State, or they null-check on every later frame.
+    try {
+      binding.handleBeginFrame(
+        binding.currentSystemFrameTimeStamp + const Duration(milliseconds: 16),
+      );
+      binding.handleDrawFrame();
+    } catch (_) {}
     // Unmount so story states (and their tickers) are disposed; an
     // animating story must not keep ticking after its capture.
     try {
