@@ -253,8 +253,14 @@ String? _groupFor(String path, Stories stories) {
 }
 
 String _galleryPage(List<Story> stories, String? only) {
+  final ordered = <String>[];
+  for (final story in stories) {
+    final group = story.id.split('/').first;
+    if (!ordered.contains(group)) ordered.add(group);
+  }
   return _indexHtml
       .replaceFirst('{{GROUPS}}', _galleryGroupsHtml(stories, only))
+      .replaceFirst('{{GROUP_LIST}}', jsonEncode(ordered))
       .replaceFirst('{{FILTER}}', only ?? '')
       .replaceFirst(
         '{{BACK}}',
@@ -315,6 +321,18 @@ figcaption{margin-top:8px;font-size:12px;color:#6B6E7A;font-family:ui-monospace,
 <div id="groups">{{GROUPS}}</div>
 <script>
 const FILTER = '{{FILTER}}';
+const GROUPS = {{GROUP_LIST}};
+// Left/right arrows cycle through the group pages.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  if (!GROUPS.length) return;
+  const delta = e.key === 'ArrowRight' ? 1 : -1;
+  const i = GROUPS.indexOf(FILTER);
+  const next = i === -1
+    ? (delta === 1 ? 0 : GROUPS.length - 1)
+    : (i + delta + GROUPS.length) % GROUPS.length;
+  location.href = '/' + encodeURIComponent(GROUPS[next]);
+});
 async function load(v){
   const idx = await (await fetch('/index.json')).json();
   const groups = {};
