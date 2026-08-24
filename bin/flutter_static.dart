@@ -17,6 +17,7 @@ Future<void> main(List<String> arguments) async {
         )
         ..addCommand(_RunCommand())
         ..addCommand(_InitCommand())
+        ..addCommand(_BuildWebCommand())
         ..addCommand(_SetupCommand())
         ..addCommand(_ListCommand())
         ..addCommand(_RenderCommand());
@@ -311,6 +312,95 @@ class _SetupCommand extends Command<int> {
     if (uri == null) return null;
     final lib = Directory.fromUri(uri);
     return lib.existsSync() ? lib.parent.path : null;
+  }
+}
+
+class _BuildWebCommand extends Command<int> {
+  @override
+  String get name => 'build-web';
+  @override
+  String get description =>
+      'Compile the stories to a wasm web build the detail pages embed live.';
+
+  @override
+  Future<int> run() async {
+    if (!File('story/main.dart').existsSync()) {
+      stderr.writeln('No story/main.dart here. Run this in the catalog app.');
+      return 1;
+    }
+    if (!Directory('web').existsSync()) {
+      stdout.writeln('flutter_static: adding web platform...');
+      final create = await Process.run('flutter', [
+        'create',
+        '--platforms=web',
+        '.',
+      ]);
+      if (create.exitCode != 0) {
+        stderr.writeln(create.stderr);
+        return create.exitCode;
+      }
+    }
+    // The bootstrap template: multi-view engine, views added by the pages.
+    const marker = '// flutter_static multiview bootstrap';
+    final bootstrap = File('web/flutter_bootstrap.js');
+    if (!bootstrap.existsSync() ||
+        bootstrap.readAsStringSync().contains(marker)) {
+      bootstrap.writeAsStringSync("""$marker
+{{flutter_js}}
+{{flutter_build_config}}
+_flutter.loader.load({
+  onEntrypointLoaded: async (engineInitializer) => {
+    const engine = await engineInitializer.initializeEngine({
+      multiViewEnabled: true,
+    });
+    const app = await engine.runApp();
+    window.flutterStaticApp = app;
+    const host = document.getElementById('host');
+    if (host) {
+      app.addView({
+        hostElement: host,
+        initialData: {storyId: window._flutterStaticStory},
+      });
+    }
+  },
+});
+""");
+    }
+    final webMain = File('story/web_main.dart');
+    if (!webMain.existsSync()) {
+      final main = File('story/main.dart').readAsStringSync();
+      final match = RegExp(r'class (\w+) extends Stories').firstMatch(main);
+      if (match == null) {
+        stderr.writeln('Could not find a Stories subclass in story/main.dart');
+        return 1;
+      }
+      webMain.writeAsStringSync(
+        """import 'package:flutter_static/flutter_static.dart';
+
+import 'main.dart';
+
+// Web entry point: the detail pages mount stories as live views.
+void main() => runFlutterStaticWeb(const \${match.group(1)}());
+""",
+      );
+      stdout.writeln('Created story/web_main.dart');
+    }
+    stdout.writeln('flutter_static: building web (wasm)...');
+    final build = await Process.start('flutter', [
+      'build',
+      'web',
+      '--wasm',
+      '-t',
+      'story/web_main.dart',
+    ], mode: ProcessStartMode.inheritStdio);
+    final code = await build.exitCode;
+    if (code == 0) {
+      stdout.writeln(
+        'Web build done. Story detail pages now serve a live view at '
+        '/story/<id>.',
+      );
+    }
+    return code;
   }
 }
 

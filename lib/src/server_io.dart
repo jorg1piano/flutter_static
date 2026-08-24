@@ -274,7 +274,26 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
           await response.close();
         } else {
           response.headers.contentType = ContentType.html;
+          response.headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+          response.headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
           response.write(_storyDetailPage(all, index));
+          await response.close();
+        }
+      } else if (path.startsWith('/live/') || path == '/live') {
+        final rel = path == '/live' ? '' : path.substring('/live/'.length);
+        final root = _projectRoot();
+        final file = root == null
+            ? null
+            : File('$root/build/web/${rel.isEmpty ? 'index.html' : rel}');
+        if (file == null || !file.existsSync()) {
+          response.statusCode = HttpStatus.notFound;
+          response.write('no web build - run: flutter_static build-web');
+          await response.close();
+        } else {
+          response.headers.contentType = _mimeFor(file.path);
+          response.headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+          response.headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
+          await response.addStream(file.openRead());
           await response.close();
         }
       } else if (_groupFor(path, stories) != null) {
@@ -299,6 +318,44 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
 /// View.of has no answer in an offscreen tree). Routed directly on later
 /// renders instead of re-attempting offscreen.
 final _needsWindow = <String>{};
+
+/// The consumer project root, derived from the debug binary's location
+/// (`<project>/build/macos/.../app`); the server process's cwd is not the
+/// project.
+String? _projectRootCache;
+String? _projectRoot() {
+  if (_projectRootCache != null) return _projectRootCache;
+  var dir = File(Platform.resolvedExecutable).parent;
+  while (dir.path != dir.parent.path) {
+    if (File('${dir.path}/pubspec.yaml').existsSync()) {
+      return _projectRootCache = dir.path;
+    }
+    dir = dir.parent;
+  }
+  return null;
+}
+
+ContentType _mimeFor(String path) {
+  final ext = path.split('.').last.toLowerCase();
+  switch (ext) {
+    case 'html':
+      return ContentType.html;
+    case 'js':
+    case 'mjs':
+      return ContentType('text', 'javascript');
+    case 'wasm':
+      return ContentType('application', 'wasm');
+    case 'json':
+      return ContentType.json;
+    case 'png':
+      return ContentType('image', 'png');
+    case 'ttf':
+    case 'otf':
+      return ContentType('font', ext);
+    default:
+      return ContentType('application', 'octet-stream');
+  }
+}
 
 Future<Uint8List> _capture(Story story, {bool offscreenOnly = false}) async {
   if (_needsWindow.contains(story.id)) {
