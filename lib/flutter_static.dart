@@ -114,9 +114,9 @@ Future<void> _serve(Stories stories, int port) async {
 /// story at a time.
 Future<void>? _captureQueue;
 
-Future<Uint8List> _renderCached(String id) {
+Future<Uint8List> _renderCached(Story story) {
   if (_renderCacheVersion == _version) {
-    final hit = _renderCache[id];
+    final hit = _renderCache[story.id];
     if (hit != null) return Future.value(hit);
   }
   final previous = _captureQueue ?? Future<void>.value();
@@ -128,7 +128,7 @@ Future<Uint8List> _renderCached(String id) {
         _renderCache.clear();
         _renderCacheVersion = _version;
       }
-      return _renderCache[id] ??= await _capture(id);
+      return _renderCache[story.id] ??= await _capture(story);
     } finally {
       completer.complete();
     }
@@ -171,13 +171,14 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
           '/story/'.length,
           path.length - '.png'.length,
         );
-        if (!stories.build().any((s) => s.id == id)) {
+        final matches = stories.build().where((s) => s.id == id);
+        if (matches.isEmpty) {
           response.statusCode = HttpStatus.notFound;
           await response.close();
         } else {
           // Renders are pure per (story, reload version): cached, and
           // capture work is serialized behind _captureQueue.
-          final png = await _renderCached(id);
+          final png = await _renderCached(matches.first);
           response.headers.contentType = ContentType('image', 'png');
           response.add(png);
           await response.close();
@@ -200,7 +201,120 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
   }
 }
 
-Future<Uint8List> _capture(String id) async {
+Future<Uint8List> _capture(Story story) async {
+  try {
+    return await _captureOffscreen(story);
+  } catch (e) {
+    debugPrint(
+      'flutter_static: offscreen capture failed for ${story.id} ($e); '
+      'falling back to window capture',
+    );
+    return _captureOnWindow(story.id);
+  }
+}
+
+/// Renders [story] in its own offscreen render tree: no shared window, no
+/// vsync, and animations advance on synthetic timestamps instead of
+/// wall-clock time, so even infinitely-animating stories capture in tens of
+/// milliseconds.
+Future<Uint8List> _captureOffscreen(Story story) async {
+  final binding = WidgetsBinding.instance;
+  final theme = ThemeData();
+  final boundaryKey = GlobalKey();
+
+  final container = RenderPositionedBox(alignment: Alignment.topLeft);
+  final renderView = RenderView(
+    view: binding.platformDispatcher.implicitView!,
+    configuration: const ViewConfiguration(
+      logicalConstraints: BoxConstraints(maxWidth: 4096, maxHeight: 8192),
+      devicePixelRatio: 2,
+    ),
+    child: container,
+  );
+  final pipelineOwner = PipelineOwner();
+  final buildOwner = BuildOwner(focusManager: FocusManager());
+  pipelineOwner.rootNode = renderView;
+  renderView.prepareInitialFrame();
+
+  final adapter = RenderObjectToWidgetAdapter<RenderBox>(
+    container: container,
+    child: MediaQuery(
+      data: const MediaQueryData(size: Size(2048, 4096), devicePixelRatio: 2),
+      child: Localizations(
+        locale: const Locale('en'),
+        delegates: const [
+          DefaultWidgetsLocalizations.delegate,
+          DefaultMaterialLocalizations.delegate,
+        ],
+        child: Directionality(
+          textDirection: TextDirection.ltr,
+          child: Theme(
+            data: theme,
+            child: DefaultTextStyle(
+              style: theme.textTheme.bodyMedium!,
+              child: Material(
+                type: MaterialType.transparency,
+                child: RepaintBoundary(
+                  key: boundaryKey,
+                  child: story.builder(),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+  final root = adapter.attachToRenderTree(buildOwner);
+
+  void flushFrame() {
+    buildOwner.buildScope(root);
+    buildOwner.finalizeTree();
+    pipelineOwner.flushLayout();
+    pipelineOwner.flushCompositingBits();
+    pipelineOwner.flushPaint();
+  }
+
+  try {
+    flushFrame();
+    // A few real-time microturns so async work (image decoding) can land,
+    // then synthetic frame pumps so animations reach a settled-looking
+    // state without waiting wall-clock time.
+    var synthetic = binding.currentSystemFrameTimeStamp;
+    for (var i = 0; i < 24; i++) {
+      final animating = binding.transientCallbackCount > 0;
+      if (i >= 3 && !animating) break;
+      if (animating) {
+        synthetic += const Duration(milliseconds: 16);
+        try {
+          binding.handleBeginFrame(synthetic);
+          binding.handleDrawFrame();
+        } catch (_) {
+          // A real engine frame was mid-flight; skip this pump.
+        }
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 4));
+      flushFrame();
+    }
+    final boundary =
+        boundaryKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
+    final image = await boundary.toImage(pixelRatio: 2);
+    final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
+    image.dispose();
+    return bytes!.buffer.asUint8List();
+  } finally {
+    // Unmount so story states (and their tickers) are disposed; an
+    // animating story must not keep ticking after its capture.
+    try {
+      RenderObjectToWidgetAdapter<RenderBox>(
+        container: container,
+      ).attachToRenderTree(buildOwner, root);
+      buildOwner.finalizeTree();
+    } catch (_) {}
+  }
+}
+
+Future<Uint8List> _captureOnWindow(String id) async {
   _currentId.value = id;
   final binding = WidgetsBinding.instance;
   // Pump frames until the tree settles: implicit animations (e.g.
