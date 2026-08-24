@@ -30,6 +30,24 @@ abstract class Stories {
 void runFlutterStatic(Stories stories, {int port = 8474}) {
   runApp(_CatalogApp(stories: stories));
   _serve(stories, port);
+  _prewarm(stories);
+}
+
+/// Renders every story into the cache in the background so user-facing
+/// requests rarely pay a cold render. Yields between stories to keep the
+/// server responsive; exits early when superseded by a newer reload.
+void _prewarm(Stories stories) {
+  final version = _version;
+  Future(() async {
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    for (final story in stories.build()) {
+      if (_version != version) return;
+      try {
+        await _renderCached(story);
+      } catch (_) {}
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+  });
 }
 
 final _boundaryKey = GlobalKey();
@@ -53,6 +71,7 @@ class _CatalogAppState extends State<_CatalogApp> {
   void reassemble() {
     super.reassemble();
     _version++;
+    _prewarm(widget.stories);
     for (final client in _eventClients) {
       try {
         client.write('data: {"version": $_version}\n\n');
