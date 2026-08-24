@@ -40,9 +40,9 @@ void _prewarm(Stories stories) {
   final version = _version;
   Future(() async {
     await Future<void>.delayed(const Duration(milliseconds: 300));
-    for (final story in stories.build()) {
-      if (_needsWindow.contains(story.id)) _mountWindowStory(story);
-    }
+    // Phase 1: everything that can render offscreen does; stories that
+    // need the window fail in milliseconds and are only collected.
+    final windowBound = <Story>[];
     for (final story in stories.build()) {
       if (_version != version) return;
       // Let interactive requests drain first; warming is idle work.
@@ -51,9 +51,25 @@ void _prewarm(Stories stories) {
         if (_version != version) return;
       }
       try {
+        await _renderCached(story, background: true, offscreenOnly: true);
+      } catch (_) {
+        windowBound.add(story);
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+    // Phase 2: mount the whole window batch at once - one Stack rebuild,
+    // one settle - then snapshot each.
+    if (windowBound.isEmpty) return;
+    _mountWindowStories(windowBound);
+    for (final story in windowBound) {
+      if (_version != version) return;
+      while (_foregroundWaiters > 0) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        if (_version != version) return;
+      }
+      try {
         await _renderCached(story, background: true);
       } catch (_) {}
-      await Future<void>.delayed(const Duration(milliseconds: 10));
     }
   });
 }
@@ -67,12 +83,20 @@ final _windowStories = ValueNotifier<List<Story>>([]);
 final _windowKeys = <String, GlobalKey>{};
 Future<void>? _windowSettled;
 
-void _mountWindowStory(Story story) {
-  if (_windowKeys.containsKey(story.id)) return;
-  _windowKeys[story.id] = GlobalKey();
-  _windowStories.value = [..._windowStories.value, story];
-  _windowSettled = null; // new mount: settle once for the whole batch
+void _mountWindowStories(Iterable<Story> stories) {
+  final added = <Story>[];
+  for (final story in stories) {
+    if (_windowKeys.containsKey(story.id)) continue;
+    _windowKeys[story.id] = GlobalKey();
+    added.add(story);
+  }
+  if (added.isEmpty) return;
+  // One Stack rebuild and one settle for the whole batch.
+  _windowStories.value = [..._windowStories.value, ...added];
+  _windowSettled = null;
 }
+
+void _mountWindowStory(Story story) => _mountWindowStories([story]);
 
 int _version = 0;
 final _renderCache = <String, Uint8List>{};
@@ -168,7 +192,11 @@ Future<void>? _captureQueue;
 /// yields to them.
 int _foregroundWaiters = 0;
 
-Future<Uint8List> _renderCached(Story story, {bool background = false}) {
+Future<Uint8List> _renderCached(
+  Story story, {
+  bool background = false,
+  bool offscreenOnly = false,
+}) {
   if (_renderCacheVersion == _version) {
     final hit = _renderCache[story.id];
     if (hit != null) return Future.value(hit);
@@ -183,7 +211,10 @@ Future<Uint8List> _renderCached(Story story, {bool background = false}) {
         _renderCache.clear();
         _renderCacheVersion = _version;
       }
-      return _renderCache[story.id] ??= await _capture(story);
+      return _renderCache[story.id] ??= await _capture(
+        story,
+        offscreenOnly: offscreenOnly,
+      );
     } finally {
       if (!background) _foregroundWaiters--;
       completer.complete();
@@ -267,14 +298,18 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
 /// renders instead of re-attempting offscreen.
 final _needsWindow = <String>{};
 
-Future<Uint8List> _capture(Story story) async {
-  if (_needsWindow.contains(story.id)) return _captureOnWindow(story);
+Future<Uint8List> _capture(Story story, {bool offscreenOnly = false}) async {
+  if (_needsWindow.contains(story.id)) {
+    if (offscreenOnly) throw StateError('needs window');
+    return _captureOnWindow(story);
+  }
   try {
     return await _captureOffscreen(story);
   } catch (e) {
     _needsWindow.add(story.id);
     _lastTrace = 'FALLBACK ${story.id}: $e';
     _traceLog(_lastTrace);
+    if (offscreenOnly) rethrow;
     debugPrint(
       'flutter_static: offscreen capture failed for ${story.id} ($e); '
       'falling back to window capture',
