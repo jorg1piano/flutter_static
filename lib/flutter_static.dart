@@ -331,10 +331,18 @@ Future<Uint8List> _capture(Story story, {bool offscreenOnly = false}) async {
 /// vsync, and animations advance on synthetic timestamps instead of
 /// wall-clock time, so even infinitely-animating stories capture in tens of
 /// milliseconds.
+RenderRepaintBoundary? _findBoundary(RenderObject node) {
+  if (node is RenderRepaintBoundary) return node;
+  RenderRepaintBoundary? result;
+  node.visitChildren((child) {
+    result ??= _findBoundary(child);
+  });
+  return result;
+}
+
 Future<Uint8List> _captureOffscreen(Story story) async {
   final binding = WidgetsBinding.instance;
   final theme = ThemeData();
-  final boundaryKey = GlobalKey();
 
   final container = RenderPositionedBox(alignment: Alignment.topLeft);
   final renderView = RenderView(
@@ -371,10 +379,7 @@ Future<Uint8List> _captureOffscreen(Story story) async {
               style: theme.textTheme.bodyMedium!,
               child: Material(
                 type: MaterialType.transparency,
-                child: RepaintBoundary(
-                  key: boundaryKey,
-                  child: story.builder(),
-                ),
+                child: RepaintBoundary(child: story.builder()),
               ),
             ),
           ),
@@ -429,8 +434,12 @@ Future<Uint8List> _captureOffscreen(Story story) async {
     pipelineOwner.flushCompositingBits();
     pipelineOwner.flushPaint();
     mark('paint');
-    final boundary =
-        boundaryKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
+    // Walk from the container we hold directly: GlobalKey lookups resolve
+    // through the binding's BuildOwner, not our private offscreen one.
+    final boundary = _findBoundary(container);
+    if (boundary == null) {
+      throw StateError('offscreen boundary not mounted');
+    }
     final image = await boundary.toImage(pixelRatio: 2);
     mark('toImage');
     final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
