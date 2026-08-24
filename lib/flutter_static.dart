@@ -61,6 +61,17 @@ int _version = 0;
 final _renderCache = <String, Uint8List>{};
 int _renderCacheVersion = -1;
 String _lastTrace = '';
+final List<String> _traceLines = [];
+void _traceLog(String line) {
+  _traceLines.add(
+    '${DateTime.now().toIso8601String().substring(11, 23)} \$line'.replaceFirst(
+      r'\$line',
+      line,
+    ),
+  );
+  if (_traceLines.length > 500) _traceLines.removeAt(0);
+}
+
 final _eventClients = <HttpResponse>[];
 
 class _CatalogApp extends StatefulWidget {
@@ -189,6 +200,10 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         response.headers.contentType = ContentType.html;
         response.write(_galleryPage(stories.build(), null));
         await response.close();
+      } else if (path == '/trace') {
+        response.headers.contentType = ContentType.text;
+        response.write(_traceLines.join('\n'));
+        await response.close();
       } else if (path == '/events') {
         response.bufferOutput = false;
         response.headers.contentType = ContentType('text', 'event-stream');
@@ -238,6 +253,7 @@ Future<Uint8List> _capture(Story story) async {
     return await _captureOffscreen(story);
   } catch (e) {
     _lastTrace = 'FALLBACK ${story.id}: $e';
+    _traceLog(_lastTrace);
     debugPrint(
       'flutter_static: offscreen capture failed for ${story.id} ($e); '
       'falling back to window capture',
@@ -354,6 +370,7 @@ Future<Uint8List> _captureOffscreen(Story story) async {
     mark('png-encode');
     image.dispose();
     _lastTrace = '${story.id}: $trace';
+    _traceLog(_lastTrace);
     return bytes!.buffer.asUint8List();
   } finally {
     // Unmount so story states (and their tickers) are disposed; an
