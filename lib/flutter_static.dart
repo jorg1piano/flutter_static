@@ -283,6 +283,18 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
           response.add(png);
           await response.close();
         }
+      } else if (path.startsWith('/story/') && !path.endsWith('.png')) {
+        final id = Uri.decodeComponent(path.substring('/story/'.length));
+        final all = stories.build();
+        final index = all.indexWhere((s) => s.id == id);
+        if (index == -1) {
+          response.statusCode = HttpStatus.notFound;
+          await response.close();
+        } else {
+          response.headers.contentType = ContentType.html;
+          response.write(_storyDetailPage(all, index));
+          await response.close();
+        }
       } else if (_groupFor(path, stories) != null) {
         response.headers.contentType = ContentType.html;
         response.write(_galleryPage(stories.build(), _groupFor(path, stories)));
@@ -547,6 +559,55 @@ Future<void> _settleWindow() async {
       DateTime.now().isBefore(deadline));
 }
 
+String _storyDetailPage(List<Story> all, int index) {
+  final story = all[index];
+  final id = _escape(story.id);
+  final group = _escape(story.id.split('/').first);
+  final prev = all[(index - 1 + all.length) % all.length].id;
+  final next = all[(index + 1) % all.length].id;
+  return '''
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>$id - flutter_static</title>
+<style>
+body{margin:0;background:#0A0B0D;color:#E2E4E9;font:14px system-ui,sans-serif;padding:32px}
+a{color:#9B9FAB;text-decoration:none}a:hover{color:#E2E4E9}
+h1{font-size:16px;margin:12px 0 24px;font-family:ui-monospace,monospace}
+.nav{font-size:12px;display:flex;gap:16px}
+section{margin:0 0 28px}
+section h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#6B6E7A;margin:0 0 10px}
+.png{background:#131518;border-radius:12px;padding:16px;display:inline-block}
+.png img{display:block;max-width:min(840px,100%);height:auto;border-radius:8px}
+#live{background:#131518;border-radius:12px;padding:16px;min-height:120px;display:flex;align-items:center;justify-content:center}
+#live .hint{color:#6B6E7A;font-size:12.5px}
+#host{width:100%;min-height:120px}
+</style></head><body>
+<div class="nav"><a href="/">&larr; alle</a><a href="/$group">$group</a>
+<a href="/story/${_escape(prev)}">&larr; forrige</a><a href="/story/${_escape(next)}">neste &rarr;</a></div>
+<h1>$id</h1>
+<section><h2>Render</h2>
+<a class="png" href="/story/$id.png"><img src="/story/$id.png?v=$_version" alt="$id"></a></section>
+<section><h2>Live</h2><div id="live"><div id="host"></div></div></section>
+<script>
+const STORY = '$id';
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowLeft') location.href = '/story/${_escape(prev)}';
+  if (e.key === 'ArrowRight') location.href = '/story/${_escape(next)}';
+});
+fetch('/live/flutter_bootstrap.js', {method: 'HEAD'}).then((r) => {
+  if (!r.ok) throw 0;
+  window._flutterStaticStory = STORY;
+  const s = document.createElement('script');
+  s.src = '/live/flutter_bootstrap.js';
+  document.body.appendChild(s);
+}).catch(() => {
+  document.getElementById('live').innerHTML =
+    '<div class="hint">Ingen web-bygg enn&aring; - kj&oslash;r flutter_static build-web for &aring; f&aring; en interaktiv versjon her.</div>';
+});
+</script>
+</body></html>
+''';
+}
+
 /// Server-rendered grid so the initial document contains every <img>:
 /// the browser load event then waits for them, which makes headless
 /// screenshots deterministic. The inline script only re-renders on /events.
@@ -589,7 +650,7 @@ String _galleryGroupsHtml(List<Story> stories, String? only) {
     for (final story in members) {
       final id = _escape(story.id);
       buffer.write(
-        '<a class="card" href="/story/$id.png">'
+        '<a class="card" href="/story/$id">'
         '<figure><img src="/story/$id.png?v=$_version" alt="$id" loading="lazy" decoding="async">'
         '<figcaption>$id</figcaption></figure></a>',
       );
@@ -663,7 +724,7 @@ async function load(v){
     for (const s of stories){
       const a = document.createElement('a');
       a.className = 'card';
-      a.href = s.png;
+      a.href = '/story/' + s.id;
       const f = document.createElement('figure');
       const img = document.createElement('img');
       img.loading = 'lazy';
