@@ -270,21 +270,23 @@ Future<Uint8List> _captureOffscreen(Story story) async {
   );
   final root = adapter.attachToRenderTree(buildOwner);
 
-  void flushFrame() {
+  // Painting is the expensive pass for complex stories, so the pump loop
+  // only builds and lays out; paint happens exactly once, at capture.
+  void pump() {
     buildOwner.buildScope(root);
     buildOwner.finalizeTree();
     pipelineOwner.flushLayout();
-    pipelineOwner.flushCompositingBits();
-    pipelineOwner.flushPaint();
   }
 
   try {
-    flushFrame();
+    pump();
     // A few real-time microturns so async work (image decoding) can land,
     // then synthetic frame pumps so animations reach a settled-looking
-    // state without waiting wall-clock time.
+    // state without waiting wall-clock time. The budget bounds stories
+    // whose single frame is genuinely expensive.
     var synthetic = binding.currentSystemFrameTimeStamp;
-    for (var i = 0; i < 24; i++) {
+    final budget = DateTime.now().add(const Duration(seconds: 2));
+    for (var i = 0; i < 24 && DateTime.now().isBefore(budget); i++) {
       final animating = binding.transientCallbackCount > 0;
       if (i >= 3 && !animating) break;
       if (animating) {
@@ -297,8 +299,10 @@ Future<Uint8List> _captureOffscreen(Story story) async {
         }
       }
       await Future<void>.delayed(const Duration(milliseconds: 4));
-      flushFrame();
+      pump();
     }
+    pipelineOwner.flushCompositingBits();
+    pipelineOwner.flushPaint();
     final boundary =
         boundaryKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
     final image = await boundary.toImage(pixelRatio: 2);
