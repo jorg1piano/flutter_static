@@ -408,14 +408,28 @@ void main() => runFlutterStaticWeb(const ${match.group(1)}());
       stdout.writeln('Created story/web_main.dart');
     }
     stdout.writeln('flutter_static: building web (wasm)...');
-    final build = await Process.start('flutter', [
+    var build = await Process.start('flutter', [
       'build',
       'web',
       '--wasm',
       '-t',
       'story/web_main.dart',
     ], mode: ProcessStartMode.inheritStdio);
-    final code = await build.exitCode;
+    var code = await build.exitCode;
+    if (code != 0) {
+      // Legacy dart:html plugins in the dependency tree cannot compile to
+      // wasm; the JS compiler handles them.
+      stdout.writeln(
+        'flutter_static: wasm build failed, retrying as a JS build...',
+      );
+      build = await Process.start('flutter', [
+        'build',
+        'web',
+        '-t',
+        'story/web_main.dart',
+      ], mode: ProcessStartMode.inheritStdio);
+      code = await build.exitCode;
+    }
     if (code == 0) {
       stdout.writeln(
         'Web build done. Story detail pages now serve a live view at '
