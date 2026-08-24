@@ -63,12 +63,8 @@ int _renderCacheVersion = -1;
 String _lastTrace = '';
 final List<String> _traceLines = [];
 void _traceLog(String line) {
-  _traceLines.add(
-    '${DateTime.now().toIso8601String().substring(11, 23)} \$line'.replaceFirst(
-      r'\$line',
-      line,
-    ),
-  );
+  final ts = DateTime.now().toIso8601String().substring(11, 23);
+  _traceLines.add('$ts $line');
   if (_traceLines.length > 500) _traceLines.removeAt(0);
 }
 
