@@ -257,7 +257,13 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         await response.close();
       } else if (path == '/' || path == '/index.html') {
         response.headers.contentType = ContentType.html;
-        response.write(_galleryPage(stories.build(), null));
+        response.write(
+          _galleryPage(
+            stories.build(),
+            null,
+            liveDev: await _liveDevAvailable(),
+          ),
+        );
         await response.close();
       } else if (path == '/trace') {
         response.headers.contentType = ContentType.text;
@@ -339,7 +345,13 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         }
       } else if (_groupFor(path, stories) != null) {
         response.headers.contentType = ContentType.html;
-        response.write(_galleryPage(stories.build(), _groupFor(path, stories)));
+        response.write(
+          _galleryPage(
+            stories.build(),
+            _groupFor(path, stories),
+            liveDev: await _liveDevAvailable(),
+          ),
+        );
         await response.close();
       } else if (_looksLikeDevAsset(path) &&
           await _liveDevAvailable() &&
@@ -824,7 +836,11 @@ String? _groupFor(String path, Stories stories) {
   return stories.build().any((s) => s.id.startsWith('$group/')) ? group : null;
 }
 
-String _galleryPage(List<Story> stories, String? only) {
+String _galleryPage(
+  List<Story> stories,
+  String? only, {
+  required bool liveDev,
+}) {
   final ordered = <String>[];
   for (final story in stories) {
     final group = story.id.split('/').first;
@@ -838,7 +854,8 @@ String _galleryPage(List<Story> stories, String? only) {
         '{{BACK}}',
         only == null ? '' : '<a class="back" href="/">&larr; alle grupper</a>',
       )
-      .replaceFirst('{{VERSION}}', '$_version');
+      .replaceFirst('{{VERSION}}', '$_version')
+      .replaceFirst('{{LIVE_DEV}}', '$liveDev');
 }
 
 String _galleryGroupsHtml(List<Story> stories, String? only) {
@@ -874,7 +891,9 @@ String _escape(String s) => s
 
 /// Story gallery served at / and /index.html: every render in a grid,
 /// grouped by the id's first path segment, live-reloading via /events.
-const _indexHtml = """
+/// A getter, not a const: hot reload leaves top-level consts as they were,
+/// so template edits would only land on restart.
+String get _indexHtml => """
 <!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>flutter_static</title>
 <style>
@@ -890,6 +909,8 @@ figure{margin:0;background:#131518;border-radius:12px;padding:12px}
 .card:hover figure{background:#1A1D23}
 .media{display:block}
 img{display:block;max-width:420px;height:auto;border-radius:8px;background:#0A0B0D}
+.host{border-radius:8px;background:#0A0B0D;overflow:hidden}
+.card.booting img{opacity:.5;transition:opacity .3s}
 .name{display:block;margin-top:8px;font-size:12px;color:#6B6E7A;font-family:ui-monospace,monospace;text-decoration:none}
 .name:hover{color:#E2E4E9}
 </style></head><body>
@@ -900,6 +921,103 @@ img{display:block;max-width:420px;height:auto;border-radius:8px;background:#0A0B
 <script>
 const FILTER = '{{FILTER}}';
 const GROUPS = {{GROUP_LIST}};
+const LIVE_DEV = {{LIVE_DEV}};
+// Live views: inside a group every card goes live as it scrolls near; the
+// front page keeps its pngs and swaps a card for the real widget on hover.
+// The dev bundle boots on first need, not on page load, and comes through
+// this origin (the catalog proxies dev assets): its hot-restart path
+// fetches page-relative URLs, and cross-origin XHR trips on dwds. The png
+// stays the size reference (rendered at 2x) and the fallback for
+// automation.
+const WEB = '/';
+const LIVE = LIVE_DEV && !navigator.webdriver;
+const GROUP_LIVE = LIVE && !!FILTER;
+let app = null, booting = false;
+const pending = new Set();
+function boot() {
+  if (booting) return;
+  booting = true;
+  document.addEventListener('flutter-static-ready', (e) => {
+    // Fires again after every hot restart: the engine drops all views and
+    // hands out a fresh app; the old handle cannot add views any more.
+    const rerun = app !== null;
+    app = e.detail;
+    if (rerun) {
+      for (const c of document.querySelectorAll('.card[data-view]')) delete c.dataset.view;
+      observeAll();
+    }
+    for (const c of pending) mount(c);
+    pending.clear();
+  });
+  const s = document.createElement('script');
+  s.src = WEB + 'flutter_bootstrap.js';
+  document.body.appendChild(s);
+}
+const io = new IntersectionObserver((entries) => {
+  for (const e of entries) {
+    if (!e.isIntersecting) continue;
+    io.unobserve(e.target);
+    mount(e.target);
+  }
+}, {rootMargin: '300px'});
+function mount(card) {
+  if (card.dataset.view) return;
+  boot();
+  if (!app) { pending.add(card); card.classList.add('booting'); return; }
+  const existing = card.querySelector('.host');
+  if (existing) {
+    // A handle from before a restart cannot add views; the ready event of
+    // that restart observes the card again.
+    try {
+      card.dataset.view = app.addView({hostElement: existing, initialData: {storyId: card.dataset.id}});
+    } catch (e) { console.warn('flutter_static: view not added', card.dataset.id, e); }
+    return;
+  }
+  const img = card.querySelector('img');
+  const go = () => {
+    const w = Math.round(img.naturalWidth / 2), h = Math.round(img.naturalHeight / 2);
+    if (!w || !h || card.dataset.view) return;
+    const scale = Math.min(1, 420 / w);
+    const box = document.createElement('div');
+    box.className = 'media';
+    box.style.cssText = 'width:' + Math.round(w * scale) + 'px;height:' + Math.round(h * scale) + 'px';
+    const host = document.createElement('div');
+    host.className = 'host';
+    host.style.cssText = 'width:' + w + 'px;height:' + h + 'px;transform:scale(' + scale + ');transform-origin:0 0';
+    box.appendChild(host);
+    card.querySelector('a.media').replaceWith(box);
+    card.classList.remove('booting');
+    card.dataset.view = app.addView({hostElement: host, initialData: {storyId: card.dataset.id}});
+  };
+  if (img.complete && img.naturalWidth) go(); else img.addEventListener('load', go, {once: true});
+}
+// Cards that are (or were) live get a view when they scroll near: all of
+// them inside a group, the hovered ones on the front page.
+function observeAll() {
+  if (!LIVE) return;
+  // Start observation over: observe() is a no-op for a card still being
+  // observed, and a restart between its observation and its mount would
+  // otherwise leave it empty for good.
+  io.disconnect();
+  for (const c of document.querySelectorAll('.card:not([data-view])')) {
+    if (GROUP_LIVE || c.dataset.live) io.observe(c);
+  }
+}
+function armHover() {
+  if (!LIVE || GROUP_LIVE) return;
+  for (const c of document.querySelectorAll('.card:not([data-live])')) {
+    c.addEventListener('pointerenter', () => { c.dataset.live = '1'; mount(c); }, {once: true});
+  }
+}
+function unmountAll() {
+  if (!app) return;
+  for (const c of document.querySelectorAll('.card[data-view]')) {
+    app.removeView(+c.dataset.view);
+    delete c.dataset.view;
+  }
+}
+observeAll();
+armHover();
 let shownVersion = {{VERSION}};
 // Left/right arrows cycle through the group pages.
 document.addEventListener('keydown', (e) => {
@@ -919,7 +1037,7 @@ async function load(v){
   if (ids.join('|') === shown.join('|')) {
     // Same stories: live views were hot restarted in place; refresh the PNGs
     // when they are what is visible.
-    if ((v ?? idx.version) !== shownVersion) {
+    if (!LIVE && (v ?? idx.version) !== shownVersion) {
       shownVersion = v ?? idx.version;
       for (const img of document.querySelectorAll('.card img')) {
         img.src = '/story/' + img.alt + '.png?v=' + shownVersion;
@@ -928,6 +1046,7 @@ async function load(v){
     return;
   }
   shownVersion = v ?? idx.version;
+  unmountAll();
   const groups = {};
   for (const s of idx.stories){
     const g = s.id.split('/')[0];
@@ -965,12 +1084,24 @@ async function load(v){
     }
     root.appendChild(grid);
   }
+  observeAll();
+  armHover();
 }
 // Automation (headless screenshots, drivers) waits for network idle;
 // the ever-open SSE stream would hang it, so only humans get live reload.
 if (!navigator.webdriver) {
+  let webSeen = null;
   new EventSource('/events').onmessage = (e) => {
     const d = JSON.parse(e.data);
+    if (webSeen !== null && d.web !== webSeen && LIVE && app) {
+      // Views stay attached through a hot restart: it re-runs main in
+      // place and the engine keeps them (a view added afterwards through
+      // the pre-restart app handle fails). A bare recompile means this
+      // page is no longer the dev server's client (it relaunched): start
+      // over with the new bundle.
+      if (d.webStatus === 'recompiled') { location.reload(); return; }
+    }
+    webSeen = d.web;
     load(d.version);
   };
 }
