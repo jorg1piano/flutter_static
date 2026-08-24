@@ -226,7 +226,10 @@ Future<Uint8List> _captureOffscreen(Story story) async {
   final renderView = RenderView(
     view: binding.platformDispatcher.implicitView!,
     configuration: const ViewConfiguration(
-      logicalConstraints: BoxConstraints(maxWidth: 4096, maxHeight: 8192),
+      // Phone-plus headroom: expanding widgets fill this, and anything
+      // larger explodes rasterization cost (the 4096x8192 canvas meant
+      // 51s captures for stories with fill-width content).
+      logicalConstraints: BoxConstraints(maxWidth: 1600, maxHeight: 3200),
       devicePixelRatio: 2,
     ),
     child: container,
@@ -239,7 +242,7 @@ Future<Uint8List> _captureOffscreen(Story story) async {
   final adapter = RenderObjectToWidgetAdapter<RenderBox>(
     container: container,
     child: MediaQuery(
-      data: const MediaQueryData(size: Size(2048, 4096), devicePixelRatio: 2),
+      data: const MediaQueryData(size: Size(430, 932), devicePixelRatio: 2),
       child: Localizations(
         locale: const Locale('en'),
         delegates: const [
