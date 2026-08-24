@@ -85,7 +85,7 @@ class _MultiViewStoriesState extends State<_MultiViewStories>
 
   Widget _storyView(int viewId) {
     final id = _storyIdFor(viewId);
-    final all = widget.stories.build();
+    final all = widget.stories.all();
     final matches = all.where((s) => s.id == id);
     if (matches.isEmpty) {
       return Center(child: Text('unknown story: ${id ?? '<none>'}'));

@@ -32,7 +32,7 @@ void _prewarm(Stories stories) {
     // Phase 1: everything that can render offscreen does; stories that
     // need the window fail in milliseconds and are only collected.
     final windowBound = <Story>[];
-    for (final story in stories.build()) {
+    for (final story in stories.all()) {
       if (_version != version) return;
       // Let interactive requests drain first; warming is idle work.
       while (_foregroundWaiters > 0) {
@@ -239,7 +239,7 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
           jsonEncode({
             'version': _version,
             'stories': [
-              for (final s in stories.build())
+              for (final s in stories.all())
                 {'id': s.id, 'png': '/story/${s.id}.png'},
             ],
           }),
@@ -249,7 +249,7 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         response.headers.contentType = ContentType.html;
         _isolate(response);
         response.write(
-          _galleryPage(stories.build(), null, liveBuild: _liveBuildExists()),
+          _galleryPage(stories.all(), null, liveBuild: _liveBuildExists()),
         );
         await response.close();
       } else if (path == '/trace') {
@@ -269,7 +269,7 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
           '/story/'.length,
           path.length - '.png'.length,
         );
-        final matches = stories.build().where((s) => s.id == id);
+        final matches = stories.all().where((s) => s.id == id);
         if (matches.isEmpty) {
           response.statusCode = HttpStatus.notFound;
           await response.close();
@@ -284,7 +284,7 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         }
       } else if (path.startsWith('/story/') && !path.endsWith('.png')) {
         final id = Uri.decodeComponent(path.substring('/story/'.length));
-        final all = stories.build();
+        final all = stories.all();
         final index = all.indexWhere((s) => s.id == id);
         if (index == -1) {
           response.statusCode = HttpStatus.notFound;
@@ -317,7 +317,7 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         _isolate(response);
         response.write(
           _galleryPage(
-            stories.build(),
+            stories.all(),
             _groupFor(path, stories),
             liveBuild: _liveBuildExists(),
           ),
@@ -724,7 +724,7 @@ if (!navigator.webdriver) {
 String? _groupFor(String path, Stories stories) {
   if (path.length < 2 || path.substring(1).contains('/')) return null;
   final group = Uri.decodeComponent(path.substring(1));
-  return stories.build().any((s) => s.id.startsWith('$group/')) ? group : null;
+  return stories.all().any((s) => s.id.startsWith('$group/')) ? group : null;
 }
 
 String _galleryPage(
