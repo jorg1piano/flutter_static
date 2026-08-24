@@ -93,7 +93,6 @@ class _RunCommand extends Command<int> {
       pidFile.path,
     ], mode: ProcessStartMode.inheritStdio);
     final webPidFile = File('.dart_tool/flutter_static_web.pid');
-    Process? webChild;
     final webTarget =
         argResults!['live'] as bool &&
             File('story/web_main.dart').existsSync() &&
@@ -101,10 +100,7 @@ class _RunCommand extends Command<int> {
         ? _linkedWebTarget()
         : null;
     if (webTarget != null) {
-      stdout.writeln(
-        'flutter_static: starting live web dev server on :$webPort',
-      );
-      webChild = await Process.start('flutter', [
+      _webArgs = [
         'run',
         '-d',
         'web-server',
@@ -114,24 +110,17 @@ class _RunCommand extends Command<int> {
         webTarget,
         '--pid-file',
         webPidFile.path,
-      ]);
-      // Not inheritStdio: the macOS run owns the terminal; surface the web
-      // tool's output line-prefixed instead.
-      webChild.stdout
-          .transform(const SystemEncoding().decoder)
-          .transform(const LineSplitter())
-          .listen((l) {
-            stdout.writeln('[web] $l');
-            _onWebOutput(l, webPidFile);
-          });
-      webChild.stderr
-          .transform(const SystemEncoding().decoder)
-          .transform(const LineSplitter())
-          .listen((l) => stderr.writeln('[web] $l'));
+      ];
+      _webPidFile = webPidFile;
+      stdout.writeln(
+        'flutter_static: starting live web dev server on :$webPort',
+      );
+      await _startWeb();
     }
-    _watchSources(pidFile, webChild == null ? null : webPidFile);
+    _watchSources(pidFile, webTarget == null ? null : webPidFile);
     final code = await child.exitCode;
-    webChild?.kill();
+    _shuttingDown = true;
+    _webChild?.kill();
     return code;
   }
 
@@ -231,18 +220,73 @@ class _RunCommand extends Command<int> {
     return '$dir/web_main.dart';
   }
 
-  // The web runner drops SIGUSR2 while a restart is in flight, so a save
-  // that lands mid-restart is re-signalled once the runner reports back.
+  // The live web dev server. It drops SIGUSR2 while a restart is in flight,
+  // so a save that lands mid-restart is re-signalled once the runner reports
+  // back; and it can wedge (a restart that never reports, after which new
+  // pages never run main), so a restart that stays silent past the watchdog
+  // gets the runner killed and relaunched.
+  List<String>? _webArgs;
+  File? _webPidFile;
+  Process? _webChild;
+  var _shuttingDown = false;
   var _webBusy = false;
   var _webSignaledAt = DateTime.fromMillisecondsSinceEpoch(0);
+  var _webLaunchedAt = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime? _webChangedAt;
   var _webErrors = false;
+  var _webRelaunch = false;
+  Timer? _webWatchdog;
+  static const _webWatchdogTimeout = Duration(seconds: 45);
+
+  Future<void> _startWeb() async {
+    final args = _webArgs;
+    if (args == null) return;
+    _webLaunchedAt = DateTime.now();
+    _webBusy = true;
+    _webErrors = false;
+    final child = await Process.start('flutter', args);
+    _webChild = child;
+    // Not inheritStdio: the macOS run owns the terminal; surface the web
+    // tool's output line-prefixed instead.
+    child.stdout
+        .transform(const SystemEncoding().decoder)
+        .transform(const LineSplitter())
+        .listen((l) {
+          stdout.writeln('[web] $l');
+          _onWebOutput(l);
+        });
+    child.stderr
+        .transform(const SystemEncoding().decoder)
+        .transform(const LineSplitter())
+        .listen((l) => stderr.writeln('[web] $l'));
+    unawaited(
+      child.exitCode.then((code) {
+        if (_webChild != child) return;
+        _webChild = null;
+        _webWatchdog?.cancel();
+        _webBusy = false;
+        if (_shuttingDown) return;
+        if (_webRelaunch) {
+          _webRelaunch = false;
+          stdout.writeln('flutter_static: relaunching the live web dev server');
+          _startWeb();
+        } else {
+          stderr.writeln(
+            'flutter_static: live web dev server exited ($code); '
+            'it relaunches on the next save.',
+          );
+        }
+      }),
+    );
+  }
 
   void _requestWebRestart(File webPidFile) {
     _webChangedAt = DateTime.now();
-    final stuck =
-        DateTime.now().difference(_webSignaledAt) > const Duration(seconds: 60);
-    if (!_webBusy || stuck) _signalWeb(webPidFile);
+    if (_webChild == null) {
+      _startWeb();
+      return;
+    }
+    if (!_webBusy) _signalWeb(webPidFile);
   }
 
   void _signalWeb(File webPidFile) {
@@ -250,18 +294,45 @@ class _RunCommand extends Command<int> {
     _webErrors = false;
     _webSignaledAt = DateTime.now();
     _signal(webPidFile, ProcessSignal.sigusr2);
+    _webWatchdog?.cancel();
+    _webWatchdog = Timer(_webWatchdogTimeout, _onWebStuck);
   }
 
-  /// Follows a restart on the web runner's stdout. The progress line prints
-  /// when the restart stops, before the outcome line on success and after
-  /// the compiler's errors on failure.
-  void _onWebOutput(String line, File webPidFile) {
+  void _onWebStuck() {
+    final child = _webChild;
+    if (child == null) return;
+    stderr.writeln(
+      'flutter_static: the live web dev server did not finish its restart '
+      'in ${_webWatchdogTimeout.inSeconds}s; killing and relaunching it.',
+    );
+    _webRelaunch = true;
+    child.kill(ProcessSignal.sigkill);
+  }
+
+  /// Follows the web runner's stdout. A restart's progress line prints when
+  /// it stops: before the outcome line on success, after the compiler's
+  /// errors on failure.
+  void _onWebOutput(String line) {
+    final webPidFile = _webPidFile;
+    if (webPidFile == null) return;
     if (line.contains(': Error: ')) {
       _webErrors = true;
       return;
     }
     final String status;
-    if (line.contains('Restarted application')) {
+    if (line.contains('is being served at')) {
+      // (Re)launched and serving. Open pages hold a dead frame after a
+      // relaunch: have them reload it. A save during startup is re-run.
+      status = 'recompiled';
+      _webWatchdog?.cancel();
+      _webBusy = false;
+      final changed = _webChangedAt;
+      if (changed != null && changed.isAfter(_webLaunchedAt)) {
+        _signalWeb(webPidFile);
+      }
+      _notifyCatalog(status);
+      return;
+    } else if (line.contains('Restarted application')) {
       status = 'restarted';
     } else if (line.contains('Recompile complete')) {
       status = 'recompiled';
@@ -270,6 +341,7 @@ class _RunCommand extends Command<int> {
     } else {
       return;
     }
+    _webWatchdog?.cancel();
     _webBusy = false;
     final changed = _webChangedAt;
     if (changed != null && changed.isAfter(_webSignaledAt)) {

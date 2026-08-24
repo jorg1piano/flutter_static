@@ -682,8 +682,7 @@ body{margin:0;background:#0A0B0D;color:#E2E4E9;font:14px system-ui,sans-serif;pa
 a{color:#9B9FAB;text-decoration:none}a:hover{color:#E2E4E9}
 h1{font-size:16px;margin:12px 0 24px;font-family:ui-monospace,monospace}
 .nav{font-size:12px;display:flex;gap:16px}
-.cols{display:flex;gap:28px;align-items:flex-start;flex-wrap:wrap}
-.cols section{margin:0;flex:1 1 460px;min-width:min(460px,100%)}
+section{margin:0 0 28px}
 section h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#6B6E7A;margin:0 0 10px}
 .png{background:#131518;border-radius:12px;padding:16px;display:inline-block;max-width:100%}
 .png img{display:block;max-width:min(840px,100%);height:auto;border-radius:8px}
@@ -693,13 +692,15 @@ section h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#6
 #devframe{border:0;width:100%;height:100%;min-height:120px;border-radius:8px;background:#131518}
 </style></head><body>
 <div class="nav"><a href="/">&larr; alle</a><a href="/$group">$group</a>
-<a href="/story/${_escape(prev)}">&larr; forrige</a><a href="/story/${_escape(next)}">neste &rarr;</a></div>
+<a href="/story/${_escape(prev)}">&larr; forrige</a><a href="/story/${_escape(next)}">neste &rarr;</a>
+<a href="/story/$id.png">png</a></div>
 <h1>$id</h1>
-<div class="cols">
-<section><h2>Render</h2>
-<a class="png" href="/story/$id.png"><img src="/story/$id.png?v=$_version" alt="$id"></a></section>
 <section><h2>Live${liveDev ? ' (hot reload)' : ''}</h2><div id="live">$live</div></section>
-</div>
+<!-- The render stays out of view: the gallery is where the PNGs earn their
+     place, as thumbnails. It only shows when no live view is possible. The
+     img still loads so its natural size can size the live box. -->
+<section id="render" hidden><h2>Render</h2>
+<a class="png" href="/story/$id.png"><img src="/story/$id.png?v=$_version" alt="$id"></a></section>
 <script>
 const STORY = '$id';
 const LIVE_DEV = $liveDev;
@@ -746,6 +747,7 @@ if (!LIVE_DEV) {
     s.src = '/live/flutter_bootstrap.js';
     document.body.appendChild(s);
   }).catch(() => {
+    document.getElementById('render').hidden = false;
     document.getElementById('live').innerHTML =
       '<div class="hint">Ingen web-bygg enn&aring; - kj&oslash;r flutter_static build-web for &aring; f&aring; en interaktiv versjon her.</div>';
   });
