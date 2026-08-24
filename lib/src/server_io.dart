@@ -341,6 +341,12 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         response.headers.contentType = ContentType.html;
         response.write(_galleryPage(stories.build(), _groupFor(path, stories)));
         await response.close();
+      } else if (_looksLikeDevAsset(path) &&
+          await _liveDevAvailable() &&
+          await _proxyToDev(request)) {
+        // Served by the dev server: the gallery runs its bundle on this
+        // origin, and the bundle's hot-restart path fetches page-relative
+        // URLs (reloaded_sources.json, then the changed modules).
       } else {
         response.statusCode = HttpStatus.notFound;
         await response.close();
@@ -352,6 +358,56 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         await response.close();
       } catch (_) {}
     }
+  }
+}
+
+/// Catalog routes have no extension (the .png and index.json ones are
+/// matched first); dev-server assets always do.
+bool _looksLikeDevAsset(String path) {
+  final last = path.substring(path.lastIndexOf('/') + 1);
+  return last.contains('.');
+}
+
+/// Forwards [request] to the live web dev server. False when it could not
+/// be reached, so the caller can answer instead.
+Future<bool> _proxyToDev(HttpRequest request) async {
+  final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+  try {
+    final target = request.uri.replace(
+      scheme: 'http',
+      host: 'localhost',
+      port: _webDevPort,
+    );
+    final upstream = await client.openUrl(request.method, target);
+    request.headers.forEach((name, values) {
+      if (name == HttpHeaders.hostHeader) return;
+      for (final value in values) {
+        upstream.headers.add(name, value);
+      }
+    });
+    await upstream.addStream(request);
+    final reply = await upstream.close();
+    final response = request.response;
+    response.statusCode = reply.statusCode;
+    // Let the dev server's caching policy through instead of the
+    // catalog's no-store (a 17MB SDK bundle per gallery load otherwise).
+    response.headers.removeAll(HttpHeaders.cacheControlHeader);
+    reply.headers.forEach((name, values) {
+      if (name == HttpHeaders.transferEncodingHeader ||
+          name == HttpHeaders.contentLengthHeader) {
+        return;
+      }
+      for (final value in values) {
+        response.headers.add(name, value);
+      }
+    });
+    await response.addStream(reply);
+    await response.close();
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    client.close();
   }
 }
 
@@ -799,9 +855,10 @@ String _galleryGroupsHtml(List<Story> stories, String? only) {
     for (final story in members) {
       final id = _escape(story.id);
       buffer.write(
-        '<a class="card" href="/story/$id">'
-        '<figure><img src="/story/$id.png?v=$_version" alt="$id" loading="lazy" decoding="async">'
-        '<figcaption>$id</figcaption></figure></a>',
+        '<div class="card" data-id="$id"><figure>'
+        '<a class="media" href="/story/$id">'
+        '<img src="/story/$id.png?v=$_version" alt="$id" loading="lazy" decoding="async"></a>'
+        '<a class="name" href="/story/$id">$id</a></figure></div>',
       );
     }
     buffer.write('</div>');
@@ -829,11 +886,12 @@ h2 a:hover{color:#E2E4E9}
 .back{display:inline-block;font-size:12px;color:#9B9FAB;text-decoration:none;margin:4px 0 0}
 .back:hover{color:#E2E4E9}
 .grid{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start}
-a.card{color:inherit;text-decoration:none;display:block}
 figure{margin:0;background:#131518;border-radius:12px;padding:12px}
-a.card:hover figure{background:#1A1D23}
+.card:hover figure{background:#1A1D23}
+.media{display:block}
 img{display:block;max-width:420px;height:auto;border-radius:8px;background:#0A0B0D}
-figcaption{margin-top:8px;font-size:12px;color:#6B6E7A;font-family:ui-monospace,monospace}
+.name{display:block;margin-top:8px;font-size:12px;color:#6B6E7A;font-family:ui-monospace,monospace;text-decoration:none}
+.name:hover{color:#E2E4E9}
 </style></head><body>
 <h1>flutter_static</h1>
 <!-- fs-marker-7 -->
@@ -842,6 +900,7 @@ figcaption{margin-top:8px;font-size:12px;color:#6B6E7A;font-family:ui-monospace,
 <script>
 const FILTER = '{{FILTER}}';
 const GROUPS = {{GROUP_LIST}};
+let shownVersion = {{VERSION}};
 // Left/right arrows cycle through the group pages.
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
@@ -855,6 +914,20 @@ document.addEventListener('keydown', (e) => {
 });
 async function load(v){
   const idx = await (await fetch('/index.json')).json();
+  const ids = idx.stories.map((s) => s.id).filter((id) => !FILTER || id.split('/')[0] === FILTER);
+  const shown = [...document.querySelectorAll('.card')].map((c) => c.dataset.id);
+  if (ids.join('|') === shown.join('|')) {
+    // Same stories: live views were hot restarted in place; refresh the PNGs
+    // when they are what is visible.
+    if ((v ?? idx.version) !== shownVersion) {
+      shownVersion = v ?? idx.version;
+      for (const img of document.querySelectorAll('.card img')) {
+        img.src = '/story/' + img.alt + '.png?v=' + shownVersion;
+      }
+    }
+    return;
+  }
+  shownVersion = v ?? idx.version;
   const groups = {};
   for (const s of idx.stories){
     const g = s.id.split('/')[0];
@@ -871,25 +944,36 @@ async function load(v){
     h.appendChild(hl); root.appendChild(h);
     const grid = document.createElement('div'); grid.className = 'grid';
     for (const s of stories){
-      const a = document.createElement('a');
-      a.className = 'card';
-      a.href = '/story/' + s.id;
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.dataset.id = s.id;
       const f = document.createElement('figure');
+      const media = document.createElement('a');
+      media.className = 'media';
+      media.href = '/story/' + s.id;
       const img = document.createElement('img');
       img.loading = 'lazy';
       img.decoding = 'async';
-      img.src = s.png + '?v=' + (v ?? idx.version);
+      img.src = s.png + '?v=' + shownVersion;
       img.alt = s.id;
-      const c = document.createElement('figcaption'); c.textContent = s.id;
-      f.append(img, c); a.appendChild(f); grid.appendChild(a);
+      media.appendChild(img);
+      const name = document.createElement('a');
+      name.className = 'name';
+      name.href = '/story/' + s.id;
+      name.textContent = s.id;
+      f.append(media, name); card.appendChild(f); grid.appendChild(card);
     }
     root.appendChild(grid);
   }
 }
 // Automation (headless screenshots, drivers) waits for network idle;
 // the ever-open SSE stream would hang it, so only humans get live reload.
-if (!navigator.webdriver)
-  new EventSource('/events').onmessage = (e) => load(JSON.parse(e.data).version);
+if (!navigator.webdriver) {
+  new EventSource('/events').onmessage = (e) => {
+    const d = JSON.parse(e.data);
+    load(d.version);
+  };
+}
 </script>
 </body></html>
 """;
