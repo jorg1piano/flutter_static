@@ -380,7 +380,7 @@ _flutter.loader.load({
 import 'main.dart';
 
 // Web entry point: the detail pages mount stories as live views.
-void main() => runFlutterStaticWeb(const \${match.group(1)}());
+void main() => runFlutterStaticWeb(const ${match.group(1)}());
 """,
       );
       stdout.writeln('Created story/web_main.dart');
