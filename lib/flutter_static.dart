@@ -42,8 +42,13 @@ void _prewarm(Stories stories) {
     await Future<void>.delayed(const Duration(milliseconds: 300));
     for (final story in stories.build()) {
       if (_version != version) return;
+      // Let interactive requests drain first; warming is idle work.
+      while (_foregroundWaiters > 0) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        if (_version != version) return;
+      }
       try {
-        await _renderCached(story);
+        await _renderCached(story, background: true);
       } catch (_) {}
       await Future<void>.delayed(const Duration(milliseconds: 10));
     }
@@ -133,11 +138,16 @@ Future<void> _serve(Stories stories, int port) async {
 /// story at a time.
 Future<void>? _captureQueue;
 
-Future<Uint8List> _renderCached(Story story) {
+/// Foreground (browser/CLI) renders waiting in the queue; the prewarmer
+/// yields to them.
+int _foregroundWaiters = 0;
+
+Future<Uint8List> _renderCached(Story story, {bool background = false}) {
   if (_renderCacheVersion == _version) {
     final hit = _renderCache[story.id];
     if (hit != null) return Future.value(hit);
   }
+  if (!background) _foregroundWaiters++;
   final previous = _captureQueue ?? Future<void>.value();
   final completer = Completer<void>();
   _captureQueue = completer.future;
@@ -149,6 +159,7 @@ Future<Uint8List> _renderCached(Story story) {
       }
       return _renderCache[story.id] ??= await _capture(story);
     } finally {
+      if (!background) _foregroundWaiters--;
       completer.complete();
     }
   });
