@@ -3,6 +3,7 @@ import 'dart:ui_web' as ui_web;
 
 import 'package:flutter/material.dart';
 
+import 'phone_mockup.dart';
 import 'story.dart';
 
 /// Entry point for web builds: every JS `addView({initialData: {storyId}})`
@@ -37,10 +38,9 @@ class _MultiViewStoriesState extends State<_MultiViewStories>
   @override
   void didChangeMetrics() => setState(() {});
 
-  String? _storyIdFor(int viewId) {
+  Map? _dataFor(int viewId) {
     try {
-      final data = ui_web.views.getInitialData(viewId)?.dartify();
-      return (data as Map?)?['storyId'] as String?;
+      return ui_web.views.getInitialData(viewId)?.dartify() as Map?;
     } catch (_) {
       return null;
     }
@@ -84,12 +84,16 @@ class _MultiViewStoriesState extends State<_MultiViewStories>
   }
 
   Widget _storyView(int viewId) {
-    final id = _storyIdFor(viewId);
+    final data = _dataFor(viewId);
+    final id = data?['storyId'] as String?;
     final all = widget.stories.all();
     final matches = all.where((s) => s.id == id);
     if (matches.isEmpty) {
       return Center(child: Text('unknown story: ${id ?? '<none>'}'));
     }
-    return SingleChildScrollView(child: Center(child: matches.first.builder()));
+    final device = PhoneSpec.byName(data?['device'] as String?);
+    Widget view = matches.first.builder();
+    if (device != null) view = DeviceScope(spec: device, child: view);
+    return SingleChildScrollView(child: Center(child: view));
   }
 }

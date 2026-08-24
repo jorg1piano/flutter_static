@@ -6,6 +6,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
+import 'phone_mockup.dart';
 import 'story.dart';
 import 'package:flutter/rendering.dart';
 
@@ -249,7 +250,12 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         response.headers.contentType = ContentType.html;
         _isolate(response);
         response.write(
-          _galleryPage(stories.all(), null, liveBuild: _liveBuildExists()),
+          _galleryPage(
+            stories.all(),
+            null,
+            liveBuild: _liveBuildExists(),
+            lines: stories.storylines(),
+          ),
         );
         await response.close();
       } else if (path == '/trace') {
@@ -274,9 +280,15 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
           response.statusCode = HttpStatus.notFound;
           await response.close();
         } else {
-          // Renders are pure per (story, reload version): cached, and
-          // capture work is serialized behind _captureQueue.
-          final png = await _renderCached(matches.first);
+          // Renders are pure per (story, device, reload version): cached,
+          // and capture work is serialized behind _captureQueue.
+          final device = PhoneSpec.byName(
+            request.uri.queryParameters['device'],
+          );
+          final story = device == null
+              ? matches.first
+              : _onDevice(matches.first, device);
+          final png = await _renderCached(story);
           response.headers.set('x-render-trace', _lastTrace);
           response.headers.contentType = ContentType('image', 'png');
           response.add(png);
@@ -292,7 +304,29 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         } else {
           response.headers.contentType = ContentType.html;
           _isolate(response);
-          response.write(_storyDetailPage(all, index));
+          final inLine = stories.storylines().any(
+            (line) => line.stories.any((s) => s.id == id),
+          );
+          response.write(
+            _storyDetailPage(
+              all,
+              index,
+              device: PhoneSpec.byName(request.uri.queryParameters['device']),
+              showDevices: inLine,
+            ),
+          );
+          await response.close();
+        }
+      } else if (path.startsWith('/line/')) {
+        final id = Uri.decodeComponent(path.substring('/line/'.length));
+        final lines = stories.storylines().where((l) => l.id == id);
+        if (lines.isEmpty) {
+          response.statusCode = HttpStatus.notFound;
+          await response.close();
+        } else {
+          response.headers.contentType = ContentType.html;
+          _isolate(response);
+          response.write(_linePage(lines.first, liveBuild: _liveBuildExists()));
           await response.close();
         }
       } else if (path.startsWith('/live/') || path == '/live') {
@@ -348,6 +382,29 @@ bool _liveBuildExists() {
   final root = _projectRoot();
   return root != null &&
       File('$root/build/web/flutter_bootstrap.js').existsSync();
+}
+
+/// [story] rendered for [device]: the frame builders read the scope.
+/// A distinct id keeps the render cache per device.
+Story _onDevice(Story story, PhoneSpec device) => Story(
+  '${story.id}@${device.name}',
+  () => DeviceScope(spec: device, child: story.builder()),
+);
+
+/// The device toggle for pages of storyline variants.
+String _deviceToolbar({String? selected, bool links = false}) {
+  final buffer = StringBuffer('<div class="toolbar"><span>Enhet</span>');
+  for (final spec in PhoneSpec.all) {
+    final on = spec.name == (selected ?? PhoneSpec.all.first.name);
+    final cls = on ? 'device on' : 'device';
+    buffer.write(
+      links
+          ? '<a class="$cls" href="?device=${spec.name}">${_escape(spec.label)}</a>'
+          : '<button class="$cls" data-device="${spec.name}">${_escape(spec.label)}</button>',
+    );
+  }
+  buffer.write('</div>');
+  return buffer.toString();
 }
 
 /// Cross-origin isolation: the wasm build's engine needs it on the page
@@ -636,9 +693,18 @@ Future<void> _settleWindow() async {
       DateTime.now().isBefore(deadline));
 }
 
-String _storyDetailPage(List<Story> all, int index) {
+String _storyDetailPage(
+  List<Story> all,
+  int index, {
+  PhoneSpec? device,
+  bool showDevices = false,
+}) {
   final story = all[index];
   final id = _escape(story.id);
+  final dev = device == null ? '' : '&device=${device.name}';
+  final toolbar = showDevices
+      ? _deviceToolbar(selected: device?.name, links: true)
+      : '';
   final group = _escape(story.id.split('/').first);
   final prev = all[(index - 1 + all.length) % all.length].id;
   final next = all[(index + 1) % all.length].id;
@@ -663,14 +729,16 @@ section h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#6
 <a href="/story/${_escape(prev)}">&larr; forrige</a><a href="/story/${_escape(next)}">neste &rarr;</a>
 <a href="/story/$id.png">png</a></div>
 <h1>$id</h1>
+$toolbar
 <section><h2>Live</h2><div id="live">$live</div></section>
 <!-- The render stays out of view: the gallery is where the PNGs earn their
      place, as thumbnails. It only shows when no live view is possible. The
      img still loads so its natural size can size the live box. -->
 <section id="render" hidden><h2>Render</h2>
-<a class="png" href="/story/$id.png"><img src="/story/$id.png?v=$_version" alt="$id"></a></section>
+<a class="png" href="/story/$id.png"><img src="/story/$id.png?v=$_version$dev" alt="$id"></a></section>
 <script>
 const STORY = '$id';
+const DEVICE = ${jsonEncode(device?.name)};
 document.addEventListener('keydown', (e) => {
   if (e.key === 'ArrowLeft') location.href = '/story/${_escape(prev)}';
   if (e.key === 'ArrowRight') location.href = '/story/${_escape(next)}';
@@ -694,14 +762,17 @@ if (!navigator.webdriver) {
     const d = JSON.parse(e.data);
     if (d.version !== seen) {
       seen = d.version;
-      img.src = '/story/' + STORY + '.png?v=' + d.version;
+      img.src = '/story/' + STORY + '.png?v=' + d.version + (DEVICE ? '&device=' + DEVICE : '');
     }
   };
 }
 {
   fetch('/live/flutter_bootstrap.js', {method: 'HEAD'}).then((r) => {
     if (!r.ok) throw 0;
-    window._flutterStaticStory = STORY;
+    // The page adds the view itself: the device travels in its data.
+    document.addEventListener('flutter-static-ready', (e) => {
+      e.detail.addView({hostElement: document.getElementById('host'), initialData: {storyId: STORY, device: DEVICE || undefined}});
+    });
     const s = document.createElement('script');
     s.src = '/live/flutter_bootstrap.js';
     document.body.appendChild(s);
@@ -731,22 +802,81 @@ String _galleryPage(
   List<Story> stories,
   String? only, {
   required bool liveBuild,
+  List<Storyline> lines = const [],
 }) {
   final ordered = <String>[];
   for (final story in stories) {
     final group = story.id.split('/').first;
     if (!ordered.contains(group)) ordered.add(group);
   }
+  final linesHtml = only != null || lines.isEmpty
+      ? ''
+      : '<h2>Storylines</h2><div class="lines">${lines.map((l) => '<a href="/line/${_escape(l.id)}">${_escape(l.title ?? l.id)}</a>').join()}</div>';
   return _indexHtml
       .replaceFirst('{{GROUPS}}', _galleryGroupsHtml(stories, only))
+      .replaceFirst('{{LINES}}', linesHtml)
+      .replaceFirst('{{TOOLBAR}}', '')
       .replaceFirst('{{GROUP_LIST}}', jsonEncode(ordered))
       .replaceFirst('{{FILTER}}', only ?? '')
+      .replaceFirst('{{LINE}}', 'false')
       .replaceFirst(
         '{{BACK}}',
         only == null ? '' : '<a class="back" href="/">&larr; alle grupper</a>',
       )
       .replaceFirst('{{VERSION}}', '$_version')
       .replaceFirst('{{LIVE_BUILD}}', '$liveBuild');
+}
+
+/// A storyline: its rows of cells, each cell its variants stacked, all
+/// live (near the viewport) with the device toggle on top.
+String _linePage(Storyline line, {required bool liveBuild}) {
+  final device = PhoneSpec.all.first.name;
+  final buffer = StringBuffer();
+  for (final row in line.rows) {
+    buffer.write('<h2>${_escape(row.title)}</h2><div class="grid">');
+    for (final cell in row.cells) {
+      buffer.write(
+        '<div class="cell"><h3>${_escape(cell.title ?? cell.id)}</h3>',
+      );
+      for (final variant in cell.variants) {
+        buffer.write(
+          _cardHtml(
+            '${line.id}/${cell.id}/${variant.id}',
+            label: variant.id,
+            device: device,
+          ),
+        );
+      }
+      buffer.write('</div>');
+    }
+    buffer.write('</div>');
+  }
+  return _indexHtml
+      .replaceFirst('{{GROUPS}}', buffer.toString())
+      .replaceFirst('{{LINES}}', '')
+      .replaceFirst('{{TOOLBAR}}', _deviceToolbar())
+      .replaceFirst('{{GROUP_LIST}}', '[]')
+      .replaceFirst('{{FILTER}}', line.id)
+      .replaceFirst('{{LINE}}', 'true')
+      .replaceFirst(
+        '{{BACK}}',
+        '<a class="back" href="/">&larr; alle grupper</a>'
+            '<h1 class="line">${_escape(line.title ?? line.id)}</h1>',
+      )
+      .replaceFirst('{{VERSION}}', '$_version')
+      .replaceFirst('{{LIVE_BUILD}}', '$liveBuild');
+}
+
+/// A card: the png (the size reference and the fallback) with its name
+/// linking to the story page; live mode swaps a view in above the png.
+String _cardHtml(String id, {String? label, String? device}) {
+  final e = _escape(id);
+  final src =
+      '/story/$e.png?v=$_version${device == null ? '' : '&device=$device'}';
+  return '<div class="card" data-id="$e"><figure>'
+      '<a class="media" href="/story/$e">'
+      '<img src="$src" alt="$e" loading="lazy" decoding="async"></a>'
+      '<a class="name" href="/story/$e">${_escape(label ?? id)}</a></figure></div>';
 }
 
 String _galleryGroupsHtml(List<Story> stories, String? only) {
@@ -761,13 +891,7 @@ String _galleryGroupsHtml(List<Story> stories, String? only) {
     final g = _escape(group);
     buffer.write('<h2><a href="/$g">$g</a></h2><div class="grid">');
     for (final story in members) {
-      final id = _escape(story.id);
-      buffer.write(
-        '<div class="card" data-id="$id"><figure>'
-        '<a class="media" href="/story/$id">'
-        '<img src="/story/$id.png?v=$_version" alt="$id" loading="lazy" decoding="async"></a>'
-        '<a class="name" href="/story/$id">$id</a></figure></div>',
-      );
+      buffer.write(_cardHtml(story.id));
     }
     buffer.write('</div>');
   });
@@ -804,15 +928,26 @@ img{display:block;max-width:420px;height:auto;border-radius:8px;background:#0A0B
 .png{display:block}
 .host{position:absolute;left:0;top:0;border-radius:8px;overflow:hidden;pointer-events:none}
 .card.booting img{opacity:.5;transition:opacity .3s}
+h1.line{font-size:16px;font-family:ui-monospace,monospace;margin:8px 0 0}
+.toolbar{margin:16px 0 0;font-size:12px;color:#9B9FAB;display:flex;gap:8px;align-items:center}
+.toolbar .device{font:inherit;color:#9B9FAB;background:#131518;border:1px solid #2A2D35;border-radius:8px;padding:4px 10px;cursor:pointer;text-decoration:none}
+.toolbar .device.on{color:#E2E4E9;border-color:#6B6E7A}
+.lines a{display:inline-block;margin:0 12px 8px 0;font-family:ui-monospace,monospace;font-size:12px;color:#9B9FAB;text-decoration:none}
+.lines a:hover{color:#E2E4E9}
+.cell{display:flex;flex-direction:column;gap:16px}
+.cell h3{font-size:12px;color:#9B9FAB;margin:0;font-family:ui-monospace,monospace;font-weight:500}
 .name{display:block;margin-top:8px;font-size:12px;color:#6B6E7A;font-family:ui-monospace,monospace;text-decoration:none}
 .name:hover{color:#E2E4E9}
 </style></head><body>
 <h1>flutter_static</h1>
 <!-- fs-marker-7 -->
 {{BACK}}
+{{TOOLBAR}}
+{{LINES}}
 <div id="groups">{{GROUPS}}</div>
 <script>
 const FILTER = '{{FILTER}}';
+const LINE = {{LINE}};
 const GROUPS = {{GROUP_LIST}};
 const LIVE_BUILD = {{LIVE_BUILD}};
 // Live views from the static build (flutter_static build-web) at /live/:
@@ -822,6 +957,33 @@ const LIVE_BUILD = {{LIVE_BUILD}};
 // the size reference (rendered at 2x) and the fallback for automation.
 const WEB = '/live/';
 const LIVE = LIVE_BUILD && !navigator.webdriver;
+// Device toggle (storyline pages): renders and views take ?device / the
+// view's initial data; the choice sticks per browser.
+let DEVICE = null;
+const deviceButtons = [...document.querySelectorAll('.toolbar button.device')];
+if (deviceButtons.length) {
+  try { DEVICE = localStorage.getItem('fs-device'); } catch (e) {}
+  if (!deviceButtons.some((b) => b.dataset.device === DEVICE)) DEVICE = deviceButtons[0].dataset.device;
+  for (const b of deviceButtons) b.addEventListener('click', () => setDevice(b.dataset.device));
+}
+function pngUrl(id, v) { return '/story/' + id + '.png?v=' + v + (DEVICE ? '&device=' + DEVICE : ''); }
+function setDevice(d) {
+  DEVICE = d;
+  try { localStorage.setItem('fs-device', d); } catch (e) {}
+  for (const b of deviceButtons) b.classList.toggle('on', b.dataset.device === d);
+  // A device changes a variant's size: back to a plain png card, which
+  // remounts (live cards) from the new render's size.
+  for (const card of document.querySelectorAll('.card')) {
+    unmount(card);
+    const media = card.querySelector('.media');
+    const link = document.createElement('a');
+    link.className = 'media'; link.href = '/story/' + card.dataset.id;
+    const img = document.createElement('img');
+    img.alt = card.dataset.id; img.loading = 'lazy'; img.decoding = 'async'; img.src = pngUrl(card.dataset.id, shownVersion);
+    link.appendChild(img); media.replaceWith(link);
+  }
+  observeAll();
+}
 const GROUP_LIVE = LIVE && !!FILTER;
 let app = null, booting = false;
 const pending = new Set();
@@ -900,7 +1062,7 @@ function addView(card) {
     card.dataset.view = app.addView({
       hostElement: host,
       viewConstraints: {minWidth: w, maxWidth: w, minHeight: h, maxHeight: h},
-      initialData: {storyId: card.dataset.id},
+      initialData: {storyId: card.dataset.id, device: DEVICE || undefined},
     });
     host.style.pointerEvents = 'auto';
     card.classList.remove('booting');
@@ -937,9 +1099,9 @@ function armHover() {
 function unmountAll() {
   for (const c of document.querySelectorAll('.card[data-view]')) unmount(c);
 }
-observeAll();
-armHover();
 let shownVersion = {{VERSION}};
+if (deviceButtons.length && DEVICE !== deviceButtons[0].dataset.device) setDevice(DEVICE);
+else { for (const b of deviceButtons) b.classList.toggle('on', b.dataset.device === DEVICE); observeAll(); armHover(); }
 // Left/right arrows cycle through the group pages.
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
@@ -952,6 +1114,14 @@ document.addEventListener('keydown', (e) => {
   location.href = '/' + encodeURIComponent(GROUPS[next]);
 });
 async function load(v){
+  if (LINE) {
+    // Server-rendered layout; only the pngs move.
+    if (v !== shownVersion) {
+      shownVersion = v;
+      if (!LIVE) for (const img of document.querySelectorAll('.card img')) img.src = pngUrl(img.alt, v);
+    }
+    return;
+  }
   const idx = await (await fetch('/index.json')).json();
   const ids = idx.stories.map((s) => s.id).filter((id) => !FILTER || id.split('/')[0] === FILTER);
   const shown = [...document.querySelectorAll('.card')].map((c) => c.dataset.id);
@@ -961,7 +1131,7 @@ async function load(v){
     if (!LIVE && (v ?? idx.version) !== shownVersion) {
       shownVersion = v ?? idx.version;
       for (const img of document.querySelectorAll('.card img')) {
-        img.src = '/story/' + img.alt + '.png?v=' + shownVersion;
+        img.src = pngUrl(img.alt, shownVersion);
       }
     }
     return;
@@ -994,7 +1164,7 @@ async function load(v){
       const img = document.createElement('img');
       img.loading = 'lazy';
       img.decoding = 'async';
-      img.src = s.png + '?v=' + shownVersion;
+      img.src = pngUrl(s.id, shownVersion);
       img.alt = s.id;
       media.appendChild(img);
       const name = document.createElement('a');

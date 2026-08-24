@@ -12,9 +12,10 @@ class Story {
 /// Wraps a storyline variant in whatever should surround it on the page.
 typedef FrameBuilder = Widget Function(BuildContext context, Widget child);
 
-/// The default frame: the variant as a screen inside a [PhoneMockup].
-Widget phoneMockupFrame(BuildContext _, Widget child) =>
-    PhoneMockup(child: child);
+/// The default frame: the variant as a screen inside a [PhoneMockup] of
+/// the device the page asked for ([DeviceScope]).
+Widget phoneMockupFrame(BuildContext context, Widget child) =>
+    PhoneMockup(spec: DeviceScope.of(context), child: child);
 
 /// No frame: the variant at its own size, like a gallery card.
 Widget bareFrame(BuildContext _, Widget child) => child;
