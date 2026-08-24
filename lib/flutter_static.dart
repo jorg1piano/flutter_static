@@ -156,11 +156,7 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         await response.close();
       } else if (path == '/' || path == '/index.html') {
         response.headers.contentType = ContentType.html;
-        response.write(
-          _indexHtml
-              .replaceFirst('{{GROUPS}}', _galleryGroupsHtml(stories.build()))
-              .replaceFirst('{{VERSION}}', '$_version'),
-        );
+        response.write(_galleryPage(stories.build(), null));
         await response.close();
       } else if (path == '/events') {
         response.bufferOutput = false;
@@ -186,6 +182,10 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
           response.add(png);
           await response.close();
         }
+      } else if (_groupFor(path, stories) != null) {
+        response.headers.contentType = ContentType.html;
+        response.write(_galleryPage(stories.build(), _groupFor(path, stories)));
+        await response.close();
       } else {
         response.statusCode = HttpStatus.notFound;
         await response.close();
@@ -244,14 +244,36 @@ Future<Uint8List> _capture(String id) async {
 /// Server-rendered grid so the initial document contains every <img>:
 /// the browser load event then waits for them, which makes headless
 /// screenshots deterministic. The inline script only re-renders on /events.
-String _galleryGroupsHtml(List<Story> stories) {
+/// The group name when [path] is a single-segment route matching an
+/// existing story group ("/tokens" -> "tokens"), else null.
+String? _groupFor(String path, Stories stories) {
+  if (path.length < 2 || path.substring(1).contains('/')) return null;
+  final group = Uri.decodeComponent(path.substring(1));
+  return stories.build().any((s) => s.id.startsWith('$group/')) ? group : null;
+}
+
+String _galleryPage(List<Story> stories, String? only) {
+  return _indexHtml
+      .replaceFirst('{{GROUPS}}', _galleryGroupsHtml(stories, only))
+      .replaceFirst('{{FILTER}}', only ?? '')
+      .replaceFirst(
+        '{{BACK}}',
+        only == null ? '' : '<a class="back" href="/">&larr; alle grupper</a>',
+      )
+      .replaceFirst('{{VERSION}}', '$_version');
+}
+
+String _galleryGroupsHtml(List<Story> stories, String? only) {
   final groups = <String, List<Story>>{};
   for (final story in stories) {
-    groups.putIfAbsent(story.id.split('/').first, () => []).add(story);
+    final group = story.id.split('/').first;
+    if (only != null && group != only) continue;
+    groups.putIfAbsent(group, () => []).add(story);
   }
   final buffer = StringBuffer();
   groups.forEach((group, members) {
-    buffer.write('<h2>${_escape(group)}</h2><div class="grid">');
+    final g = _escape(group);
+    buffer.write('<h2><a href="/$g">$g</a></h2><div class="grid">');
     for (final story in members) {
       final id = _escape(story.id);
       buffer.write(
@@ -279,19 +301,26 @@ const _indexHtml = """
 body{margin:0;background:#0A0B0D;color:#E2E4E9;font:14px system-ui,sans-serif;padding:32px}
 h1{font-size:18px;margin:0 0 8px}
 h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#9B9FAB;margin:32px 0 12px}
+h2 a{color:inherit;text-decoration:none}
+h2 a:hover{color:#E2E4E9}
+.back{display:inline-block;font-size:12px;color:#9B9FAB;text-decoration:none;margin:4px 0 0}
+.back:hover{color:#E2E4E9}
 .grid{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start}
 figure{margin:0;background:#131518;border-radius:12px;padding:12px}
 img{display:block;max-width:420px;height:auto;border-radius:8px;background:#0A0B0D}
 figcaption{margin-top:8px;font-size:12px;color:#6B6E7A;font-family:ui-monospace,monospace}
 </style></head><body>
 <h1>flutter_static</h1>
+{{BACK}}
 <div id="groups">{{GROUPS}}</div>
 <script>
+const FILTER = '{{FILTER}}';
 async function load(v){
   const idx = await (await fetch('/index.json')).json();
   const groups = {};
   for (const s of idx.stories){
     const g = s.id.split('/')[0];
+    if (FILTER && g !== FILTER) continue;
     (groups[g] ??= []).push(s);
   }
   const root = document.getElementById('groups');
