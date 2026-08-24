@@ -349,6 +349,11 @@ class _BuildWebCommand extends Command<int> {
 {{flutter_js}}
 {{flutter_build_config}}
 _flutter.loader.load({
+  config: {
+    entrypointBaseUrl: '/live/',
+    assetBase: '/live/',
+    canvasKitBaseUrl: '/live/canvaskit/',
+  },
   onEntrypointLoaded: async (engineInitializer) => {
     const engine = await engineInitializer.initializeEngine({
       multiViewEnabled: true,
