@@ -9,15 +9,11 @@ import 'package:flutter/material.dart';
 import 'story.dart';
 import 'package:flutter/rendering.dart';
 
-/// Ports, overridable at build time (flutter_static run --port/--web-port
-/// passes them as dart-defines).
+/// Port, overridable at build time (flutter_static run --port passes it
+/// as a dart-define).
 const _catalogPort = int.fromEnvironment(
   'FLUTTER_STATIC_PORT',
   defaultValue: 8474,
-);
-const _webDevPort = int.fromEnvironment(
-  'FLUTTER_STATIC_WEB_PORT',
-  defaultValue: 8476,
 );
 
 void runFlutterStatic(Stories stories, {int port = _catalogPort}) {
@@ -93,13 +89,7 @@ void _mountWindowStory(Story story) => _mountWindowStories([story]);
 
 int _version = 0;
 
-/// Bumped by the CLI (POST /web-reloaded) when the live web dev server
-/// finishes a hot restart, with the outcome it reported.
-int _webVersion = 0;
-String _webStatus = '';
-
-String _eventData() =>
-    '{"version": $_version, "web": $_webVersion, "webStatus": "$_webStatus"}';
+String _eventData() => '{"version": $_version}';
 
 void _broadcastEvent() {
   for (final client in _eventClients) {
@@ -257,12 +247,9 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         await response.close();
       } else if (path == '/' || path == '/index.html') {
         response.headers.contentType = ContentType.html;
+        _isolate(response);
         response.write(
-          _galleryPage(
-            stories.build(),
-            null,
-            liveDev: await _liveDevAvailable(),
-          ),
+          _galleryPage(stories.build(), null, liveBuild: _liveBuildExists()),
         );
         await response.close();
       } else if (path == '/trace') {
@@ -277,13 +264,6 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         response.flush();
         _eventClients.add(response);
         response.done.whenComplete(() => _eventClients.remove(response));
-      } else if (path == '/web-reloaded') {
-        final status = request.uri.queryParameters['status'] ?? '';
-        _webStatus = RegExp(r'^[a-z]+$').hasMatch(status) ? status : '';
-        _webVersion++;
-        _broadcastEvent();
-        response.statusCode = HttpStatus.noContent;
-        await response.close();
       } else if (path.startsWith('/story/') && path.endsWith('.png')) {
         final id = path.substring(
           '/story/'.length,
@@ -310,20 +290,9 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
           response.statusCode = HttpStatus.notFound;
           await response.close();
         } else {
-          // A running dev server (flutter_static run --live) beats the
-          // static /live build: it hot reloads. The dev page is embedded
-          // cross-origin in an iframe, so the wasm isolation headers must
-          // stay off in that mode (the dev build is JS and needs neither).
-          final liveDev = await _liveDevAvailable();
           response.headers.contentType = ContentType.html;
-          if (!liveDev) {
-            response.headers.set('Cross-Origin-Opener-Policy', 'same-origin');
-            response.headers.set(
-              'Cross-Origin-Embedder-Policy',
-              'require-corp',
-            );
-          }
-          response.write(_storyDetailPage(all, index, liveDev: liveDev));
+          _isolate(response);
+          response.write(_storyDetailPage(all, index));
           await response.close();
         }
       } else if (path.startsWith('/live/') || path == '/live') {
@@ -345,20 +314,15 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         }
       } else if (_groupFor(path, stories) != null) {
         response.headers.contentType = ContentType.html;
+        _isolate(response);
         response.write(
           _galleryPage(
             stories.build(),
             _groupFor(path, stories),
-            liveDev: await _liveDevAvailable(),
+            liveBuild: _liveBuildExists(),
           ),
         );
         await response.close();
-      } else if (_looksLikeDevAsset(path) &&
-          await _liveDevAvailable() &&
-          await _proxyToDev(request)) {
-        // Served by the dev server: the gallery runs its bundle on this
-        // origin, and the bundle's hot-restart path fetches page-relative
-        // URLs (reloaded_sources.json, then the changed modules).
       } else {
         response.statusCode = HttpStatus.notFound;
         await response.close();
@@ -373,83 +337,24 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
   }
 }
 
-/// Catalog routes have no extension (the .png and index.json ones are
-/// matched first); dev-server assets always do.
-bool _looksLikeDevAsset(String path) {
-  final last = path.substring(path.lastIndexOf('/') + 1);
-  return last.contains('.');
-}
-
-/// Forwards [request] to the live web dev server. False when it could not
-/// be reached, so the caller can answer instead.
-Future<bool> _proxyToDev(HttpRequest request) async {
-  final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
-  try {
-    final target = request.uri.replace(
-      scheme: 'http',
-      host: 'localhost',
-      port: _webDevPort,
-    );
-    final upstream = await client.openUrl(request.method, target);
-    request.headers.forEach((name, values) {
-      if (name == HttpHeaders.hostHeader) return;
-      for (final value in values) {
-        upstream.headers.add(name, value);
-      }
-    });
-    await upstream.addStream(request);
-    final reply = await upstream.close();
-    final response = request.response;
-    response.statusCode = reply.statusCode;
-    // Let the dev server's caching policy through instead of the
-    // catalog's no-store (a 17MB SDK bundle per gallery load otherwise).
-    response.headers.removeAll(HttpHeaders.cacheControlHeader);
-    reply.headers.forEach((name, values) {
-      if (name == HttpHeaders.transferEncodingHeader ||
-          name == HttpHeaders.contentLengthHeader) {
-        return;
-      }
-      for (final value in values) {
-        response.headers.add(name, value);
-      }
-    });
-    await response.addStream(reply);
-    await response.close();
-    return true;
-  } catch (_) {
-    return false;
-  } finally {
-    client.close();
-  }
-}
-
 /// Stories that need the real window (e.g. they embed a MaterialApp, whose
 /// View.of has no answer in an offscreen tree). Routed directly on later
 /// renders instead of re-attempting offscreen.
 final _needsWindow = <String>{};
 
-/// Whether the hot-reloading web dev server (flutter_static run --live)
-/// answers on the web dev port. Probed at most every few seconds.
-var _liveDevUp = false;
-var _liveDevChecked = DateTime.fromMillisecondsSinceEpoch(0);
-Future<bool> _liveDevAvailable() async {
-  final now = DateTime.now();
-  if (now.difference(_liveDevChecked) < const Duration(seconds: 3)) {
-    return _liveDevUp;
-  }
-  _liveDevChecked = now;
-  try {
-    final socket = await Socket.connect(
-      '127.0.0.1',
-      _webDevPort,
-      timeout: const Duration(milliseconds: 300),
-    );
-    socket.destroy();
-    _liveDevUp = true;
-  } catch (_) {
-    _liveDevUp = false;
-  }
-  return _liveDevUp;
+/// The static web build (flutter_static build-web) that /live/ serves; the
+/// pages mount stories from it as live views.
+bool _liveBuildExists() {
+  final root = _projectRoot();
+  return root != null &&
+      File('$root/build/web/flutter_bootstrap.js').existsSync();
+}
+
+/// Cross-origin isolation: the wasm build's engine needs it on the page
+/// that embeds it.
+void _isolate(HttpResponse response) {
+  response.headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+  response.headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
 }
 
 /// The consumer project root, derived from the debug binary's location
@@ -731,17 +636,13 @@ Future<void> _settleWindow() async {
       DateTime.now().isBefore(deadline));
 }
 
-String _storyDetailPage(List<Story> all, int index, {required bool liveDev}) {
+String _storyDetailPage(List<Story> all, int index) {
   final story = all[index];
   final id = _escape(story.id);
   final group = _escape(story.id.split('/').first);
   final prev = all[(index - 1 + all.length) % all.length].id;
   final next = all[(index + 1) % all.length].id;
-  final live = liveDev
-      ? '<iframe id="devframe" '
-            'src="http://localhost:$_webDevPort/?storyId=${Uri.encodeComponent(story.id)}" '
-            'allow="clipboard-write"></iframe>'
-      : '<div id="host"></div>';
+  const live = '<div id="host"></div>';
   return '''
 <!DOCTYPE html>
 <html><head><meta charset="utf-8"><base href="/live/"><title>$id - flutter_static</title>
@@ -757,13 +658,12 @@ section h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#6
 #live{background:#131518;border-radius:12px;padding:16px;min-height:120px;display:flex;align-items:center;justify-content:center;resize:vertical;overflow:hidden}
 #live .hint{color:#6B6E7A;font-size:12.5px}
 #host{width:100%;height:100%;min-height:120px}
-#devframe{border:0;width:100%;height:100%;min-height:120px;border-radius:8px;background:#131518}
 </style></head><body>
 <div class="nav"><a href="/">&larr; alle</a><a href="/$group">$group</a>
 <a href="/story/${_escape(prev)}">&larr; forrige</a><a href="/story/${_escape(next)}">neste &rarr;</a>
 <a href="/story/$id.png">png</a></div>
 <h1>$id</h1>
-<section><h2>Live${liveDev ? ' (hot reload)' : ''}</h2><div id="live">$live</div></section>
+<section><h2>Live</h2><div id="live">$live</div></section>
 <!-- The render stays out of view: the gallery is where the PNGs earn their
      place, as thumbnails. It only shows when no live view is possible. The
      img still loads so its natural size can size the live box. -->
@@ -771,7 +671,6 @@ section h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#6
 <a class="png" href="/story/$id.png"><img src="/story/$id.png?v=$_version" alt="$id"></a></section>
 <script>
 const STORY = '$id';
-const LIVE_DEV = $liveDev;
 document.addEventListener('keydown', (e) => {
   if (e.key === 'ArrowLeft') location.href = '/story/${_escape(prev)}';
   if (e.key === 'ArrowRight') location.href = '/story/${_escape(next)}';
@@ -788,26 +687,18 @@ const sizeLive = () => {
 img.addEventListener('load', sizeLive);
 sizeLive();
 if (!navigator.webdriver) {
-  // Keep the PNG in sync with hot reloads. The live frame: when the dev
-  // server had this page as a client it hot restarted the app in place
-  // ('restarted'); when it only recompiled, reload the frame to fetch the
-  // new bundle. A static /live build cannot change underneath us.
-  let seen = $_version, webSeen = $_webVersion;
+  // Keep the PNG in sync with hot reloads; the static live view cannot
+  // change underneath us.
+  let seen = $_version;
   new EventSource('/events').onmessage = (e) => {
     const d = JSON.parse(e.data);
     if (d.version !== seen) {
       seen = d.version;
       img.src = '/story/' + STORY + '.png?v=' + d.version;
     }
-    if (LIVE_DEV && d.web !== webSeen) {
-      webSeen = d.web;
-      const frame = document.getElementById('devframe');
-      frame.style.outline = d.webStatus === 'failed' ? '2px solid #E5484D' : '';
-      if (d.webStatus === 'recompiled') frame.src = frame.src;
-    }
   };
 }
-if (!LIVE_DEV) {
+{
   fetch('/live/flutter_bootstrap.js', {method: 'HEAD'}).then((r) => {
     if (!r.ok) throw 0;
     window._flutterStaticStory = STORY;
@@ -839,7 +730,7 @@ String? _groupFor(String path, Stories stories) {
 String _galleryPage(
   List<Story> stories,
   String? only, {
-  required bool liveDev,
+  required bool liveBuild,
 }) {
   final ordered = <String>[];
   for (final story in stories) {
@@ -855,7 +746,7 @@ String _galleryPage(
         only == null ? '' : '<a class="back" href="/">&larr; alle grupper</a>',
       )
       .replaceFirst('{{VERSION}}', '$_version')
-      .replaceFirst('{{LIVE_DEV}}', '$liveDev');
+      .replaceFirst('{{LIVE_BUILD}}', '$liveBuild');
 }
 
 String _galleryGroupsHtml(List<Story> stories, String? only) {
@@ -909,7 +800,9 @@ figure{margin:0;background:#131518;border-radius:12px;padding:12px}
 .card:hover figure{background:#1A1D23}
 .media{display:block}
 img{display:block;max-width:420px;height:auto;border-radius:8px;background:#0A0B0D}
-.host{border-radius:8px;background:#0A0B0D;overflow:hidden}
+.media{position:relative}
+.png{display:block}
+.host{position:absolute;left:0;top:0;border-radius:8px;overflow:hidden;pointer-events:none}
 .card.booting img{opacity:.5;transition:opacity .3s}
 .name{display:block;margin-top:8px;font-size:12px;color:#6B6E7A;font-family:ui-monospace,monospace;text-decoration:none}
 .name:hover{color:#E2E4E9}
@@ -921,16 +814,14 @@ img{display:block;max-width:420px;height:auto;border-radius:8px;background:#0A0B
 <script>
 const FILTER = '{{FILTER}}';
 const GROUPS = {{GROUP_LIST}};
-const LIVE_DEV = {{LIVE_DEV}};
-// Live views: inside a group every card goes live as it scrolls near; the
-// front page keeps its pngs and swaps a card for the real widget on hover.
-// The dev bundle boots on first need, not on page load, and comes through
-// this origin (the catalog proxies dev assets): its hot-restart path
-// fetches page-relative URLs, and cross-origin XHR trips on dwds. The png
-// stays the size reference (rendered at 2x) and the fallback for
-// automation.
-const WEB = '/';
-const LIVE = LIVE_DEV && !navigator.webdriver;
+const LIVE_BUILD = {{LIVE_BUILD}};
+// Live views from the static build (flutter_static build-web) at /live/:
+// inside a group every card goes live while it is near the viewport; the
+// front page keeps its pngs and swaps a card for the real widget on
+// hover. The engine boots on first need, not on page load. The png stays
+// the size reference (rendered at 2x) and the fallback for automation.
+const WEB = '/live/';
+const LIVE = LIVE_BUILD && !navigator.webdriver;
 const GROUP_LIVE = LIVE && !!FILTER;
 let app = null, booting = false;
 const pending = new Set();
@@ -938,14 +829,7 @@ function boot() {
   if (booting) return;
   booting = true;
   document.addEventListener('flutter-static-ready', (e) => {
-    // Fires again after every hot restart: the engine drops all views and
-    // hands out a fresh app; the old handle cannot add views any more.
-    const rerun = app !== null;
     app = e.detail;
-    if (rerun) {
-      for (const c of document.querySelectorAll('.card[data-view]')) delete c.dataset.view;
-      observeAll();
-    }
     for (const c of pending) mount(c);
     pending.clear();
   });
@@ -953,68 +837,84 @@ function boot() {
   s.src = WEB + 'flutter_bootstrap.js';
   document.body.appendChild(s);
 }
-const io = new IntersectionObserver((entries) => {
-  for (const e of entries) {
-    if (!e.isIntersecting) continue;
-    io.unobserve(e.target);
-    mount(e.target);
-  }
+// A live card holds a view only while it is near the viewport: added as
+// it comes within 300px, discarded once it is more than 900px away (the
+// gap keeps a card at the edge from flapping). The png stays underneath
+// as the placeholder, and its render size (2x) is the size of the view.
+const near = new IntersectionObserver((entries) => {
+  for (const e of entries) if (e.isIntersecting) mount(e.target);
 }, {rootMargin: '300px'});
+const far = new IntersectionObserver((entries) => {
+  for (const e of entries) if (!e.isIntersecting) unmount(e.target);
+}, {rootMargin: '900px'});
+function hostFor(card) {
+  let host = card.querySelector('.host');
+  if (host) return host;
+  const img = card.querySelector('img');
+  const w = Math.round(img.naturalWidth / 2), h = Math.round(img.naturalHeight / 2);
+  if (!w || !h) return null;
+  const scale = Math.min(1, 420 / w);
+  const box = document.createElement('div');
+  box.className = 'media';
+  box.style.cssText = 'width:' + Math.round(w * scale) + 'px;height:' + Math.round(h * scale) + 'px';
+  const link = card.querySelector('a.media');
+  link.replaceWith(box);
+  link.className = 'png';
+  img.style.cssText = 'width:100%;height:100%';
+  box.appendChild(link);
+  host = document.createElement('div');
+  host.className = 'host';
+  host.style.cssText = 'width:' + w + 'px;height:' + h + 'px;transform:scale(' + scale + ');transform-origin:0 0';
+  box.appendChild(host);
+  return host;
+}
 function mount(card) {
   if (card.dataset.view) return;
   boot();
   if (!app) { pending.add(card); card.classList.add('booting'); return; }
-  const existing = card.querySelector('.host');
-  if (existing) {
-    // A handle from before a restart cannot add views; the ready event of
-    // that restart observes the card again.
-    try {
-      card.dataset.view = app.addView({hostElement: existing, initialData: {storyId: card.dataset.id}});
-    } catch (e) { console.warn('flutter_static: view not added', card.dataset.id, e); }
+  const img = card.querySelector('img');
+  if (!(img.complete && img.naturalWidth)) {
+    img.addEventListener('load', () => mount(card), {once: true});
     return;
   }
-  const img = card.querySelector('img');
-  const go = () => {
-    const w = Math.round(img.naturalWidth / 2), h = Math.round(img.naturalHeight / 2);
-    if (!w || !h || card.dataset.view) return;
-    const scale = Math.min(1, 420 / w);
-    const box = document.createElement('div');
-    box.className = 'media';
-    box.style.cssText = 'width:' + Math.round(w * scale) + 'px;height:' + Math.round(h * scale) + 'px';
-    const host = document.createElement('div');
-    host.className = 'host';
-    host.style.cssText = 'width:' + w + 'px;height:' + h + 'px;transform:scale(' + scale + ');transform-origin:0 0';
-    box.appendChild(host);
-    card.querySelector('a.media').replaceWith(box);
-    card.classList.remove('booting');
+  const host = hostFor(card);
+  if (!host) return;
+  try {
     card.dataset.view = app.addView({hostElement: host, initialData: {storyId: card.dataset.id}});
-  };
-  if (img.complete && img.naturalWidth) go(); else img.addEventListener('load', go, {once: true});
+    host.style.pointerEvents = 'auto';
+    card.classList.remove('booting');
+  } catch (e) { console.warn('flutter_static: view not added', card.dataset.id, e); }
 }
-// Cards that are (or were) live get a view when they scroll near: all of
-// them inside a group, the hovered ones on the front page.
+function unmount(card) {
+  if (!card.dataset.view) return;
+  const host = card.querySelector('.host');
+  app.removeView(+card.dataset.view);
+  delete card.dataset.view;
+  host.replaceChildren();
+  host.style.pointerEvents = 'none';
+}
+// Live cards are watched for entering and leaving: all of them inside a
+// group, the hovered ones on the front page.
+function observe(card) {
+  near.observe(card);
+  far.observe(card);
+}
 function observeAll() {
   if (!LIVE) return;
-  // Start observation over: observe() is a no-op for a card still being
-  // observed, and a restart between its observation and its mount would
-  // otherwise leave it empty for good.
-  io.disconnect();
-  for (const c of document.querySelectorAll('.card:not([data-view])')) {
-    if (GROUP_LIVE || c.dataset.live) io.observe(c);
+  near.disconnect();
+  far.disconnect();
+  for (const c of document.querySelectorAll('.card')) {
+    if (GROUP_LIVE || c.dataset.live) observe(c);
   }
 }
 function armHover() {
   if (!LIVE || GROUP_LIVE) return;
   for (const c of document.querySelectorAll('.card:not([data-live])')) {
-    c.addEventListener('pointerenter', () => { c.dataset.live = '1'; mount(c); }, {once: true});
+    c.addEventListener('pointerenter', () => { c.dataset.live = '1'; observe(c); }, {once: true});
   }
 }
 function unmountAll() {
-  if (!app) return;
-  for (const c of document.querySelectorAll('.card[data-view]')) {
-    app.removeView(+c.dataset.view);
-    delete c.dataset.view;
-  }
+  for (const c of document.querySelectorAll('.card[data-view]')) unmount(c);
 }
 observeAll();
 armHover();
@@ -1035,8 +935,8 @@ async function load(v){
   const ids = idx.stories.map((s) => s.id).filter((id) => !FILTER || id.split('/')[0] === FILTER);
   const shown = [...document.querySelectorAll('.card')].map((c) => c.dataset.id);
   if (ids.join('|') === shown.join('|')) {
-    // Same stories: live views were hot restarted in place; refresh the PNGs
-    // when they are what is visible.
+    // Same stories: refresh the PNGs when they are what is visible (the
+    // static live views only change with a new build-web).
     if (!LIVE && (v ?? idx.version) !== shownVersion) {
       shownVersion = v ?? idx.version;
       for (const img of document.querySelectorAll('.card img')) {
@@ -1090,19 +990,8 @@ async function load(v){
 // Automation (headless screenshots, drivers) waits for network idle;
 // the ever-open SSE stream would hang it, so only humans get live reload.
 if (!navigator.webdriver) {
-  let webSeen = null;
   new EventSource('/events').onmessage = (e) => {
-    const d = JSON.parse(e.data);
-    if (webSeen !== null && d.web !== webSeen && LIVE && app) {
-      // Views stay attached through a hot restart: it re-runs main in
-      // place and the engine keeps them (a view added afterwards through
-      // the pre-restart app handle fails). A bare recompile means this
-      // page is no longer the dev server's client (it relaunched): start
-      // over with the new bundle.
-      if (d.webStatus === 'recompiled') { location.reload(); return; }
-    }
-    webSeen = d.web;
-    load(d.version);
+    load(JSON.parse(e.data).version);
   };
 }
 </script>

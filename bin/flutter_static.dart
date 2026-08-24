@@ -39,20 +39,7 @@ class _RunCommand extends Command<int> {
         help: 'Entry point that calls runFlutterStatic().',
       )
       ..addOption('device', abbr: 'd', defaultsTo: 'macos')
-      ..addOption('port', defaultsTo: '8474', help: 'Catalog server port.')
-      ..addOption(
-        'web-port',
-        defaultsTo: '8476',
-        help: 'Port for the live web dev server.',
-      )
-      ..addFlag(
-        'live',
-        defaultsTo: true,
-        help:
-            'Also run a hot-reloading web dev server that the story detail '
-            'pages embed as the live view. Needs a one-time '
-            'flutter_static build-web to scaffold web support.',
-      );
+      ..addOption('port', defaultsTo: '8474', help: 'Catalog server port.');
   }
 
   @override
@@ -77,8 +64,7 @@ class _RunCommand extends Command<int> {
       );
       return 1;
     }
-    _port = argResults!['port'] as String;
-    final webPort = argResults!['web-port'] as String;
+    final port = argResults!['port'] as String;
     final pidFile = File('.dart_tool/flutter_static.pid');
     pidFile.parent.createSync(recursive: true);
     final child = await Process.start('flutter', [
@@ -87,46 +73,15 @@ class _RunCommand extends Command<int> {
       argResults!['device'] as String,
       '-t',
       target,
-      '--dart-define=FLUTTER_STATIC_PORT=$_port',
-      '--dart-define=FLUTTER_STATIC_WEB_PORT=$webPort',
+      '--dart-define=FLUTTER_STATIC_PORT=$port',
       '--pid-file',
       pidFile.path,
     ], mode: ProcessStartMode.inheritStdio);
-    final webPidFile = File('.dart_tool/flutter_static_web.pid');
-    final webTarget =
-        argResults!['live'] as bool &&
-            File('story/web_main.dart').existsSync() &&
-            Directory('web').existsSync()
-        ? _linkedWebTarget()
-        : null;
-    if (webTarget != null) {
-      _webArgs = [
-        'run',
-        '-d',
-        'web-server',
-        '--web-port',
-        webPort,
-        // The gallery on the catalog's origin boots this bundle directly.
-        '--web-header=Access-Control-Allow-Origin=*',
-        '-t',
-        webTarget,
-        '--pid-file',
-        webPidFile.path,
-      ];
-      _webPidFile = webPidFile;
-      stdout.writeln(
-        'flutter_static: starting live web dev server on :$webPort',
-      );
-      await _startWeb();
-    }
-    _watchSources(pidFile, webTarget == null ? null : webPidFile);
-    final code = await child.exitCode;
-    _shuttingDown = true;
-    _webChild?.kill();
-    return code;
+    _watchSources(pidFile);
+    return child.exitCode;
   }
 
-  void _watchSources(File pidFile, File? webPidFile) {
+  void _watchSources(File pidFile) {
     final roots = _localPackageRoots();
     Timer? debounce;
     void watchRoot(String root) {
@@ -142,9 +97,6 @@ class _RunCommand extends Command<int> {
           debounce?.cancel();
           debounce = Timer(const Duration(milliseconds: 250), () {
             _signal(pidFile, ProcessSignal.sigusr1);
-            // Restart, not reload: only a web hot restart updates the bundle
-            // served to fresh page loads (each story navigation is one).
-            if (webPidFile != null) _requestWebRestart(webPidFile);
           });
         },
         onError: (Object e) {
@@ -176,256 +128,10 @@ class _RunCommand extends Command<int> {
     stdout.writeln('flutter_static: watching ${targets.join(', ')}');
   }
 
-  var _port = '8474';
-
   void _signal(File pidFile, ProcessSignal s) {
     final raw = pidFile.existsSync() ? pidFile.readAsStringSync().trim() : '';
     final pid = int.tryParse(raw);
     if (pid != null) Process.killPid(pid, s);
-  }
-
-  /// Entry point for the web dev server, reached through the symlink
-  /// lib/flutter_static_story -> ../story.
-  ///
-  /// A target outside lib/ is compiled under a private org-dartlang-app:
-  /// scheme (flutter_tools, ResidentWebRunner._generateEntrypoint) that the
-  /// hot-restart file invalidator cannot stat, so edits under story/ never
-  /// recompile: the restart reports success and serves the old bundle.
-  /// Through the link every story file has a package: URI, which restart
-  /// tracks like any other source.
-  String? _linkedWebTarget() {
-    const dir = 'lib/flutter_static_story';
-    final link = Link(dir);
-    if (link.existsSync()) {
-      final target = link.targetSync();
-      if (target != '../story') {
-        stderr.writeln(
-          'flutter_static: $dir points at $target, expected ../story; '
-          'not starting the live web server.',
-        );
-        return null;
-      }
-    } else if (FileSystemEntity.typeSync(dir) !=
-        FileSystemEntityType.notFound) {
-      stderr.writeln(
-        'flutter_static: $dir exists and is not a symlink; '
-        'not starting the live web server.',
-      );
-      return null;
-    } else {
-      link.createSync('../story');
-      stdout.writeln(
-        'flutter_static: created $dir -> ../story '
-        '(the live web server compiles stories through it)',
-      );
-    }
-    return '$dir/web_main.dart';
-  }
-
-  // The live web dev server. It drops SIGUSR2 while a restart is in flight,
-  // so a save that lands mid-restart is re-signalled once the runner reports
-  // back; and it can wedge (a restart that never reports, after which new
-  // pages never run main), so a restart that stays silent past the watchdog
-  // gets the runner killed and relaunched.
-  List<String>? _webArgs;
-  File? _webPidFile;
-  Process? _webChild;
-  var _shuttingDown = false;
-  var _webBusy = false;
-  var _webSignaledAt = DateTime.fromMillisecondsSinceEpoch(0);
-  var _webLaunchedAt = DateTime.fromMillisecondsSinceEpoch(0);
-  DateTime? _webChangedAt;
-  var _webErrors = false;
-  var _webRestartFailed = false;
-  var _webRelaunch = false;
-  var _webRelaunched = false;
-  var _webLaunchRetries = 0;
-  Timer? _webWatchdog;
-  static const _webWatchdogTimeout = Duration(seconds: 45);
-
-  Future<void> _startWeb({bool relaunch = false}) async {
-    final args = _webArgs;
-    final webPidFile = _webPidFile;
-    if (args == null || webPidFile == null) return;
-    _webRelaunched = relaunch;
-    _webLaunchedAt = DateTime.now();
-    _webBusy = true;
-    _webErrors = false;
-    final stalePid = _readPid(webPidFile);
-    final child = await Process.start('flutter', args);
-    _webChild = child;
-    unawaited(_awaitWebReady(child, stalePid));
-    // Not inheritStdio: the macOS run owns the terminal; surface the web
-    // tool's output line-prefixed instead.
-    child.stdout
-        .transform(const SystemEncoding().decoder)
-        .transform(const LineSplitter())
-        .listen((l) {
-          stdout.writeln('[web] $l');
-          _onWebOutput(l);
-        });
-    child.stderr
-        .transform(const SystemEncoding().decoder)
-        .transform(const LineSplitter())
-        .listen((l) => stderr.writeln('[web] $l'));
-    unawaited(
-      child.exitCode.then((code) {
-        if (_webChild != child) return;
-        _webChild = null;
-        _webWatchdog?.cancel();
-        _webBusy = false;
-        if (_shuttingDown) return;
-        final earlyExit =
-            DateTime.now().difference(_webLaunchedAt) <
-            const Duration(seconds: 30);
-        if (_webRelaunch) {
-          _webRelaunch = false;
-          stdout.writeln('flutter_static: relaunching the live web dev server');
-          _startWeb(relaunch: true);
-        } else if (earlyExit && _webLaunchRetries < 3) {
-          // Typically the port still held by the previous run's server for
-          // a few seconds after a quick q + restart.
-          _webLaunchRetries++;
-          stderr.writeln(
-            'flutter_static: live web dev server exited ($code) during '
-            'startup; retrying in 5s ($_webLaunchRetries/3).',
-          );
-          Future<void>.delayed(const Duration(seconds: 5), _startWeb);
-        } else {
-          stderr.writeln(
-            'flutter_static: live web dev server exited ($code); '
-            'it relaunches on the next save.',
-          );
-        }
-      }),
-    );
-  }
-
-  int? _readPid(File pidFile) => int.tryParse(
-    pidFile.existsSync() ? pidFile.readAsStringSync().trim() : '',
-  );
-
-  /// The runner writes its pid file right after registering its signal
-  /// handlers, and nothing it prints marks that moment ("is being served"
-  /// comes well before, "Debug service listening" only once a page
-  /// connects). So: ready when the file names a pid other than the one it
-  /// held before this launch. After a relaunch, open pages hold a dead
-  /// frame: have them reload it. A save that landed during startup is
-  /// re-run.
-  Future<void> _awaitWebReady(Process child, int? stalePid) async {
-    final webPidFile = _webPidFile!;
-    final deadline = DateTime.now().add(const Duration(minutes: 3));
-    while (_webChild == child) {
-      final pid = _readPid(webPidFile);
-      if (pid != null && pid != stalePid) break;
-      if (DateTime.now().isAfter(deadline)) {
-        stderr.writeln(
-          'flutter_static: the live web dev server never wrote its pid '
-          'file; hot restarts will not reach it.',
-        );
-        return;
-      }
-      await Future<void>.delayed(const Duration(milliseconds: 300));
-    }
-    if (_webChild != child) return;
-    _webWatchdog?.cancel();
-    _webBusy = false;
-    final changed = _webChangedAt;
-    if (changed != null && changed.isAfter(_webLaunchedAt)) {
-      await _signalWeb(webPidFile);
-    }
-    if (_webRelaunched) await _notifyCatalog('recompiled');
-  }
-
-  void _requestWebRestart(File webPidFile) {
-    _webChangedAt = DateTime.now();
-    if (_webChild == null) {
-      _startWeb();
-      return;
-    }
-    if (!_webBusy) _signalWeb(webPidFile);
-  }
-
-  Future<void> _signalWeb(File webPidFile) async {
-    _webBusy = true;
-    _webErrors = false;
-    _webRestartFailed = false;
-    _webSignaledAt = DateTime.now();
-    // The dev server waits for every connected page to acknowledge a hot
-    // restart, and a page holding several views never does; pages drop
-    // their views on this event, then get them back on the outcome.
-    await _notifyCatalog('restarting');
-    await Future<void>.delayed(const Duration(milliseconds: 150));
-    _signal(webPidFile, ProcessSignal.sigusr2);
-    _webWatchdog?.cancel();
-    _webWatchdog = Timer(_webWatchdogTimeout, _onWebStuck);
-  }
-
-  void _onWebStuck() {
-    final child = _webChild;
-    if (child == null) return;
-    stderr.writeln(
-      'flutter_static: the live web dev server did not finish its restart '
-      'in ${_webWatchdogTimeout.inSeconds}s; killing and relaunching it.',
-    );
-    _webRelaunch = true;
-    child.kill(ProcessSignal.sigkill);
-  }
-
-  /// Follows the web runner's stdout. A restart's progress line prints when
-  /// it stops: before the outcome line on success, after the compiler's
-  /// errors on failure.
-  void _onWebOutput(String line) {
-    final webPidFile = _webPidFile;
-    if (webPidFile == null) return;
-    if (line.contains(': Error: ')) {
-      _webErrors = true;
-      return;
-    }
-    if (line.contains('Hot restart failed')) {
-      // A client did not acknowledge in time (dwds gives up after 15s).
-      // The bundle recompiled all the same; pages reload to pick it up.
-      _webRestartFailed = true;
-      return;
-    }
-    final String status;
-    if (line.contains('Restarted application')) {
-      status = 'restarted';
-    } else if (line.contains('Recompile complete')) {
-      status = 'recompiled';
-    } else if (line.contains('Performing hot re') && _webErrors) {
-      status = 'failed';
-    } else if (line.contains('Performing hot re') && _webRestartFailed) {
-      status = 'recompiled';
-    } else {
-      return;
-    }
-    _webWatchdog?.cancel();
-    _webBusy = false;
-    final changed = _webChangedAt;
-    if (changed != null && changed.isAfter(_webSignaledAt)) {
-      _signalWeb(webPidFile);
-    }
-    _notifyCatalog(status);
-  }
-
-  /// Tells the catalog server the web bundle changed so open detail pages
-  /// refresh their live frame.
-  Future<void> _notifyCatalog(String status) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
-    try {
-      final request = await client.postUrl(
-        Uri.parse('http://localhost:$_port/web-reloaded?status=$status'),
-      );
-      final response = await request.close().timeout(
-        const Duration(seconds: 5),
-      );
-      await response.drain<void>();
-    } catch (_) {
-      // Catalog not up (yet): its pages load the current bundle anyway.
-    } finally {
-      client.close();
-    }
   }
 
   /// The app package itself plus every path dependency: exactly the code the
@@ -664,12 +370,9 @@ class _BuildWebCommand extends Command<int> {
       bootstrap.writeAsStringSync("""$marker
 {{flutter_js}}
 {{flutter_build_config}}
-// Works from three origins: the catalog's /live/ static build, the
-// hot-reloading dev server's root, and pages that load this script
-// cross-origin (the gallery). Resolve bases from this script's own URL.
+// Works from the catalog's /live/ and from a standalone page: resolve
+// bases from this script's own URL.
 const BASE = new URL('.', document.currentScript.src).href;
-// Runs at boot and again after every hot restart (see the re-arm below):
-// a restart disposes every view and the previous app handle with them.
 const onEntrypointLoaded = async (engineInitializer) => {
     // The engine resolves assets and CanvasKit against these, not the
     // loader config above, which only covers the entrypoint.
@@ -696,10 +399,6 @@ const onEntrypointLoaded = async (engineInitializer) => {
     }
     // Pages that mount their own views (the gallery) listen for this.
     document.dispatchEvent(new CustomEvent('flutter-static-ready', {detail: app}));
-    // flutter.js deletes this hook after the first boot, and the engine
-    // then treats a hot restart as "auto start": it re-runs the app on its
-    // own and never hands out the new app. Re-arm so it calls us instead.
-    _flutter.loader.didCreateEngineInitializer = onEntrypointLoaded;
 };
 _flutter.loader.load({
   config: {
