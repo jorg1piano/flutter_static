@@ -60,6 +60,7 @@ final _currentId = ValueNotifier<String?>(null);
 int _version = 0;
 final _renderCache = <String, Uint8List>{};
 int _renderCacheVersion = -1;
+String _lastTrace = '';
 final _eventClients = <HttpResponse>[];
 
 class _CatalogApp extends StatefulWidget {
@@ -209,6 +210,7 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
           // Renders are pure per (story, reload version): cached, and
           // capture work is serialized behind _captureQueue.
           final png = await _renderCached(matches.first);
+          response.headers.set('x-render-trace', _lastTrace);
           response.headers.contentType = ContentType('image', 'png');
           response.add(png);
           await response.close();
@@ -308,8 +310,16 @@ Future<Uint8List> _captureOffscreen(Story story) async {
     pipelineOwner.flushLayout();
   }
 
+  final sw = Stopwatch()..start();
+  final trace = StringBuffer();
+  void mark(String label) {
+    trace.write('$label=${sw.elapsedMilliseconds}ms ');
+    sw.reset();
+  }
+
   try {
     pump();
+    mark('first-pump');
     // A few real-time microturns so async work (image decoding) can land,
     // then synthetic frame pumps so animations reach a settled-looking
     // state without waiting wall-clock time. The budget bounds stories
@@ -331,13 +341,18 @@ Future<Uint8List> _captureOffscreen(Story story) async {
       await Future<void>.delayed(const Duration(milliseconds: 4));
       pump();
     }
+    mark('anim-pumps');
     pipelineOwner.flushCompositingBits();
     pipelineOwner.flushPaint();
+    mark('paint');
     final boundary =
         boundaryKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
     final image = await boundary.toImage(pixelRatio: 2);
+    mark('toImage');
     final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
+    mark('png-encode');
     image.dispose();
+    _lastTrace = '${story.id}: $trace';
     return bytes!.buffer.asUint8List();
   } finally {
     // Unmount so story states (and their tickers) are disposed; an
@@ -434,8 +449,9 @@ String _galleryGroupsHtml(List<Story> stories, String? only) {
     for (final story in members) {
       final id = _escape(story.id);
       buffer.write(
+        '<a class="card" href="/story/$id.png">'
         '<figure><img src="/story/$id.png?v=$_version" alt="$id" loading="lazy" decoding="async">'
-        '<figcaption>$id</figcaption></figure>',
+        '<figcaption>$id</figcaption></figure></a>',
       );
     }
     buffer.write('</div>');
@@ -463,11 +479,14 @@ h2 a:hover{color:#E2E4E9}
 .back{display:inline-block;font-size:12px;color:#9B9FAB;text-decoration:none;margin:4px 0 0}
 .back:hover{color:#E2E4E9}
 .grid{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start}
+a.card{color:inherit;text-decoration:none;display:block}
 figure{margin:0;background:#131518;border-radius:12px;padding:12px}
+a.card:hover figure{background:#1A1D23}
 img{display:block;max-width:420px;height:auto;border-radius:8px;background:#0A0B0D}
 figcaption{margin-top:8px;font-size:12px;color:#6B6E7A;font-family:ui-monospace,monospace}
 </style></head><body>
 <h1>flutter_static</h1>
+<!-- fs-marker-7 -->
 {{BACK}}
 <div id="groups">{{GROUPS}}</div>
 <script>
@@ -498,6 +517,9 @@ async function load(v){
     const h = document.createElement('h2'); h.textContent = g; root.appendChild(h);
     const grid = document.createElement('div'); grid.className = 'grid';
     for (const s of stories){
+      const a = document.createElement('a');
+      a.className = 'card';
+      a.href = s.png;
       const f = document.createElement('figure');
       const img = document.createElement('img');
       img.loading = 'lazy';
@@ -505,7 +527,7 @@ async function load(v){
       img.src = s.png + '?v=' + (v ?? idx.version);
       img.alt = s.id;
       const c = document.createElement('figcaption'); c.textContent = s.id;
-      f.append(img, c); grid.appendChild(f);
+      f.append(img, c); a.appendChild(f); grid.appendChild(a);
     }
     root.appendChild(grid);
   }
