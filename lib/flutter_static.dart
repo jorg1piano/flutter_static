@@ -104,6 +104,39 @@ Future<void> _serve(Stories stories, int port) async {
   final server = await HttpServer.bind(InternetAddress.loopbackIPv4, port);
   debugPrint('flutter_static serving on http://localhost:$port');
   await for (final request in server) {
+    // Handle concurrently: only captures are serialized (one window), so
+    // cache hits and static routes never queue behind a slow render.
+    unawaited(_handleRequest(request, stories));
+  }
+}
+
+/// Chains captures one after another; the shared window can only show one
+/// story at a time.
+Future<void>? _captureQueue;
+
+Future<Uint8List> _renderCached(String id) {
+  if (_renderCacheVersion == _version) {
+    final hit = _renderCache[id];
+    if (hit != null) return Future.value(hit);
+  }
+  final previous = _captureQueue ?? Future<void>.value();
+  final completer = Completer<void>();
+  _captureQueue = completer.future;
+  return previous.then((_) async {
+    try {
+      if (_renderCacheVersion != _version) {
+        _renderCache.clear();
+        _renderCacheVersion = _version;
+      }
+      return _renderCache[id] ??= await _capture(id);
+    } finally {
+      completer.complete();
+    }
+  });
+}
+
+Future<void> _handleRequest(HttpRequest request, Stories stories) async {
+  {
     final response = request.response;
     final path = request.uri.path;
     // Renders change on every hot reload; never let browsers cache them.
@@ -146,14 +179,9 @@ Future<void> _serve(Stories stories, int port) async {
           response.statusCode = HttpStatus.notFound;
           await response.close();
         } else {
-          // Renders are pure per (story, reload version): cache them so a
-          // gallery full of images costs one capture per story per reload
-          // instead of re-rendering on every page view.
-          if (_renderCacheVersion != _version) {
-            _renderCache.clear();
-            _renderCacheVersion = _version;
-          }
-          final png = _renderCache[id] ??= await _capture(id);
+          // Renders are pure per (story, reload version): cached, and
+          // capture work is serialized behind _captureQueue.
+          final png = await _renderCached(id);
           response.headers.contentType = ContentType('image', 'png');
           response.add(png);
           await response.close();
