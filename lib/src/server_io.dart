@@ -868,10 +868,23 @@ function hostFor(card) {
   box.appendChild(host);
   return host;
 }
+// Views are added one per animation frame: a burst of additions leaves
+// some of them painted at the wrong size until they are re-added.
+const queue = [];
+function drain() {
+  const card = queue.shift();
+  if (!card) return;
+  if (card.isConnected && !card.dataset.view && (GROUP_LIVE || card.dataset.live)) addView(card);
+  if (queue.length) requestAnimationFrame(drain);
+}
 function mount(card) {
-  if (card.dataset.view) return;
+  if (card.dataset.view || queue.includes(card)) return;
   boot();
   if (!app) { pending.add(card); card.classList.add('booting'); return; }
+  queue.push(card);
+  if (queue.length === 1) requestAnimationFrame(drain);
+}
+function addView(card) {
   const img = card.querySelector('img');
   if (!(img.complete && img.naturalWidth)) {
     img.addEventListener('load', () => mount(card), {once: true});
@@ -880,7 +893,15 @@ function mount(card) {
   const host = hostFor(card);
   if (!host) return;
   try {
-    card.dataset.view = app.addView({hostElement: host, initialData: {storyId: card.dataset.id}});
+    // Explicit constraints: without them the engine sizes every view's
+    // canvas off the last view added (flutter/flutter#185034, 3.41+),
+    // which shifts and doubles content in views that repaint.
+    const w = host.offsetWidth, h = host.offsetHeight;
+    card.dataset.view = app.addView({
+      hostElement: host,
+      viewConstraints: {minWidth: w, maxWidth: w, minHeight: h, maxHeight: h},
+      initialData: {storyId: card.dataset.id},
+    });
     host.style.pointerEvents = 'auto';
     card.classList.remove('booting');
   } catch (e) { console.warn('flutter_static: view not added', card.dataset.id, e); }
