@@ -361,7 +361,10 @@ Future<Uint8List> _captureOffscreen(Story story) async {
   pipelineOwner.rootNode = renderView;
   renderView.prepareInitialFrame();
 
-  Widget shell(Widget inner) => MediaQuery(
+  // Unbounded like the window's OverflowBox: Column(mainAxisSize.max)
+  // shrink-wraps under unbounded constraints but inflates to any bound,
+  // so bounded-loose canvases turned every card into a 932px giant.
+  Widget shell(Widget inner, {required bool unbounded}) => MediaQuery(
     data: const MediaQueryData(size: Size(430, 932), devicePixelRatio: 2),
     child: Localizations(
       locale: const Locale('en'),
@@ -377,7 +380,24 @@ Future<Uint8List> _captureOffscreen(Story story) async {
             style: theme.textTheme.bodyMedium!,
             child: Material(
               type: MaterialType.transparency,
-              child: RepaintBoundary(child: inner),
+              child: unbounded
+                  ? OverflowBox(
+                      minWidth: 0,
+                      minHeight: 0,
+                      maxWidth: double.infinity,
+                      maxHeight: double.infinity,
+                      alignment: Alignment.topLeft,
+                      child: RepaintBoundary(child: inner),
+                    )
+                  : RepaintBoundary(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(
+                          maxWidth: 430,
+                          maxHeight: 932,
+                        ),
+                        child: inner,
+                      ),
+                    ),
             ),
           ),
         ),
@@ -387,7 +407,7 @@ Future<Uint8List> _captureOffscreen(Story story) async {
 
   final root = RenderObjectToWidgetAdapter<RenderBox>(
     container: container,
-    child: shell(story.builder()),
+    child: shell(story.builder(), unbounded: true),
   ).attachToRenderTree(buildOwner);
 
   // Painting is the expensive pass for complex stories, so the pump loop
@@ -408,21 +428,25 @@ Future<Uint8List> _captureOffscreen(Story story) async {
   final baselineTickers = binding.transientCallbackCount;
 
   try {
-    pump();
+    var unboundedOk = true;
+    try {
+      pump();
+      final size = _findBoundary(container)?.size;
+      unboundedOk =
+          size != null &&
+          size.isFinite &&
+          size.width <= 1600 &&
+          size.height <= 3200;
+    } catch (_) {
+      unboundedOk = false;
+    }
     mark('first-pump');
-    // Expanders fill the loose canvas (content at the top of a mile of
-    // empty card): detect the cap hit and re-layout phone-tight.
-    final firstSize = _findBoundary(container)?.size;
-    if (firstSize != null &&
-        (firstSize.width >= 1599 || firstSize.height >= 3199)) {
+    if (!unboundedOk) {
+      // Stories that can't lay out unbounded (fill-style sizing) get the
+      // phone-bounded shell instead.
       RenderObjectToWidgetAdapter<RenderBox>(
         container: container,
-        child: shell(
-          ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 430, maxHeight: 932),
-            child: story.builder(),
-          ),
-        ),
+        child: shell(story.builder(), unbounded: false),
       ).attachToRenderTree(buildOwner, root);
       pump();
       mark('clamped');
