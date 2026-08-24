@@ -150,18 +150,26 @@ class _CatalogAppState extends State<_CatalogApp> {
                 alignment: Alignment.center,
                 children: [
                   for (final story in mounted)
-                    // Decouple story constraints from the window: a story
-                    // larger than the window must still lay out (and
-                    // capture) at its natural size.
+                    // Window-mounted stories are app screens (they embed
+                    // MaterialApp, which requires BOUNDED constraints - in
+                    // an unbounded OverflowBox its layout fails and the
+                    // broken render tree poisons every later window frame,
+                    // which offscreen captures also flush when pumping).
                     OverflowBox(
                       minWidth: 0,
                       minHeight: 0,
-                      maxWidth: double.infinity,
-                      maxHeight: double.infinity,
+                      maxWidth: 430,
+                      maxHeight: 932,
                       alignment: Alignment.center,
                       child: RepaintBoundary(
                         key: _windowKeys[story.id],
-                        child: story.builder(),
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(
+                            maxWidth: 430,
+                            maxHeight: 932,
+                          ),
+                          child: story.builder(),
+                        ),
                       ),
                     ),
                 ],
