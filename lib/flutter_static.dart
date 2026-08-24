@@ -248,10 +248,17 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
   }
 }
 
+/// Stories that need the real window (e.g. they embed a MaterialApp, whose
+/// View.of has no answer in an offscreen tree). Routed directly on later
+/// renders instead of re-attempting offscreen.
+final _needsWindow = <String>{};
+
 Future<Uint8List> _capture(Story story) async {
+  if (_needsWindow.contains(story.id)) return _captureOnWindow(story.id);
   try {
     return await _captureOffscreen(story);
   } catch (e) {
+    _needsWindow.add(story.id);
     _lastTrace = 'FALLBACK ${story.id}: $e';
     _traceLog(_lastTrace);
     debugPrint(
@@ -399,7 +406,9 @@ Future<Uint8List> _captureOnWindow(String id) async {
   // A hidden app has framesEnabled == false: scheduleFrame() is silently
   // ignored, so hasScheduledFrame can't be trusted as a settle signal.
   // transientCallbackCount counts active tickers and works either way.
-  final deadline = DateTime.now().add(const Duration(seconds: 3));
+  // Short budget: fallback stories are usually entrance-animated full
+  // screens; 700ms reaches a presentable state without stalling the queue.
+  final deadline = DateTime.now().add(const Duration(milliseconds: 700));
   var noVsync = !binding.framesEnabled;
   var synthetic = binding.currentSystemFrameTimeStamp;
   do {
