@@ -237,6 +237,7 @@ Future<Uint8List> _capture(Story story) async {
   try {
     return await _captureOffscreen(story);
   } catch (e) {
+    _lastTrace = 'FALLBACK ${story.id}: $e';
     debugPrint(
       'flutter_static: offscreen capture failed for ${story.id} ($e); '
       'falling back to window capture',
