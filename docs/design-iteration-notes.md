@@ -152,3 +152,31 @@ pixel diff ~3-4/255, which is the rasterizer floor (see below). Widgets live in
     pubspec changes still need a full runner restart.
 27. Colour emoji (avatar stand-in) renders fine in macOS captures via the
     Apple Color Emoji fallback - no asset needed for placeholder avatars.
+
+## Round 6 (Sendi "Na Matrise Eier - decomposed", 23 widgets)
+
+28. **`TextStyle.letterSpacing: null` lays Inter out ~3% wider than
+    `letterSpacing: 0`** — same variable font file, same weight. 12.5px/700
+    "Ingen svar ennå": 100 px with null, 96.5 with 0, Chrome 97.3. This is
+    what the per-style negative-tracking corrections in rounds 1–4 were
+    compensating for. Set 0 in the type scale and the calibration lines
+    match Chrome to the half pixel at every size and weight tried
+    (9.5–16px, 400–900). Calibrate (a sample line per style, ink widths
+    in both) before assuming a tracking problem.
+29. Chrome's `line-height: normal` is not `1.21·size`: ascent and descent
+    round to whole pixels separately (Inter: `round(0.96875·s) +
+    round(0.2421875·s)`), so 11px sets on 14 and 16px on 20.
+30. Material Symbols line box = `size + 4` (36 at 30), measured off the
+    sheet with Playwright rather than derived.
+31. Playwright `element.screenshot()` rounds a fractional page offset
+    outward: a widget under a 15.95px-tall footnote comes back one CSS px
+    taller with its top row blurred. Shift the element by `-frac` px
+    (`style.marginTop`) before shooting, and give the sheet's annotation
+    labels integer line-heights.
+32. CSS `border-top` on the card takes two layout pixels; a Flutter
+    `DecoratedBox` border takes none (use `Container`, or pad). Same for
+    a 1px hairline: a shell came out 1px short until it was a Container.
+33. Loop speed with a warm catalog: render ~10 ms, 23-story sweep with
+    diff + composites 0.9 s, hot reload 0.1–0.2 s (≈4 s first reload of
+    a big library). Reading the composites is the bottleneck, so print
+    numbers first and open only the outliers.
