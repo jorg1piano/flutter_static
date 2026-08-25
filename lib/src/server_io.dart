@@ -658,7 +658,15 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         final all = stories.all();
         final index = all.indexWhere((s) => s.id == id);
         if (index == -1) {
-          response.statusCode = HttpStatus.notFound;
+          // A prefix, not a story ("/story/flows/shell/now/"): what is
+          // under it has its own page.
+          final prefix = _groupFor('/$id', stories);
+          if (prefix != null) {
+            response.statusCode = HttpStatus.found;
+            response.headers.set('Location', '/$prefix');
+          } else {
+            response.statusCode = HttpStatus.notFound;
+          }
           await response.close();
         } else {
           response.headers.contentType = ContentType.html;
@@ -706,15 +714,18 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
           await response.addStream(file.openRead());
           await response.close();
         }
-      } else if (_groupFor(path, stories) != null) {
+      } else if (_groupFor(path, stories) case final prefix?) {
         response.headers.contentType = ContentType.html;
         _isolate(response);
+        final lines = stories.storylines().where((l) => l.id == prefix);
         response.write(
-          _galleryPage(
-            stories.all(),
-            _groupFor(path, stories),
-            liveBuild: _liveBuildExists(),
-          ),
+          lines.isNotEmpty
+              ? _linePage(lines.first, liveBuild: _liveBuildExists())
+              : _galleryPage(
+                  stories.all(),
+                  prefix,
+                  liveBuild: _liveBuildExists(),
+                ),
         );
         await response.close();
       } else {
@@ -1232,7 +1243,6 @@ String _storyDetailPage(
           chosen: chosen,
         )
       : '';
-  final group = _escape(story.id.split('/').first);
   final prev = all[(index - 1 + all.length) % all.length].id;
   final next = all[(index + 1) % all.length].id;
   const live = '<div id="host"></div>';
@@ -1243,6 +1253,8 @@ String _storyDetailPage(
 body{margin:0;background:#0A0B0D;color:#E2E4E9;font:14px system-ui,sans-serif;padding:32px}
 a{color:#9B9FAB;text-decoration:none}a:hover{color:#E2E4E9}
 h1{font-size:16px;margin:12px 0 24px;font-family:ui-monospace,monospace}
+h1 a{color:inherit}h1 a:hover{color:#9B9FAB}
+h1 .slash{color:#6B6E7A;margin:0 2px}
 .nav{font-size:12px;display:flex;gap:16px}
 section{margin:0 0 28px}
 section h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#6B6E7A;margin:0 0 10px}
@@ -1256,10 +1268,10 @@ section h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#6
 .toolbar .sep{margin-left:12px}
 #host{width:100%;height:100%;min-height:120px}
 </style></head><body>
-<div class="nav"><a href="/">&larr; alle</a><a href="/$group">$group</a>
+<div class="nav"><a href="/">&larr; alle</a>
 <a href="/story/${_escape(prev)}">&larr; forrige</a><a href="/story/${_escape(next)}">neste &rarr;</a>
 <a href="/story/$id.png">png</a></div>
-<h1>$id</h1>
+<h1>${_crumbs(story.id)}</h1>
 $toolbar
 <section><h2>Live</h2><div id="live">$live</div></section>
 <!-- The render stays out of view: the gallery is where the PNGs earn their
@@ -1329,12 +1341,33 @@ if (!navigator.webdriver) {
 /// Server-rendered grid so the initial document contains every <img>:
 /// the browser load event then waits for them, which makes headless
 /// screenshots deterministic. The inline script only re-renders on /events.
-/// The group name when [path] is a single-segment route matching an
-/// existing story group ("/tokens" -> "tokens"), else null.
+/// The id prefix when [path] is one that stories live under ("/tokens"
+/// -> "tokens", "/flows/shell/now" -> "flows/shell/now"), else null.
 String? _groupFor(String path, Stories stories) {
-  if (path.length < 2 || path.substring(1).contains('/')) return null;
-  final group = Uri.decodeComponent(path.substring(1));
-  return stories.all().any((s) => s.id.startsWith('$group/')) ? group : null;
+  final prefix = Uri.decodeComponent(
+    path.substring(1),
+  ).replaceAll(RegExp(r'/+$'), '');
+  if (prefix.isEmpty) return null;
+  return stories.all().any((s) => s.id.startsWith('$prefix/')) ? prefix : null;
+}
+
+bool _under(String id, String prefix) =>
+    id == prefix || id.startsWith('$prefix/');
+
+/// [id] as a path of links: every prefix is a page (a gallery of what is
+/// under it, or the storyline it names); the last segment links to
+/// [last], or stays text.
+String _crumbs(String id, {String? last}) {
+  final parts = id.split('/');
+  final buffer = StringBuffer();
+  for (var i = 0; i < parts.length; i++) {
+    if (i > 0) buffer.write('<span class="slash">/</span>');
+    final isLast = i == parts.length - 1;
+    final href = isLast ? last : '/${parts.sublist(0, i + 1).join('/')}';
+    final text = _escape(parts[i]);
+    buffer.write(href == null ? text : '<a href="${_escape(href)}">$text</a>');
+  }
+  return '$buffer';
 }
 
 String _galleryPage(
@@ -1400,6 +1433,7 @@ String _linePage(Storyline line, {required bool liveBuild}) {
       .replaceFirst(
         '{{BACK}}',
         '<a class="back" href="/">&larr; alle grupper</a>'
+            '<div class="name">${_crumbs(line.id)}</div>'
             '<h1 class="line">${_escape(line.title ?? line.id)}</h1>',
       )
       .replaceFirst('{{VERSION}}', '$_version')
@@ -1412,23 +1446,27 @@ String _cardHtml(String id, {String? label, String? device}) {
   final e = _escape(id);
   final src =
       '/story/$e.png?v=$_version${device == null ? '' : '&device=$device'}';
+  final name = label == null
+      ? _crumbs(id, last: '/story/$id')
+      : '<a href="/story/$e">${_escape(label)}</a>';
   return '<div class="card" data-id="$e"><figure>'
       '<a class="media" href="/story/$e">'
       '<img src="$src" alt="$e" loading="lazy" decoding="async"></a>'
-      '<a class="name" href="/story/$e">${_escape(label ?? id)}</a></figure></div>';
+      '<div class="name">$name</div></figure></div>';
 }
 
 String _galleryGroupsHtml(List<Story> stories, String? only) {
   final groups = <String, List<Story>>{};
   for (final story in stories) {
-    final group = story.id.split('/').first;
-    if (only != null && group != only) continue;
+    if (only != null && !_under(story.id, only)) continue;
+    final group = only ?? story.id.split('/').first;
     groups.putIfAbsent(group, () => []).add(story);
   }
   final buffer = StringBuffer();
   groups.forEach((group, members) {
-    final g = _escape(group);
-    buffer.write('<h2><a href="/$g">$g</a></h2><div class="grid">');
+    buffer.write(
+      '<h2>${_crumbs(group, last: '/$group')}</h2><div class="grid">',
+    );
     for (final story in members) {
       buffer.write(_cardHtml(story.id));
     }
@@ -1480,8 +1518,10 @@ h1.line{font-size:16px;font-family:ui-monospace,monospace;margin:8px 0 0}
 .lines a:hover{color:#E2E4E9}
 .cell{display:flex;flex-direction:column;gap:16px}
 .cell h3{font-size:12px;color:#9B9FAB;margin:0;font-family:ui-monospace,monospace;font-weight:500}
-.name{display:block;margin-top:8px;font-size:12px;color:#6B6E7A;font-family:ui-monospace,monospace;text-decoration:none}
-.name:hover{color:#E2E4E9}
+.name{display:block;margin-top:8px;font-size:12px;color:#6B6E7A;font-family:ui-monospace,monospace}
+.name a{color:inherit;text-decoration:none}
+.name a:hover{color:#E2E4E9}
+.slash{margin:0 1px}
 </style></head><body>
 <h1>flutter_static</h1>
 <!-- fs-marker-7 -->
@@ -1492,6 +1532,20 @@ h1.line{font-size:16px;font-family:ui-monospace,monospace;margin:8px 0 0}
 <script>
 const FILTER = '{{FILTER}}';
 const LINE = {{LINE}};
+// FILTER is an id prefix: 'flows', 'flows/shell/now', ...
+const inFilter = (id) => !FILTER || id === FILTER || id.startsWith(FILTER + '/');
+// An id as a path of links; the last segment goes to `last` or stays text.
+function crumbs(id, last) {
+  const box = document.createDocumentFragment();
+  const parts = id.split('/');
+  parts.forEach((part, i) => {
+    if (i) { const s = document.createElement('span'); s.className = 'slash'; s.textContent = '/'; box.appendChild(s); }
+    const href = i === parts.length - 1 ? last : '/' + parts.slice(0, i + 1).join('/');
+    if (!href) { box.appendChild(document.createTextNode(part)); return; }
+    const a = document.createElement('a'); a.href = href; a.textContent = part; box.appendChild(a);
+  });
+  return box;
+}
 const GROUPS = {{GROUP_LIST}};
 const LIVE_BUILD = {{LIVE_BUILD}};
 // Live views from the static build (flutter_static build-web) at /live/:
@@ -1691,7 +1745,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
   if (!GROUPS.length) return;
   const delta = e.key === 'ArrowRight' ? 1 : -1;
-  const i = GROUPS.indexOf(FILTER);
+  const i = GROUPS.indexOf(FILTER.split('/')[0]);
   const next = i === -1
     ? (delta === 1 ? 0 : GROUPS.length - 1)
     : (i + delta + GROUPS.length) % GROUPS.length;
@@ -1707,7 +1761,7 @@ async function load(v){
     return;
   }
   const idx = await (await fetch('/index.json')).json();
-  const ids = idx.stories.map((s) => s.id).filter((id) => !FILTER || id.split('/')[0] === FILTER);
+  const ids = idx.stories.map((s) => s.id).filter(inFilter);
   const shown = [...document.querySelectorAll('.card')].map((c) => c.dataset.id);
   if (ids.join('|') === shown.join('|')) {
     // Same stories: refresh the PNGs (the live views only change with a
@@ -1724,18 +1778,15 @@ async function load(v){
   unmountAll();
   const groups = {};
   for (const s of idx.stories){
-    const g = s.id.split('/')[0];
-    if (FILTER && g !== FILTER) continue;
+    if (!inFilter(s.id)) continue;
+    const g = FILTER || s.id.split('/')[0];
     (groups[g] ??= []).push(s);
   }
   const root = document.getElementById('groups');
   root.innerHTML = '';
   for (const [g, stories] of Object.entries(groups)){
     const h = document.createElement('h2');
-    const hl = document.createElement('a');
-    hl.href = '/' + encodeURIComponent(g);
-    hl.textContent = g;
-    h.appendChild(hl); root.appendChild(h);
+    h.appendChild(crumbs(g, '/' + g)); root.appendChild(h);
     const grid = document.createElement('div'); grid.className = 'grid';
     for (const s of stories){
       const card = document.createElement('div');
@@ -1751,10 +1802,9 @@ async function load(v){
       img.src = pngUrl(s.id, shownVersion);
       img.alt = s.id;
       media.appendChild(img);
-      const name = document.createElement('a');
+      const name = document.createElement('div');
       name.className = 'name';
-      name.href = '/story/' + s.id;
-      name.textContent = s.id;
+      name.appendChild(crumbs(s.id, '/story/' + s.id));
       f.append(media, name); card.appendChild(f); grid.appendChild(card);
     }
     root.appendChild(grid);
