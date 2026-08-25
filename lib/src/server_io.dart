@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 
 import 'phone_mockup.dart';
 import 'story.dart';
+import 'tokens.dart';
 import 'package:flutter/rendering.dart';
 
 /// Port, overridable at build time (flutter_static run --port passes it
@@ -558,6 +559,26 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
                   'id': line.id,
                   'title': line.title,
                   'page': '/line/${line.id}',
+                  'rows': [
+                    for (final row in line.rows)
+                      {
+                        'title': row.title,
+                        'cells': [
+                          for (final cell in row.cells)
+                            {
+                              'id': cell.id,
+                              'title': cell.title,
+                              'variants': [
+                                for (final v in cell.variants)
+                                  {
+                                    'id': v.id,
+                                    'story': '${line.id}/${cell.id}/${v.id}',
+                                  },
+                              ],
+                            },
+                        ],
+                      },
+                  ],
                   'knobs': [
                     for (final knob in line.knobs)
                       {
@@ -585,6 +606,39 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
             lines: stories.storylines(),
           ),
         );
+        await response.close();
+      } else if (path == '/tokens.json') {
+        // The project's design tokens, parsed from source (see tokens.dart).
+        final root = _projectRoot();
+        if (root == null) {
+          response.statusCode = HttpStatus.notFound;
+          response.write('project root not found');
+        } else {
+          response.headers.contentType = ContentType.json;
+          response.write(tokensJson(TokenSet.load(root)));
+        }
+        await response.close();
+      } else if (path == '/tokens' && request.method == 'POST') {
+        // {"id": "AppColors.primary", "value": "Color(0xFF...)"} rewrites
+        // the token's expression; {"id", "arg": "fontSize", "value"} one
+        // argument of a TextStyle token. The watcher hot reloads the save.
+        final root = _projectRoot();
+        final body = jsonDecode(await utf8.decoder.bind(request).join());
+        final token = root == null
+            ? null
+            : TokenSet.load(root).find(body['id'] as String? ?? '');
+        if (token == null) {
+          response.statusCode = HttpStatus.notFound;
+          response.write('no token ${body['id']}');
+        } else {
+          final arg = body['arg'] as String?;
+          final value = body['value'] as String;
+          final written = arg == null
+              ? writeToken(token, value)
+              : writeTokenArg(token, arg, value);
+          response.headers.contentType = ContentType.json;
+          response.write(jsonEncode(written.toJson()));
+        }
         await response.close();
       } else if (path == '/trace') {
         response.headers.contentType = ContentType.text;
