@@ -18,6 +18,8 @@ Future<void> main(List<String> arguments) async {
           'flutter_static',
           'Widget story catalog: PNG renders over HTTP.',
         )
+        ..addCommand(_UpCommand())
+        ..addCommand(_DownCommand())
         ..addCommand(_RunCommand())
         ..addCommand(_InitCommand())
         ..addCommand(_BuildWebCommand())
@@ -87,83 +89,813 @@ class _RunCommand extends Command<int> {
       'flutter_static: catalog port $port '
       '(registered in ${_PortRegistry.file.path})',
     );
-    final pidFile = File('.dart_tool/flutter_static.pid');
-    pidFile.parent.createSync(recursive: true);
-    final child = await Process.start('flutter', [
-      'run',
-      '-d',
-      argResults!['device'] as String,
-      '-t',
-      target,
-      '--dart-define=FLUTTER_STATIC_PORT=$port',
-      '--pid-file',
-      pidFile.path,
-    ], mode: ProcessStartMode.inheritStdio);
-    _watchSources(pidFile);
-    return child.exitCode;
+    return _Runner(
+      target: target,
+      device: argResults!['device'] as String,
+      port: port,
+    ).run();
+  }
+}
+
+/// `flutter_static up`: setup, start the catalog, block until it renders.
+///
+/// Runs setup (a no-op when everything exists), then reuses this project's
+/// runner when one is alive, restarts it with `--restart`, or starts one
+/// detached with its output in `.dart_tool/flutter_static.log`. Returns
+/// once `/index.json` answers, the story is listed, and one render of it
+/// has passed the freshness gate, so the caller cannot get ahead of the
+/// build or the first reload.
+class _UpCommand extends Command<int> {
+  _UpCommand() {
+    argParser
+      ..addOption(
+        'story',
+        abbr: 's',
+        help:
+            'Story id that must be listed and rendered before up returns '
+            '(default: the first listed story).',
+      )
+      ..addOption(
+        'out',
+        abbr: 'o',
+        help:
+            'Where to write that render '
+            '(default: .dart_tool/flutter_static_up.png).',
+      )
+      ..addOption(
+        'timeout',
+        defaultsTo: '900',
+        help:
+            'Seconds to wait for the catalog to answer; the first macOS '
+            'build of a project takes minutes.',
+      )
+      ..addOption('port', help: 'Forwarded to run.')
+      ..addOption(
+        'org',
+        help: 'Forwarded to setup when a macOS runner has to be created.',
+      )
+      ..addFlag(
+        'restart',
+        negatable: false,
+        help: 'Stop the running catalog for this project first.',
+      );
   }
 
-  void _watchSources(File pidFile) {
-    final roots = _localPackageRoots();
-    Timer? debounce;
-    void watchRoot(String root) {
-      DirectoryWatcher(root).events.listen(
-        (event) {
-          final path = event.path;
-          if (!path.endsWith('.dart')) return;
-          if (path.contains('/.dart_tool/') ||
-              path.contains('/build/') ||
-              path.contains('/.git/')) {
-            return;
-          }
-          debounce?.cancel();
-          debounce = Timer(const Duration(milliseconds: 250), () {
-            _signal(pidFile, ProcessSignal.sigusr1);
-          });
-        },
-        onError: (Object e) {
-          stderr.writeln(
-            'flutter_static: watcher error on $root: $e; '
-            'restarting watcher',
-          );
-          watchRoot(root);
-        },
-        onDone: () {
-          stderr.writeln('flutter_static: watcher for $root ended; restarting');
-          watchRoot(root);
-        },
+  @override
+  String get name => 'up';
+  @override
+  String get description =>
+      'Setup if needed, start the catalog in the background, and return '
+      'only once it answers and a story has rendered.';
+
+  static final logFile = File('.dart_tool/flutter_static.log');
+
+  @override
+  Future<int> run() async {
+    final started = Stopwatch()..start();
+    if (!File('pubspec.yaml').existsSync()) {
+      stderr.writeln(
+        'No pubspec.yaml here. Run up from the root of the Flutter project '
+        'that hosts (or should host) the stories.',
+      );
+      return 1;
+    }
+    final timeout = Duration(
+      seconds: int.tryParse(argResults!['timeout'] as String) ?? 900,
+    );
+
+    // 1. Setup: story/, the dependency, pub get, a macOS runner. A no-op
+    //    when all of it exists.
+    final org = argResults!['org'] as String?;
+    final setup = await _self([
+      'setup',
+      if (org != null) ...['--org', org],
+    ], quiet: true);
+    if (setup != 0) return setup;
+
+    // 2. A runner for this project.
+    final requested = argResults!['port'] as String?;
+    final port = await _PortRegistry.claim(
+      requested: requested == null ? null : int.tryParse(requested),
+    );
+    if (port == null) {
+      stderr.writeln('Invalid port: $requested');
+      return 64;
+    }
+    final url = 'http://localhost:$port';
+    var pid = _runnerPid();
+    if (pid != null && argResults!['restart'] as bool) {
+      await _DownCommand.stop(pid, port);
+      pid = null;
+    }
+    if (pid != null) {
+      stdout.writeln(
+        'flutter_static: catalog runner already alive (pid $pid); '
+        'waiting for it.',
+      );
+    } else {
+      _DownCommand.killPortHolders(port);
+      pid = await _launch(port);
+      stdout.writeln(
+        'flutter_static: started the catalog runner (pid $pid), '
+        'log: ${logFile.path}',
       );
     }
 
-    // Watch only the Dart-bearing subdirectories: watching a whole package
-    // root means the watcher's initial scan crawls deps/_build/node_modules
-    // (minutes on a big repo) before delivering a single event.
-    final targets = <String>[];
-    for (final root in roots) {
-      final narrow = [
-        '$root/lib',
-        '$root/story',
-      ].where((d) => Directory(d).existsSync()).toList();
-      targets.addAll(narrow.isEmpty ? [root] : narrow);
+    // 3. The catalog answers.
+    final deadline = DateTime.now().add(timeout);
+    var lastNote = DateTime.now();
+    while (await _StoryDir._index(url) == null) {
+      if (_runnerPid() == null) {
+        stderr.writeln('flutter_static: the runner exited. Log tail:');
+        _tailLog();
+        return 1;
+      }
+      if (DateTime.now().isAfter(deadline)) {
+        stderr.writeln(
+          'flutter_static: no catalog at $url after ${timeout.inSeconds}s. '
+          'Log tail:',
+        );
+        _tailLog();
+        return 1;
+      }
+      if (DateTime.now().difference(lastNote) > const Duration(seconds: 15)) {
+        lastNote = DateTime.now();
+        stdout.writeln(
+          'flutter_static: still building '
+          '(${started.elapsed.inSeconds}s), last log line: ${_lastLogLine()}',
+        );
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 500));
     }
-    targets.forEach(watchRoot);
-    stdout.writeln('flutter_static: watching ${targets.join(', ')}');
+
+    // 4. The story is listed (a just-added one is a hot reload away).
+    final wanted = argResults!['story'] as String?;
+    final listDeadline = DateTime.now().add(const Duration(seconds: 30));
+    String id;
+    while (true) {
+      final ids = await _StoryDir._index(url) ?? const <String>{};
+      if (wanted == null && ids.isNotEmpty) {
+        id = ids.first;
+        break;
+      }
+      if (wanted != null && ids.contains(wanted)) {
+        id = wanted;
+        break;
+      }
+      if (DateTime.now().isAfter(listDeadline)) {
+        stderr.writeln(
+          wanted == null
+              ? 'flutter_static: the catalog at $url lists no stories. Add '
+                    'one with: flutter_static add story <group>/<name>'
+              : 'flutter_static: "$wanted" is not listed at $url. Listed: '
+                    '${ids.isEmpty ? '(none)' : ids.take(20).join(', ')}. '
+                    'Add it with: flutter_static add story $wanted',
+        );
+        return 1;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    }
+
+    // 5. It renders. Goes through the gate: a save made during the build
+    //    has reloaded by the time this returns.
+    final out =
+        (argResults!['out'] as String?) ?? '.dart_tool/flutter_static_up.png';
+    final render = Stopwatch()..start();
+    final written = await _renderStory(id, url, out);
+    if (written == null) {
+      stderr.writeln(
+        'flutter_static: the catalog answers but "$id" did not render. '
+        'Log tail:',
+      );
+      _tailLog();
+      return 1;
+    }
+    final count = (await _StoryDir._index(url))?.length ?? 0;
+    stdout.writeln(
+      'flutter_static: up at $url in ${started.elapsed.inSeconds}s; '
+      '$count stories; rendered $id to $out in '
+      '${render.elapsedMilliseconds}ms. Saves under the watched roots hot '
+      'reload; renders wait for them.',
+    );
+    return 0;
   }
 
-  void _signal(File pidFile, ProcessSignal s) {
-    final raw = pidFile.existsSync() ? pidFile.readAsStringSync().trim() : '';
-    final pid = int.tryParse(raw);
-    if (pid != null) Process.killPid(pid, s);
+  /// Runs another subcommand of this same binary. [quiet] shows its output
+  /// only when it changed something or failed.
+  Future<int> _self(List<String> args, {bool quiet = false}) async {
+    if (!quiet) {
+      final process = await Process.start(_selfCommand.first, [
+        ..._selfCommand.skip(1),
+        ...args,
+      ], mode: ProcessStartMode.inheritStdio);
+      return process.exitCode;
+    }
+    final result = await Process.run(_selfCommand.first, [
+      ..._selfCommand.skip(1),
+      ...args,
+    ]);
+    final out = '${result.stdout}${result.stderr}';
+    final acted = RegExp(r'^(Created|Added|No macOS)', multiLine: true);
+    if (result.exitCode != 0 || acted.hasMatch(out)) stdout.write(out);
+    return result.exitCode;
   }
 
-  /// The app package itself plus every path dependency: exactly the code the
-  /// resident compiler can hot reload. Hosted and SDK packages have absolute
-  /// file:// rootUris; local packages are written as relative URIs.
-  List<String> _localPackageRoots() {
-    final config = File('.dart_tool/package_config.json');
-    if (!config.existsSync()) return [Directory.current.path];
-    final roots = <String>{};
-    final json = jsonDecode(config.readAsStringSync()) as Map<String, dynamic>;
+  /// How to invoke this CLI again: the compiled binary, or `dart run
+  /// flutter_static` when running from source.
+  static List<String> get _selfCommand {
+    final exe = Platform.resolvedExecutable;
+    final viaDart = p.basename(exe) == 'dart' || p.basename(exe) == 'dartvm';
+    return viaDart ? [exe, 'run', 'flutter_static'] : [exe];
+  }
+
+  /// Starts `run` detached, output to the log, and returns its pid once
+  /// the runner has written its pid file.
+  Future<int> _launch(int port) async {
+    logFile.parent.createSync(recursive: true);
+    if (logFile.existsSync()) logFile.deleteSync();
+    _Runner.pidFile.existsSync() ? _Runner.pidFile.deleteSync() : null;
+    final command = [..._selfCommand, 'run', '--port', '$port'];
+    final quoted = command.map((a) => "'${a.replaceAll("'", r"'\''")}'");
+    await Process.start('/bin/sh', [
+      '-c',
+      'exec ${quoted.join(' ')} < /dev/null > ${logFile.path} 2>&1',
+    ], mode: ProcessStartMode.detached);
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    while (DateTime.now().isBefore(deadline)) {
+      final pid = _runnerPid();
+      if (pid != null) return pid;
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    }
+    stderr.writeln('flutter_static: the runner never wrote its pid file:');
+    _tailLog();
+    throw StateError('runner did not start');
+  }
+
+  /// The alive runner's pid from `.dart_tool/flutter_static.pid`, or null.
+  static int? _runnerPid() {
+    final file = _Runner.pidFile;
+    if (!file.existsSync()) return null;
+    final pid = int.tryParse(file.readAsStringSync().trim());
+    if (pid == null) return null;
+    return _alive(pid) ? pid : null;
+  }
+
+  static bool _alive(int pid) =>
+      Process.runSync('kill', ['-0', '$pid']).exitCode == 0;
+
+  static void _tailLog() {
+    if (!logFile.existsSync()) return;
+    final lines = logFile.readAsLinesSync();
+    for (final line in lines.skip(lines.length > 25 ? lines.length - 25 : 0)) {
+      stderr.writeln('  $line');
+    }
+  }
+
+  static String _lastLogLine() {
+    if (!logFile.existsSync()) return '(no log yet)';
+    final lines = logFile.readAsLinesSync().where((l) => l.trim().isNotEmpty);
+    return lines.isEmpty ? '(empty log)' : lines.last;
+  }
+}
+
+/// `flutter_static down`: stop this project's catalog runner and anything
+/// else holding its port.
+class _DownCommand extends Command<int> {
+  @override
+  String get name => 'down';
+  @override
+  String get description => "Stop this project's catalog runner.";
+
+  @override
+  Future<int> run() async {
+    final port = _PortRegistry.lookup();
+    final pid = _UpCommand._runnerPid();
+    if (pid == null && port == null) {
+      stdout.writeln('flutter_static: nothing running for this project.');
+      return 0;
+    }
+    if (pid != null) await stop(pid, port);
+    if (port != null) killPortHolders(port);
+    stdout.writeln('flutter_static: down.');
+    return 0;
+  }
+
+  /// SIGTERM to the runner (it stops the app first), SIGKILL if it lingers.
+  static Future<void> stop(int pid, int? port) async {
+    Process.killPid(pid, ProcessSignal.sigterm);
+    final deadline = DateTime.now().add(const Duration(seconds: 20));
+    while (_UpCommand._alive(pid) && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+    }
+    if (_UpCommand._alive(pid)) Process.killPid(pid, ProcessSignal.sigkill);
+    if (port != null) killPortHolders(port);
+  }
+
+  /// Kills whatever listens on [port]: a catalog app whose runner is gone
+  /// keeps serving stale code, and a new runner's server dies on bind.
+  static void killPortHolders(int port) {
+    final result = Process.runSync('lsof', [
+      '-ti',
+      'tcp:$port',
+      '-sTCP:LISTEN',
+    ]);
+    for (final line in (result.stdout as String).split('\n')) {
+      final holder = int.tryParse(line.trim());
+      if (holder == null || holder == pid) continue;
+      stdout.writeln(
+        'flutter_static: killing stale port $port holder (pid $holder)',
+      );
+      Process.killPid(holder, ProcessSignal.sigkill);
+    }
+  }
+}
+
+/// Renders [id] from the catalog at [url] into [out], through the gate.
+/// Returns the written path, or null after printing why not.
+Future<String?> _renderStory(
+  String id,
+  String url,
+  String out, {
+  Map<String, String> knobs = const {},
+}) async {
+  // A render sent right after a save can reach the catalog before the
+  // watcher's notice of that save. `edited` is the newest source mtime
+  // under the watched roots; when it is newer than the last reload, the
+  // catalog waits for the next one. `settle` is the fallback outside a
+  // project, where there are no roots to walk.
+  final edited = _newestSourceMtime();
+  final query = StringBuffer(
+    edited == null ? 'settle=250' : 'edited=${edited.millisecondsSinceEpoch}',
+  );
+  for (final entry in knobs.entries) {
+    query.write(
+      '&k.${Uri.encodeQueryComponent(entry.key)}='
+      '${Uri.encodeQueryComponent(entry.value)}',
+    );
+  }
+  final bytes = await _fetch(
+    '$url/story/$id.png?$query',
+    url,
+    notFound: 'Story "$id" not found. See: flutter_static list',
+    onHeaders: (headers) {
+      final stale = headers.value('x-flutter-static-stale');
+      if (stale != null) stderr.writeln('flutter_static: warning: $stale');
+    },
+  );
+  if (bytes == null) return null;
+  File(out).parent.createSync(recursive: true);
+  File(out).writeAsBytesSync(bytes);
+  return out;
+}
+
+/// Owns the `flutter run --machine` process, the source watcher and the
+/// reload state machine between them.
+///
+/// The daemon protocol (JSON lines on stdin/stdout) replaces SIGUSR1 to the
+/// tool: a restart requested while one is running is queued by the tool
+/// instead of silently dropped, and every restart answers with a result, so
+/// the catalog can be told whether the code it serves is current. The CLI's
+/// own pid goes to `.dart_tool/flutter_static.pid`, and SIGUSR1/SIGUSR2 to
+/// it still mean reload/restart.
+class _Runner {
+  _Runner({required this.target, required this.device, required this.port});
+
+  final String target;
+  final String device;
+  final int port;
+
+  static final pidFile = File('.dart_tool/flutter_static.pid');
+  static final packageConfig = File('.dart_tool/package_config.json');
+
+  late final Process _process;
+  final _pending = <int, Completer<Map<String, dynamic>>>{};
+  int _nextId = 0;
+  String? _appId;
+  bool _started = false;
+  bool _stopping = false;
+  final _exit = Completer<int>();
+
+  /// Edits since the running reload was requested (or since the last one
+  /// finished). Set by the watcher, consumed by [_reload].
+  bool _dirty = false;
+  bool _reloading = false;
+  bool _wantFull = false;
+  Timer? _debounce;
+  final _reloadErrors = <String>[];
+  Future<void> _notifyChain = Future.value();
+
+  final _watched = <String>{};
+  final _subscriptions = <StreamSubscription<Object?>>[];
+  bool _rawTerminal = false;
+
+  Future<int> run() async {
+    pidFile.parent.createSync(recursive: true);
+    _process = await Process.start('flutter', [
+      'run',
+      '--machine',
+      '-d',
+      device,
+      '-t',
+      target,
+      '--dart-define=FLUTTER_STATIC_PORT=$port',
+    ]);
+    pidFile.writeAsStringSync('$pid');
+    _process.stdout
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .listen(_onLine);
+    // Compiler diagnostics bypass the daemon protocol and arrive here as
+    // plain text; they are what a failed reload should report.
+    _process.stderr
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .listen((line) {
+          _reloadErrors.add(line);
+          if (_reloadErrors.length > 200) _reloadErrors.removeAt(0);
+          stderr.writeln(line);
+        });
+    unawaited(
+      _process.exitCode.then((code) {
+        if (!_exit.isCompleted) _exit.complete(code);
+      }),
+    );
+    _watchSources();
+    _listenSignals();
+    _listenKeys();
+    final code = await _exit.future;
+    _cleanUp();
+    return code;
+  }
+
+  // --- daemon protocol -----------------------------------------------------
+
+  /// `FLUTTER_STATIC_DAEMON_LOG=<file>` appends every raw daemon line.
+  static final _daemonLog = Platform.environment['FLUTTER_STATIC_DAEMON_LOG'];
+
+  void _onLine(String line) {
+    if (_daemonLog != null) {
+      File(_daemonLog!).writeAsStringSync('$line\n', mode: FileMode.append);
+    }
+    if (!line.startsWith('[{') || !line.endsWith('}]')) {
+      stdout.writeln(line);
+      return;
+    }
+    List<dynamic> messages;
+    try {
+      messages = jsonDecode(line) as List<dynamic>;
+    } catch (_) {
+      stdout.writeln(line);
+      return;
+    }
+    for (final message in messages.cast<Map<String, dynamic>>()) {
+      if (message.containsKey('id')) {
+        _pending.remove(message['id'])?.complete(message);
+        continue;
+      }
+      final params =
+          (message['params'] as Map?)?.cast<String, dynamic>() ?? const {};
+      switch (message['event']) {
+        case 'app.start':
+          _appId = params['appId'] as String?;
+        case 'app.debugPort':
+          stdout.writeln('flutter_static: VM service at ${params['wsUri']}');
+        case 'app.started':
+          _started = true;
+          stdout.writeln(
+            'flutter_static: app running; saves hot reload it '
+            '(r reload, R restart, q quit)',
+          );
+          if (_dirty) unawaited(_reload());
+        case 'app.log':
+          final text = params['log'] as String? ?? '';
+          if (params['error'] == true) {
+            _reloadErrors.add(text);
+            stderr.writeln(text);
+          } else {
+            // Compiler diagnostics arrive as plain log lines; keep them
+            // for the catalog's 409 body. The buffer is cleared when a
+            // reload starts and read when one fails.
+            if (_looksLikeDiagnostic(text)) _reloadErrors.add(text);
+            stdout.writeln(text);
+          }
+        case 'app.progress':
+          final text = params['message'] as String?;
+          if (text != null && params['finished'] != true) {
+            stdout.writeln(text);
+          }
+        case 'app.stop':
+          _started = false;
+        case 'daemon.logMessage':
+          final text = '${params['message']}';
+          if (params['level'] == 'error') {
+            _reloadErrors.add(text);
+            stderr.writeln(text);
+          }
+      }
+    }
+  }
+
+  /// A compiler diagnostic, its indented source excerpt, or its caret line.
+  static bool _looksLikeDiagnostic(String line) =>
+      line.contains(': Error: ') ||
+      line.contains(': Warning: ') ||
+      line.startsWith(' ') ||
+      line.trimLeft().startsWith('^');
+
+  Future<Map<String, dynamic>> _call(
+    String method,
+    Map<String, Object?> params,
+  ) {
+    final id = ++_nextId;
+    final completer = Completer<Map<String, dynamic>>();
+    _pending[id] = completer;
+    _process.stdin.writeln(
+      jsonEncode([
+        {'id': id, 'method': method, 'params': params},
+      ]),
+    );
+    return completer.future;
+  }
+
+  // --- reload state machine ------------------------------------------------
+
+  /// First save of the current edit burst; reported when its reload lands.
+  DateTime? _lastSaveAt;
+
+  void _onSourceChanged() {
+    _lastSaveAt ??= DateTime.now();
+    _dirty = true;
+    _notifyCatalog('pending');
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 60), _reload);
+  }
+
+  /// Runs one hot reload (or restart) and reports the outcome to the
+  /// catalog. Edits that land while it runs trigger a follow-up as soon as
+  /// it finishes.
+  Future<void> _reload({bool full = false}) async {
+    _wantFull |= full;
+    if (_appId == null || !_started || _stopping) return;
+    if (_reloading) return;
+    _reloading = true;
+    _dirty = false;
+    final fullNow = _wantFull;
+    _wantFull = false;
+    _reloadErrors.clear();
+    final sw = Stopwatch()..start();
+    Map<String, dynamic> response;
+    try {
+      response = await _call('app.restart', {
+        'appId': _appId,
+        'fullRestart': fullNow,
+        'reason': 'save',
+        'pause': false,
+      });
+    } catch (e) {
+      response = {'error': '$e'};
+    } finally {
+      _reloading = false;
+    }
+    final result = (response['result'] as Map?)?.cast<String, dynamic>();
+    final ok = result != null && result['code'] == 0;
+    if (_dirty || _wantFull) {
+      // Superseded already; the follow-up reports for both.
+      unawaited(_reload());
+      return;
+    }
+    if (ok) {
+      _notifyCatalog(
+        'done',
+        message: '${result['message']} (${sw.elapsedMilliseconds}ms)',
+        full: fullNow,
+      );
+      if (_lastSaveAt != null) {
+        stdout.writeln(
+          'flutter_static: renders are current '
+          '(${DateTime.now().difference(_lastSaveAt!).inMilliseconds}ms '
+          'after the save)',
+        );
+        _lastSaveAt = null;
+      }
+      return;
+    }
+    // The tool answers before its last diagnostic lines are flushed.
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    final detail = [
+      if (result != null) '${result['message']}',
+      if (response['error'] != null) '${response['error']}',
+      ..._reloadErrors,
+    ].join('\n');
+    stderr.writeln(
+      'flutter_static: hot ${fullNow ? 'restart' : 'reload'} failed; '
+      'the catalog keeps serving the previous code until the next save '
+      'compiles.',
+    );
+    _notifyCatalog('failed', message: detail, full: fullNow);
+  }
+
+  /// Tells the catalog whether the code it serves is current. Posts are
+  /// chained so a slow `pending` does not land after its own `done`.
+  void _notifyCatalog(String state, {String? message, bool full = false}) {
+    _notifyChain = _notifyChain.then((_) async {
+      final client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 2);
+      try {
+        final request = await client.postUrl(
+          Uri.parse('http://localhost:$port/reload'),
+        );
+        request.headers.contentType = ContentType.json;
+        request.write(
+          jsonEncode({'state': state, 'message': message, 'full': full}),
+        );
+        final response = await request.close().timeout(
+          const Duration(seconds: 5),
+        );
+        await response.drain<void>();
+      } catch (_) {
+        // Catalog not up yet (first launch) or restarting; the next state
+        // change reports again.
+      } finally {
+        client.close();
+      }
+    });
+  }
+
+  // --- sources -------------------------------------------------------------
+
+  /// Watches every local package's `lib/` and `story/`, and keeps that set
+  /// in sync with `.dart_tool/package_config.json`: in a fresh checkout the
+  /// file only exists once `flutter run` has finished pub get, and it
+  /// changes whenever a path dependency is added.
+  void _watchSources() {
+    _syncWatchTargets();
+    var stamp = _packageConfigStamp();
+    final timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      final now = _packageConfigStamp();
+      if (now == stamp) return;
+      stamp = now;
+      _syncWatchTargets();
+    });
+    _exit.future.whenComplete(timer.cancel);
+  }
+
+  String _packageConfigStamp() {
+    if (!packageConfig.existsSync()) return '';
+    final stat = packageConfig.statSync();
+    return '${stat.modified.microsecondsSinceEpoch}:${stat.size}';
+  }
+
+  void _syncWatchTargets() {
+    final added = _watchTargets().where(_watched.add).toList();
+    if (added.isEmpty) return;
+    added.forEach(_watchRoot);
+    stdout.writeln(
+      'flutter_static: watching ${added.map(_shortPath).join(', ')}'
+      '${packageConfig.existsSync() ? '' : ' (package_config.json not written yet; path dependencies join once pub get has run)'}',
+    );
+  }
+
+  static String _shortPath(String path) {
+    final cwd = Directory.current.path;
+    return path.startsWith('$cwd/') ? path.substring(cwd.length + 1) : path;
+  }
+
+  void _watchRoot(String root) {
+    DirectoryWatcher(root).events.listen(
+      (event) {
+        final path = event.path;
+        if (!path.endsWith('.dart')) return;
+        if (path.contains('/.dart_tool/') ||
+            path.contains('/build/') ||
+            path.contains('/.git/')) {
+          return;
+        }
+        _onSourceChanged();
+      },
+      onError: (Object e) {
+        stderr.writeln(
+          'flutter_static: watcher error on $root: $e; restarting watcher',
+        );
+        _watchRoot(root);
+      },
+      onDone: () {
+        if (_exit.isCompleted) return;
+        stderr.writeln('flutter_static: watcher for $root ended; restarting');
+        _watchRoot(root);
+      },
+    );
+  }
+
+  // --- signals and keys ----------------------------------------------------
+
+  void _listenSignals() {
+    _subscriptions.addAll([
+      ProcessSignal.sigusr1.watch().listen((_) => _reload()),
+      ProcessSignal.sigusr2.watch().listen((_) => _reload(full: true)),
+      ProcessSignal.sigint.watch().listen((_) => _stop()),
+      ProcessSignal.sigterm.watch().listen((_) => _stop()),
+    ]);
+  }
+
+  void _listenKeys() {
+    if (!stdin.hasTerminal) return;
+    try {
+      stdin.echoMode = false;
+      stdin.lineMode = false;
+      _rawTerminal = true;
+    } on StdinException {
+      return;
+    }
+    _subscriptions.add(
+      stdin.listen((bytes) {
+        for (final byte in bytes) {
+          switch (String.fromCharCode(byte)) {
+            case 'r':
+              unawaited(_reload());
+            case 'R':
+              unawaited(_reload(full: true));
+            case 'q':
+              unawaited(_stop());
+            case 'h' || '?':
+              stdout.writeln(
+                'r hot reload, R hot restart, q quit. Saves under every '
+                'watched directory hot reload by themselves.',
+              );
+          }
+        }
+      }),
+    );
+  }
+
+  Future<void> _stop() async {
+    if (_stopping) return;
+    _stopping = true;
+    stdout.writeln('flutter_static: stopping');
+    if (_appId != null) {
+      try {
+        await _call('app.stop', {
+          'appId': _appId,
+        }).timeout(const Duration(seconds: 8));
+      } catch (_) {}
+    }
+    try {
+      await _process.exitCode.timeout(const Duration(seconds: 3));
+    } on TimeoutException {
+      _process.kill(ProcessSignal.sigkill);
+    }
+  }
+
+  void _cleanUp() {
+    for (final subscription in _subscriptions) {
+      subscription.cancel();
+    }
+    if (_rawTerminal) {
+      try {
+        stdin.echoMode = true;
+        stdin.lineMode = true;
+      } on StdinException {
+        // Terminal went away.
+      }
+    }
+    try {
+      if (pidFile.existsSync() && pidFile.readAsStringSync().trim() == '$pid') {
+        pidFile.deleteSync();
+      }
+    } on FileSystemException {
+      // Nothing to clean.
+    }
+  }
+}
+
+/// The directories `run` watches: `lib/` and `story/` of the app and of
+/// every path dependency. Only the Dart-bearing subdirectories: watching a
+/// whole package root means the watcher's initial scan crawls
+/// deps/_build/node_modules (minutes on a big repo) before delivering a
+/// single event.
+List<String> _watchTargets() {
+  final targets = <String>[];
+  for (final root in _localPackageRoots()) {
+    final narrow = [
+      '$root/lib',
+      '$root/story',
+    ].where((d) => Directory(d).existsSync()).toList();
+    targets.addAll(narrow.isEmpty ? [root] : narrow);
+  }
+  return targets;
+}
+
+/// The app package itself plus every path dependency: exactly the code the
+/// resident compiler can hot reload. Hosted and SDK packages have absolute
+/// file:// rootUris; local packages are written as relative URIs.
+List<String> _localPackageRoots() {
+  final packageConfig = _Runner.packageConfig;
+  final cwd = Directory.current.resolveSymbolicLinksSync();
+  if (!packageConfig.existsSync()) return [cwd];
+  final roots = <String>{};
+  try {
+    final json =
+        jsonDecode(packageConfig.readAsStringSync()) as Map<String, dynamic>;
     for (final package
         in (json['packages'] as List).cast<Map<String, dynamic>>()) {
       final rootUri = package['rootUri'] as String;
@@ -171,15 +903,44 @@ class _RunCommand extends Command<int> {
       try {
         roots.add(
           Directory.fromUri(
-            config.parent.uri.resolveUri(Uri.parse(rootUri)),
+            packageConfig.absolute.parent.uri.resolveUri(Uri.parse(rootUri)),
           ).resolveSymbolicLinksSync(),
         );
       } on FileSystemException {
         // Stale entry; skip.
       }
     }
-    return roots.isEmpty ? [Directory.current.path] : roots.toList();
+  } catch (_) {
+    // Half-written by pub get; the next stamp change re-reads it.
   }
+  return roots.isEmpty ? [cwd] : roots.toList();
+}
+
+/// Newest mtime of any .dart file under the watched roots, or null outside
+/// a project. A few hundred stats, ~15ms on a large app.
+DateTime? _newestSourceMtime() {
+  if (!File('pubspec.yaml').existsSync()) return null;
+  DateTime? newest;
+  for (final root in _watchTargets()) {
+    final dir = Directory(root);
+    if (!dir.existsSync()) continue;
+    try {
+      for (final entity in dir.listSync(recursive: true, followLinks: false)) {
+        if (entity is! File || !entity.path.endsWith('.dart')) continue;
+        final path = entity.path;
+        if (path.contains('/.dart_tool/') ||
+            path.contains('/build/') ||
+            path.contains('/.git/')) {
+          continue;
+        }
+        final modified = entity.statSync().modified;
+        if (newest == null || modified.isAfter(newest)) newest = modified;
+      }
+    } on FileSystemException {
+      // Unreadable subtree; the watcher skips it too.
+    }
+  }
+  return newest;
 }
 
 class _InitCommand extends Command<int> {
@@ -523,6 +1284,14 @@ class _RenderCommand extends Command<int> {
         abbr: 'o',
         help: 'Output file (default: <id>.png with / as _).',
       )
+      ..addMultiOption(
+        'knob',
+        abbr: 'k',
+        valueHelp: 'id=option',
+        help:
+            'A storyline knob choice (the line\'s mock switches; see '
+            '"knobs" in `list --json`). Repeatable.',
+      )
       ..addOption('url', help: _urlHelp);
   }
 
@@ -531,7 +1300,8 @@ class _RenderCommand extends Command<int> {
   @override
   String get description => 'Render one story to a PNG file.';
   @override
-  String get invocation => 'flutter_static render <story-id> [-o out.png]';
+  String get invocation =>
+      'flutter_static render <story-id> [-o out.png] [-k knob=option]';
 
   @override
   Future<int> run() async {
@@ -539,15 +1309,17 @@ class _RenderCommand extends Command<int> {
     if (rest.isEmpty) usageException('A story id is required.');
     final id = rest.first;
     final url = (argResults!['url'] as String?) ?? _defaultUrl();
-    final bytes = await _fetch(
-      '$url/story/$id.png',
-      url,
-      notFound: 'Story "$id" not found. See: flutter_static list',
-    );
-    if (bytes == null) return 1;
     final out =
         (argResults!['out'] as String?) ?? '${id.replaceAll('/', '_')}.png';
-    File(out).writeAsBytesSync(bytes);
+    final knobs = <String, String>{};
+    for (final choice in argResults!['knob'] as List<String>) {
+      final eq = choice.indexOf('=');
+      if (eq < 1 || eq == choice.length - 1) {
+        usageException('--knob takes id=option; got "$choice".');
+      }
+      knobs[choice.substring(0, eq)] = choice.substring(eq + 1);
+    }
+    if (await _renderStory(id, url, out, knobs: knobs) == null) return 1;
     stdout.writeln(out);
     return 0;
   }
@@ -705,20 +1477,26 @@ Future<List<int>?> _fetch(
   String url,
   String serverUrl, {
   String? notFound,
+  void Function(HttpHeaders headers)? onHeaders,
 }) async {
   final client = HttpClient();
   try {
     final request = await client.getUrl(Uri.parse(url));
     final response = await request.close();
+    onHeaders?.call(response.headers);
     if (response.statusCode == HttpStatus.notFound) {
       stderr.writeln(notFound ?? '404: $url');
       return null;
     }
+    final bytes = (await response.toList()).expand((chunk) => chunk).toList();
     if (response.statusCode != HttpStatus.ok) {
       stderr.writeln('HTTP ${response.statusCode}: $url');
+      // A 409 carries the hot reload failure; a 500 the capture error.
+      final text = utf8.decode(bytes, allowMalformed: true).trim();
+      if (text.isNotEmpty) stderr.writeln(text);
       return null;
     }
-    return (await response.toList()).expand((chunk) => chunk).toList();
+    return bytes;
   } on SocketException {
     stderr.writeln(
       'No catalog running at $serverUrl. '
@@ -734,6 +1512,9 @@ Future<List<int>?> _fetch(
 /// that exist unless [force]. Returns the paths written.
 List<String> _scaffoldStories({bool force = false}) {
   final written = <String>[];
+  // A project with its own story/main.dart has its own stories; the
+  // example only belongs next to a freshly scaffolded main.
+  if (File('story/main.dart').existsSync() && !force) return written;
   for (final (path, content) in [
     ('story/main.dart', _mainTemplate),
     ('story/stories/example.dart', _exampleTemplate),

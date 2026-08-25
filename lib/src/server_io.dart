@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ffi' as ffi;
 import 'dart:io';
 import 'dart:ui' as ui;
 
@@ -19,28 +20,161 @@ const _catalogPort = int.fromEnvironment(
 
 void runFlutterStatic(Stories stories, {int port = _catalogPort}) {
   debugDefaultTargetPlatformOverride = stories.platform;
+  // At launch the running code includes every save made so far.
+  _reloadReportedAt = DateTime.now();
+  _stayAwake();
   runApp(_CatalogApp(stories: stories));
   _serve(stories, port);
-  _prewarm(stories);
+  _prewarm(stories, initial: true);
 }
 
-/// Renders every story into the cache in the background so user-facing
-/// requests rarely pay a cold render. Yields between stories to keep the
-/// server responsive; exits early when superseded by a newer reload.
-void _prewarm(Stories stories) {
+/// Opts the process out of App Nap. The catalog runs hidden and unfocused
+/// (flutter run launches it behind the terminal), so macOS throttles it
+/// after a few idle seconds: timers coalesce, the process drops to
+/// priority 4, and the next hot reload, capture or PNG encode takes 10 to
+/// 100 times longer (51s for a reload that takes 200ms awake).
+/// NSProcessInfo's activity API is the supported opt-out; it is called over
+/// dart:ffi so the consumer's runner needs no platform code.
+void _stayAwake() {
+  if (!Platform.isMacOS) return;
+  try {
+    final lib = ffi.DynamicLibrary.process();
+    final getClass = lib
+        .lookupFunction<
+          ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Char>),
+          ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Char>)
+        >('objc_getClass');
+    final sel = lib
+        .lookupFunction<
+          ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Char>),
+          ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Char>)
+        >('sel_registerName');
+    final send0 = lib
+        .lookupFunction<
+          ffi.Pointer<ffi.Void> Function(
+            ffi.Pointer<ffi.Void>,
+            ffi.Pointer<ffi.Void>,
+          ),
+          ffi.Pointer<ffi.Void> Function(
+            ffi.Pointer<ffi.Void>,
+            ffi.Pointer<ffi.Void>,
+          )
+        >('objc_msgSend');
+    final sendStr = lib
+        .lookupFunction<
+          ffi.Pointer<ffi.Void> Function(
+            ffi.Pointer<ffi.Void>,
+            ffi.Pointer<ffi.Void>,
+            ffi.Pointer<ffi.Char>,
+          ),
+          ffi.Pointer<ffi.Void> Function(
+            ffi.Pointer<ffi.Void>,
+            ffi.Pointer<ffi.Void>,
+            ffi.Pointer<ffi.Char>,
+          )
+        >('objc_msgSend');
+    final sendActivity = lib
+        .lookupFunction<
+          ffi.Pointer<ffi.Void> Function(
+            ffi.Pointer<ffi.Void>,
+            ffi.Pointer<ffi.Void>,
+            ffi.Uint64,
+            ffi.Pointer<ffi.Void>,
+          ),
+          ffi.Pointer<ffi.Void> Function(
+            ffi.Pointer<ffi.Void>,
+            ffi.Pointer<ffi.Void>,
+            int,
+            ffi.Pointer<ffi.Void>,
+          )
+        >('objc_msgSend');
+    final malloc = lib
+        .lookupFunction<
+          ffi.Pointer<ffi.Void> Function(ffi.IntPtr),
+          ffi.Pointer<ffi.Void> Function(int)
+        >('malloc');
+    ffi.Pointer<ffi.Char> cString(String text) {
+      final bytes = utf8.encode(text);
+      final buffer = malloc(bytes.length + 1).cast<ffi.Uint8>();
+      buffer.asTypedList(bytes.length + 1)
+        ..setAll(0, bytes)
+        ..[bytes.length] = 0;
+      return buffer.cast();
+    }
+
+    final processInfo = send0(
+      getClass(cString('NSProcessInfo')),
+      sel(cString('processInfo')),
+    );
+    final reason = sendStr(
+      getClass(cString('NSString')),
+      sel(cString('stringWithUTF8String:')),
+      cString('flutter_static renders on request'),
+    );
+    // NSActivityUserInitiatedAllowingIdleSystemSleep: no App Nap, no timer
+    // throttling, and the Mac may still sleep on its own schedule.
+    const userInitiatedAllowingIdleSystemSleep = 0x00EFFFFF;
+    final token = sendActivity(
+      processInfo,
+      sel(cString('beginActivityWithOptions:reason:')),
+      userInitiatedAllowingIdleSystemSleep,
+      reason,
+    );
+    // The activity lives as long as its token; keep it out of the pool.
+    send0(token, sel(cString('retain')));
+  } catch (e) {
+    debugPrint('flutter_static: could not disable App Nap: $e');
+  }
+}
+
+/// Renders stories into the cache in the background so user-facing requests
+/// rarely pay a cold render. Yields between stories to keep the server
+/// responsive; exits early when superseded by a newer reload or by a save
+/// the CLI has announced (its reload invalidates everything anyway).
+///
+/// After a hot reload only the hot set (stories clients asked for, most
+/// recent first) is warmed right away. The full sweep waits until nobody
+/// has saved or rendered for 4 seconds. Someone iterating on one story
+/// saves every few seconds; a 130-story sweep after each save would queue
+/// their next render behind a minute of work instead of 50ms.
+void _prewarm(Stories stories, {required bool initial}) {
   final version = _version;
+  bool superseded() => _version != version || _reloadPending;
   Future(() async {
     await Future<void>.delayed(const Duration(milliseconds: 300));
-    // Phase 1: everything that can render offscreen does; stories that
-    // need the window fail in milliseconds and are only collected.
-    final windowBound = <Story>[];
-    for (final story in stories.all()) {
-      if (_version != version) return;
+    Future<bool> yieldToForeground() async {
       // Let interactive requests drain first; warming is idle work.
       while (_foregroundWaiters > 0) {
         await Future<void>.delayed(const Duration(milliseconds: 50));
-        if (_version != version) return;
+        if (superseded()) return false;
       }
+      return !superseded();
+    }
+
+    final all = stories.all();
+    final byId = {for (final story in all) story.id: story};
+    final hot = [
+      for (final id in _requested.reversed)
+        if (byId[id] != null) byId[id]!,
+    ];
+    for (final story in hot) {
+      if (!await yieldToForeground()) return;
+      try {
+        await _renderCached(story, background: true);
+      } catch (_) {}
+    }
+    if (!initial) {
+      const idle = Duration(seconds: 4);
+      while (DateTime.now().difference(_lastActivity) < idle) {
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+        if (superseded()) return;
+      }
+    }
+    // Phase 1: everything that can render offscreen does; stories that
+    // need the window fail in milliseconds and are only collected.
+    final windowBound = <Story>[];
+    for (final story in all) {
+      if (!await yieldToForeground()) return;
       try {
         await _renderCached(story, background: true, offscreenOnly: true);
       } catch (_) {
@@ -53,16 +187,161 @@ void _prewarm(Stories stories) {
     if (windowBound.isEmpty) return;
     _mountWindowStories(windowBound);
     for (final story in windowBound) {
-      if (_version != version) return;
-      while (_foregroundWaiters > 0) {
-        await Future<void>.delayed(const Duration(milliseconds: 50));
-        if (_version != version) return;
-      }
+      if (!await yieldToForeground()) return;
       try {
         await _renderCached(story, background: true);
       } catch (_) {}
     }
   });
+}
+
+/// Story ids clients rendered this session, oldest first; the prewarm's
+/// priority list after a reload.
+final _requested = <String>[];
+
+/// Last save or client render; the full prewarm sweep waits for quiet.
+DateTime _lastActivity = DateTime.fromMillisecondsSinceEpoch(0);
+
+void _noteRequested(String id) {
+  _lastActivity = DateTime.now();
+  _requested.remove(id);
+  _requested.add(id);
+  if (_requested.length > 40) _requested.removeAt(0);
+}
+
+/// Reload gate. The CLI announces every save (`pending`) and the outcome
+/// of the hot reload it triggers (`done` / `failed`), so a render requested
+/// after a save waits for the new code instead of serving pre-save pixels,
+/// and a reload the compiler rejected answers with its message instead of
+/// a stale image.
+bool _reloadPending = false;
+String? _reloadError;
+String? _reloadMessage;
+// Epoch, not now(): top-level initializers run lazily, and a first read from
+// inside the gate would make it look like a reload had just landed.
+DateTime _reloadReportedAt = DateTime.fromMillisecondsSinceEpoch(0);
+final _reloadWaiters = <Completer<void>>[];
+final _pendingWaiters = <Completer<void>>[];
+
+void _setReloadState(String state, String? message) {
+  switch (state) {
+    case 'pending':
+      _reloadPending = true;
+      _lastActivity = DateTime.now();
+      final waiters = List.of(_pendingWaiters);
+      _pendingWaiters.clear();
+      for (final waiter in waiters) {
+        waiter.complete();
+      }
+    case 'done':
+      _reloadPending = false;
+      _reloadReportedAt = DateTime.now();
+      _reloadError = null;
+      _reloadMessage = message;
+    case 'failed':
+      _reloadPending = false;
+      _reloadReportedAt = DateTime.now();
+      _reloadError = message ?? 'hot reload failed';
+      _reloadMessage = null;
+    default:
+      return;
+  }
+  if (!_reloadPending) {
+    final waiters = List.of(_reloadWaiters);
+    _reloadWaiters.clear();
+    for (final waiter in waiters) {
+      waiter.complete();
+    }
+  }
+  _broadcastEvent();
+}
+
+/// `?settle=<ms>`: how long a request that follows no announced save waits
+/// for one before rendering (see [_awaitFresh]).
+Duration _settleParam(HttpRequest request) => Duration(
+  milliseconds: int.tryParse(request.uri.queryParameters['settle'] ?? '') ?? 0,
+);
+
+/// `?edited=<ms since epoch>`: the newest source mtime the caller saw
+/// (`flutter_static render` walks the watched roots). Unlike `settle` this
+/// does not depend on watcher latency: a save newer than the last reload
+/// report has not reached the running code.
+DateTime? _editedParam(HttpRequest request) {
+  final ms = int.tryParse(request.uri.queryParameters['edited'] ?? '');
+  return ms == null ? null : DateTime.fromMillisecondsSinceEpoch(ms);
+}
+
+/// Waits for the reload that must follow a save at [edited], then for the
+/// gate. Returns a note for the response when the save was never announced
+/// (the watcher does not cover it, or the CLI is gone).
+Future<String?> _awaitEdited(DateTime? edited, Duration settle) async {
+  if (edited == null) return _awaitFresh(settle: settle).then((_) => null);
+  if (_reloadPending || !edited.isAfter(_reloadReportedAt)) {
+    await _awaitFresh();
+    return null;
+  }
+  final completer = Completer<void>();
+  _pendingWaiters.add(completer);
+  var announced = true;
+  await completer.future.timeout(
+    const Duration(seconds: 5),
+    onTimeout: () {
+      _pendingWaiters.remove(completer);
+      announced = false;
+    },
+  );
+  if (!announced) {
+    return 'a source file was saved at ${edited.toIso8601String()} but no '
+        'reload was announced within 5s; is flutter_static run alive and '
+        'watching that directory?';
+  }
+  await _awaitFresh();
+  return null;
+}
+
+/// Resolves once no reload is pending. Bounded to 90s: a CLI that dies
+/// mid-reload would otherwise block every render.
+///
+/// [settle] closes the gap between a save and the watcher's notice of it
+/// (FSEvents delivers ~100ms after the write): unless a reload has just
+/// landed, wait up to that long for a `pending` to arrive before deciding
+/// the code is current. A render that follows no save merely waits it out.
+Future<void> _awaitFresh({Duration settle = Duration.zero}) async {
+  if (!_reloadPending &&
+      settle > Duration.zero &&
+      DateTime.now().difference(_reloadReportedAt) > settle) {
+    // A settle window only proves anything if the event loop was free to
+    // read the socket during it. A capture can hold the isolate for
+    // hundreds of milliseconds; if the timer fired late, the notice may
+    // still be unread, so wait out another window (bounded).
+    final deadline = DateTime.now().add(const Duration(seconds: 2));
+    while (!_reloadPending && DateTime.now().isBefore(deadline)) {
+      final started = DateTime.now();
+      final completer = Completer<void>();
+      _pendingWaiters.add(completer);
+      await completer.future.timeout(
+        settle,
+        onTimeout: () => _pendingWaiters.remove(completer),
+      );
+      if (_reloadPending) break;
+      final late = DateTime.now().difference(started) - settle;
+      if (late < const Duration(milliseconds: 40)) break;
+      await Future<void>.delayed(Duration.zero);
+    }
+  }
+  if (!_reloadPending) return;
+  final completer = Completer<void>();
+  _reloadWaiters.add(completer);
+  await completer.future.timeout(
+    const Duration(seconds: 90),
+    onTimeout: () {
+      _reloadWaiters.remove(completer);
+      _reloadPending = false;
+      _reloadError =
+          'the reload announced 90s ago never reported back; '
+          'is flutter_static run still alive?';
+    },
+  );
 }
 
 /// Stories mounted in the window's Stack (the ones that need a real View).
@@ -91,7 +370,11 @@ void _mountWindowStory(Story story) => _mountWindowStories([story]);
 
 int _version = 0;
 
-String _eventData() => '{"version": $_version}';
+String _eventData() => jsonEncode({
+  'version': _version,
+  'reloadPending': _reloadPending,
+  'reloadError': _reloadError,
+});
 
 void _broadcastEvent() {
   for (final client in _eventClients) {
@@ -132,7 +415,8 @@ class _CatalogAppState extends State<_CatalogApp> {
     // Re-read on every reload: main() never runs again, the getter does.
     debugDefaultTargetPlatformOverride = widget.stories.platform;
     _version++;
-    _prewarm(widget.stories);
+    _lastActivity = DateTime.now();
+    _prewarm(widget.stories, initial: false);
     _broadcastEvent();
   }
 
@@ -215,6 +499,11 @@ Future<Uint8List> _renderCached(
   _captureQueue = completer.future;
   return previous.then((_) async {
     try {
+      if (!background && _reloadPending) {
+        // A save landed while this render waited its turn in the queue:
+        // capture after its reload, not before.
+        await _awaitFresh();
+      }
       if (_renderCacheVersion != _version) {
         _renderCache.clear();
         _renderCacheVersion = _version;
@@ -237,14 +526,50 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
     // Renders change on every hot reload; never let browsers cache them.
     response.headers.set('Cache-Control', 'no-store');
     try {
-      if (path == '/index.json') {
+      if (path == '/reload' && request.method == 'POST') {
+        final body = await utf8.decoder.bind(request).join();
+        final json = body.isEmpty
+            ? const <String, dynamic>{}
+            : jsonDecode(body) as Map<String, dynamic>;
+        _setReloadState(
+          json['state'] as String? ?? '',
+          json['message'] as String?,
+        );
+        response.statusCode = HttpStatus.noContent;
+        await response.close();
+      } else if (path == '/index.json') {
+        await _awaitEdited(_editedParam(request), _settleParam(request));
         response.headers.contentType = ContentType.json;
         response.write(
           jsonEncode({
             'version': _version,
+            'reload': {
+              'pending': _reloadPending,
+              'error': _reloadError,
+              'last': _reloadMessage,
+            },
             'stories': [
               for (final s in stories.all())
                 {'id': s.id, 'png': '/story/${s.id}.png'},
+            ],
+            'lines': [
+              for (final line in stories.storylines())
+                {
+                  'id': line.id,
+                  'title': line.title,
+                  'page': '/line/${line.id}',
+                  'knobs': [
+                    for (final knob in line.knobs)
+                      {
+                        'id': knob.id,
+                        'title': knob.title,
+                        'options': [
+                          for (final option in knob.options)
+                            {'id': option.id, 'title': option.title},
+                        ],
+                      },
+                  ],
+                },
             ],
           }),
         );
@@ -279,25 +604,51 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
           path.length - '.png'.length,
         );
         final matches = stories.all().where((s) => s.id == id);
+        final gate = Stopwatch()..start();
+        final stale = await _awaitEdited(
+          _editedParam(request),
+          _settleParam(request),
+        );
+        gate.stop();
         if (matches.isEmpty) {
           response.statusCode = HttpStatus.notFound;
           await response.close();
+        } else if (_reloadError != null) {
+          // The code on disk does not compile. A render now would show the
+          // previous code, so answer with the compiler error instead.
+          response.statusCode = HttpStatus.conflict;
+          response.headers.contentType = ContentType.text;
+          response.write(
+            'hot reload failed; this render would show the pre-edit code.\n'
+            'Fix the error and save again:\n\n$_reloadError\n',
+          );
+          await response.close();
         } else {
+          _noteRequested(id);
           // Renders are pure per (story, device, reload version): cached,
           // and capture work is serialized behind _captureQueue.
-          final device = PhoneSpec.byName(
-            request.uri.queryParameters['device'],
+          final story = _onPage(
+            matches.first,
+            device: PhoneSpec.byName(request.uri.queryParameters['device']),
+            statusBar: request.uri.queryParameters['status'] == '1',
+            knobs: _knobsParam(request, _lineOf(stories, id)),
           );
-          final statusBar = request.uri.queryParameters['status'] == '1';
-          final story = device == null && !statusBar
-              ? matches.first
-              : _onDevice(
-                  matches.first,
-                  device ?? PhoneSpec.fallback,
-                  statusBar: statusBar,
-                );
+          final capture = Stopwatch()..start();
           final png = await _renderCached(story);
-          response.headers.set('x-render-trace', _lastTrace);
+          // A fallback trace carries the exception's message, newlines and
+          // all; a header value takes neither.
+          response.headers.set(
+            'x-render-trace',
+            _lastTrace.replaceAll(RegExp(r'[\x00-\x1F\x7F]+'), ' '),
+          );
+          response.headers.set(
+            'x-render-wait',
+            'gate=${gate.elapsedMilliseconds}ms '
+                'capture=${capture.elapsedMilliseconds}ms',
+          );
+          if (stale != null) {
+            response.headers.set('x-flutter-static-stale', stale);
+          }
           response.headers.contentType = ContentType('image', 'png');
           response.add(png);
           await response.close();
@@ -312,16 +663,16 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         } else {
           response.headers.contentType = ContentType.html;
           _isolate(response);
-          final inLine = stories.storylines().any(
-            (line) => line.stories.any((s) => s.id == id),
-          );
+          final line = _lineOf(stories, id);
           response.write(
             _storyDetailPage(
               all,
               index,
               device: PhoneSpec.byName(request.uri.queryParameters['device']),
               statusBar: request.uri.queryParameters['status'] == '1',
-              showDevices: inLine,
+              showDevices: line != null,
+              knobs: line?.knobs ?? const [],
+              chosen: _knobsParam(request, line),
             ),
           );
           await response.close();
@@ -393,33 +744,100 @@ bool _liveBuildExists() {
       File('$root/build/web/flutter_bootstrap.js').existsSync();
 }
 
-/// [story] rendered for [device], with or without the status bar: the
-/// frame builders read the scope. A distinct id keeps the render cache
-/// per combination.
-Story _onDevice(Story story, PhoneSpec device, {bool statusBar = false}) =>
-    Story(
-      '${story.id}@${device.name}${statusBar ? '+status' : ''}',
-      () => DeviceScope(
-        spec: device,
-        statusBar: statusBar,
-        child: story.builder(),
-      ),
-    );
+/// [story] as the page asked for it: on [device], with or without the
+/// status bar, and on the line's knob choices. The frame builders read
+/// [DeviceScope], the variants [KnobScope]. A distinct id keeps the render
+/// cache per combination; a plain request gets the story itself.
+Story _onPage(
+  Story story, {
+  PhoneSpec? device,
+  bool statusBar = false,
+  Map<String, String> knobs = const {},
+}) {
+  final onDevice = device != null || statusBar;
+  if (!onDevice && knobs.isEmpty) return story;
+  final spec = device ?? PhoneSpec.fallback;
+  final id = StringBuffer(story.id);
+  if (onDevice) id.write('@${spec.name}${statusBar ? '+status' : ''}');
+  for (final entry in knobs.entries) {
+    id.write('~${entry.key}=${entry.value}');
+  }
+  return Story('$id', () {
+    var child = story.builder();
+    if (onDevice) {
+      child = DeviceScope(spec: spec, statusBar: statusBar, child: child);
+    }
+    if (knobs.isNotEmpty) child = KnobScope(chosen: knobs, child: child);
+    return child;
+  });
+}
 
-/// The device and status-bar toggles for pages of storyline variants.
+/// The storyline [id] is a variant of, if any.
+Storyline? _lineOf(Stories stories, String id) {
+  for (final line in stories.storylines()) {
+    if (line.stories.any((s) => s.id == id)) return line;
+  }
+  return null;
+}
+
+/// The knob choices in `?k.<knob>=<option>`, kept to the knobs [line]
+/// declares and the options they have, and never the default (first)
+/// option. One spelling per choice, so the render cache has one entry
+/// for it.
+Map<String, String> _knobsParam(HttpRequest request, Storyline? line) {
+  if (line == null) return const {};
+  final params = request.uri.queryParameters;
+  final chosen = <String, String>{};
+  for (final knob in line.knobs) {
+    final option = params['k.${knob.id}'];
+    if (option == null || option == knob.options.first.id) continue;
+    if (knob.options.any((o) => o.id == option)) chosen[knob.id] = option;
+  }
+  return chosen;
+}
+
+/// `&k.<knob>=<option>` for every choice in [knobs].
+String _knobQuery(Map<String, String> knobs) => [
+  for (final entry in knobs.entries)
+    '&k.${Uri.encodeQueryComponent(entry.key)}='
+        '${Uri.encodeQueryComponent(entry.value)}',
+].join();
+
+/// The device and status-bar toggles for pages of storyline variants, and
+/// the line's knobs after them. As buttons for the line page, whose script
+/// re-renders in place; as links for the story page, which reloads.
 String _deviceToolbar({
   String? selected,
   bool statusBar = false,
   bool links = false,
+  List<Knob<Object?>> knobs = const [],
+  Map<String, String> chosen = const {},
 }) {
   final buffer = StringBuffer('<div class="toolbar"><span>Enhet</span>');
   final device = selected ?? PhoneSpec.all.first.name;
-  final status = statusBar ? '&status=1' : '';
+  final current = {
+    'device': device,
+    if (statusBar) 'status': '1',
+    for (final entry in chosen.entries) 'k.${entry.key}': entry.value,
+  };
+  // The link for one change: [current] with [key] set (or dropped).
+  String href(String key, String? value) {
+    final params = Map.of(current);
+    if (value == null) {
+      params.remove(key);
+    } else {
+      params[key] = value;
+    }
+    return _escape(
+      '?${params.entries.map((e) => '${Uri.encodeQueryComponent(e.key)}=${Uri.encodeQueryComponent(e.value)}').join('&')}',
+    );
+  }
+
   for (final spec in PhoneSpec.all) {
     final cls = spec.name == device ? 'device on' : 'device';
     buffer.write(
       links
-          ? '<a class="$cls" href="?device=${spec.name}$status">${_escape(spec.label)}</a>'
+          ? '<a class="$cls" href="${href('device', spec.name)}">${_escape(spec.label)}</a>'
           : '<button class="$cls" data-device="${spec.name}">${_escape(spec.label)}</button>',
     );
   }
@@ -428,9 +846,23 @@ String _deviceToolbar({
     final cls = (value == '1') == statusBar ? 'status on' : 'status';
     buffer.write(
       links
-          ? '<a class="$cls" href="?device=$device${value == '1' ? '&status=1' : ''}">$label</a>'
+          ? '<a class="$cls" href="${href('status', value == '1' ? '1' : null)}">$label</a>'
           : '<button class="$cls" data-status="$value">$label</button>',
     );
+  }
+  for (final knob in knobs) {
+    if (knob.options.isEmpty) continue;
+    buffer.write('<span class="sep">${_escape(knob.title ?? knob.id)}</span>');
+    final picked = chosen[knob.id] ?? knob.options.first.id;
+    for (final (i, option) in knob.options.indexed) {
+      final cls = option.id == picked ? 'knob on' : 'knob';
+      final label = _escape(option.title ?? option.id);
+      buffer.write(
+        links
+            ? '<a class="$cls" href="${href('k.${knob.id}', i == 0 ? null : option.id)}">$label</a>'
+            : '<button class="$cls" data-knob="${_escape(knob.id)}" data-value="${_escape(option.id)}">$label</button>',
+      );
+    }
   }
   buffer.write('</div>');
   return buffer.toString();
@@ -515,6 +947,28 @@ RenderRepaintBoundary? _findBoundary(RenderObject node) {
   return result;
 }
 
+/// What Flutter reported while offscreen captures were pumping. A story
+/// whose capture reported anything is handed to the window: some of what
+/// fails only fails offscreen (View.of has no answer here, and
+/// ScrollAwareImageProvider asks for it when an image inside a Scrollable
+/// is not cached yet), and Image paints that failure as a Placeholder
+/// rather than an ErrorWidget, so the tree cannot be inspected for it.
+/// Captures can overlap, so an error may be pinned on a neighbour; that
+/// story only loses the fast path, and the window renders it right.
+final _reportedErrors = <FlutterErrorDetails>[];
+int _capturesInFlight = 0;
+bool _errorHookInstalled = false;
+
+void _installErrorHook() {
+  if (_errorHookInstalled) return;
+  _errorHookInstalled = true;
+  final previous = FlutterError.onError;
+  FlutterError.onError = (details) {
+    if (_capturesInFlight > 0) _reportedErrors.add(details);
+    previous?.call(details);
+  };
+}
+
 Future<Uint8List> _captureOffscreen(Story story) async {
   final binding = WidgetsBinding.instance;
   final theme = ThemeData();
@@ -580,10 +1034,25 @@ Future<Uint8List> _captureOffscreen(Story story) async {
     ),
   );
 
-  final root = RenderObjectToWidgetAdapter<RenderBox>(
-    container: container,
-    child: shell(story.builder(), unbounded: true),
-  ).attachToRenderTree(buildOwner);
+  _installErrorHook();
+  if (_capturesInFlight == 0) _reportedErrors.clear();
+  _capturesInFlight++;
+  final errorsBefore = _reportedErrors.length;
+
+  // The first build happens in attachToRenderTree, so it must be inside
+  // the counted window: a story that only throws on its first build (Ink,
+  // and so ListTile, reads a GlobalKey the offscreen owner never
+  // registers) would otherwise pass as a render of its ErrorWidgets.
+  final RenderObjectToWidgetElement<RenderBox> root;
+  try {
+    root = RenderObjectToWidgetAdapter<RenderBox>(
+      container: container,
+      child: shell(story.builder(), unbounded: true),
+    ).attachToRenderTree(buildOwner);
+  } catch (_) {
+    _capturesInFlight--;
+    rethrow;
+  }
 
   // Painting is the expensive pass for complex stories, so the pump loop
   // only builds and lays out; paint happens exactly once, at capture.
@@ -634,7 +1103,7 @@ Future<Uint8List> _captureOffscreen(Story story) async {
     final budget = DateTime.now().add(const Duration(seconds: 2));
     for (var i = 0; i < 60 && DateTime.now().isBefore(budget); i++) {
       final animating = binding.transientCallbackCount > baselineTickers;
-      if (i >= 3 && !animating) break;
+      if (i >= 3 && !animating && !_imagesPending) break;
       if (animating) {
         synthetic += const Duration(milliseconds: 16);
         try {
@@ -648,6 +1117,14 @@ Future<Uint8List> _captureOffscreen(Story story) async {
       pump();
     }
     mark('anim-pumps');
+    // A capture that reported an error is not a render; see
+    // [_reportedErrors].
+    if (_reportedErrors.length > errorsBefore) {
+      final first = _reportedErrors[errorsBefore];
+      throw StateError(
+        'offscreen capture reported: ${first.exceptionAsString()}',
+      );
+    }
     pipelineOwner.flushCompositingBits();
     pipelineOwner.flushPaint();
     mark('paint');
@@ -666,6 +1143,7 @@ Future<Uint8List> _captureOffscreen(Story story) async {
     _traceLog(_lastTrace);
     return bytes!.buffer.asUint8List();
   } finally {
+    _capturesInFlight--;
     // Drain one binding frame while the tree is still mounted: widgets
     // like EditableText schedule post-frame callbacks that must run
     // against a live State, or they null-check on every later frame.
@@ -718,9 +1196,18 @@ Future<void> _settleWindow() async {
         noVsync = true;
       }
     }
-  } while ((binding.hasScheduledFrame || binding.transientCallbackCount > 0) &&
+  } while ((binding.hasScheduledFrame ||
+          binding.transientCallbackCount > 0 ||
+          _imagesPending) &&
       DateTime.now().isBefore(deadline));
 }
+
+/// An image still being read or decoded. Neither schedules a frame nor
+/// ticks, so a settle that only watched those captured the first render
+/// of a story with a fresh file as a blank box, and served it until the
+/// next reload.
+bool get _imagesPending =>
+    PaintingBinding.instance.imageCache.pendingImageCount > 0;
 
 String _storyDetailPage(
   List<Story> all,
@@ -728,16 +1215,21 @@ String _storyDetailPage(
   PhoneSpec? device,
   bool statusBar = false,
   bool showDevices = false,
+  List<Knob<Object?>> knobs = const [],
+  Map<String, String> chosen = const {},
 }) {
   final story = all[index];
   final id = _escape(story.id);
   final dev =
-      '${device == null ? '' : '&device=${device.name}'}${statusBar ? '&status=1' : ''}';
+      '${device == null ? '' : '&device=${device.name}'}${statusBar ? '&status=1' : ''}'
+      '${_knobQuery(chosen)}';
   final toolbar = showDevices
       ? _deviceToolbar(
           selected: device?.name,
           statusBar: statusBar,
           links: true,
+          knobs: knobs,
+          chosen: chosen,
         )
       : '';
   final group = _escape(story.id.split('/').first);
@@ -759,8 +1251,8 @@ section h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#6
 #live{background:#131518;border-radius:12px;padding:16px;min-height:120px;display:flex;align-items:center;justify-content:center;resize:vertical;overflow:hidden}
 #live .hint{color:#6B6E7A;font-size:12.5px}
 .toolbar{margin:-12px 0 16px;font-size:12px;color:#9B9FAB;display:flex;gap:8px;align-items:center}
-.toolbar .device,.toolbar .status{font:inherit;color:#9B9FAB;background:#131518;border:1px solid #2A2D35;border-radius:8px;padding:4px 10px;text-decoration:none}
-.toolbar .device.on,.toolbar .status.on{color:#E2E4E9;border-color:#6B6E7A}
+.toolbar .device,.toolbar .status,.toolbar .knob{font:inherit;color:#9B9FAB;background:#131518;border:1px solid #2A2D35;border-radius:8px;padding:4px 10px;text-decoration:none}
+.toolbar .device.on,.toolbar .status.on,.toolbar .knob.on{color:#E2E4E9;border-color:#6B6E7A}
 .toolbar .sep{margin-left:12px}
 #host{width:100%;height:100%;min-height:120px}
 </style></head><body>
@@ -779,6 +1271,8 @@ $toolbar
 const STORY = '$id';
 const DEVICE = ${jsonEncode(device?.name)};
 const STATUS = $statusBar;
+const KNOBS = ${jsonEncode(chosen)};
+const KNOB_QUERY = ${jsonEncode(_knobQuery(chosen))};
 document.addEventListener('keydown', (e) => {
   if (e.key === 'ArrowLeft') location.href = '/story/${_escape(prev)}';
   if (e.key === 'ArrowRight') location.href = '/story/${_escape(next)}';
@@ -802,7 +1296,7 @@ if (!navigator.webdriver) {
     const d = JSON.parse(e.data);
     if (d.version !== seen) {
       seen = d.version;
-      img.src = '/story/' + STORY + '.png?v=' + d.version + (DEVICE ? '&device=' + DEVICE : '') + (STATUS ? '&status=1' : '');
+      img.src = '/story/' + STORY + '.png?v=' + d.version + (DEVICE ? '&device=' + DEVICE : '') + (STATUS ? '&status=1' : '') + KNOB_QUERY;
     }
   };
 }
@@ -815,6 +1309,7 @@ if (!navigator.webdriver) {
       const data = {storyId: STORY};
       if (DEVICE) data.device = DEVICE;
       if (STATUS) data.status = true;
+      if (Object.keys(KNOBS).length) data.knobs = KNOBS;
       e.detail.addView({hostElement: document.getElementById('host'), initialData: data});
     });
     const s = document.createElement('script');
@@ -898,7 +1393,7 @@ String _linePage(Storyline line, {required bool liveBuild}) {
   return _indexHtml
       .replaceFirst('{{GROUPS}}', buffer.toString())
       .replaceFirst('{{LINES}}', '')
-      .replaceFirst('{{TOOLBAR}}', _deviceToolbar())
+      .replaceFirst('{{TOOLBAR}}', _deviceToolbar(knobs: line.knobs))
       .replaceFirst('{{GROUP_LIST}}', '[]')
       .replaceFirst('{{FILTER}}', line.id)
       .replaceFirst('{{LINE}}', 'true')
@@ -975,8 +1470,8 @@ img{display:block;max-width:460px;height:auto;border-radius:8px;background:#0A0B
 h1.line{font-size:16px;font-family:ui-monospace,monospace;margin:8px 0 0}
 .toolbar{margin:16px 0 0;font-size:12px;color:#9B9FAB;display:flex;gap:8px;align-items:center}
 .toolbar .device{font:inherit;color:#9B9FAB;background:#131518;border:1px solid #2A2D35;border-radius:8px;padding:4px 10px;cursor:pointer;text-decoration:none}
-.toolbar .device.on,.toolbar .status.on{color:#E2E4E9;border-color:#6B6E7A}
-.toolbar .status{font:inherit;color:#9B9FAB;background:#131518;border:1px solid #2A2D35;border-radius:8px;padding:4px 10px;cursor:pointer;text-decoration:none}
+.toolbar .device.on,.toolbar .status.on,.toolbar .knob.on{color:#E2E4E9;border-color:#6B6E7A}
+.toolbar .status,.toolbar .knob{font:inherit;color:#9B9FAB;background:#131518;border:1px solid #2A2D35;border-radius:8px;padding:4px 10px;cursor:pointer;text-decoration:none}
 .toolbar .sep{margin-left:12px}
 .lines a{display:inline-block;margin:0 12px 8px 0;font-family:ui-monospace,monospace;font-size:12px;color:#9B9FAB;text-decoration:none}
 .lines a:hover{color:#E2E4E9}
@@ -1018,21 +1513,43 @@ if (statusButtons.length) {
   try { STATUS = localStorage.getItem('fs-status') === '1'; } catch (e) {}
   for (const b of statusButtons) b.addEventListener('click', () => { STATUS = b.dataset.status === '1'; try { localStorage.setItem('fs-status', STATUS ? '1' : '0'); } catch (e) {} setDevice(DEVICE); });
 }
+// Knobs (storyline pages): the line's mock switches. A choice is the
+// option's id, absent when it is the default (the first button), and
+// sticks per browser and line.
+let KNOBS = {};
+const knobButtons = [...document.querySelectorAll('.toolbar button.knob')];
+const knobDefault = (knob) => knobButtons.find((b) => b.dataset.knob === knob);
+if (knobButtons.length) {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem('fs-knobs:' + FILTER)) || {}; } catch (e) {}
+  for (const b of knobButtons) {
+    if (saved[b.dataset.knob] === b.dataset.value && knobDefault(b.dataset.knob) !== b) KNOBS[b.dataset.knob] = b.dataset.value;
+  }
+  for (const b of knobButtons) b.addEventListener('click', () => {
+    if (knobDefault(b.dataset.knob) === b) delete KNOBS[b.dataset.knob]; else KNOBS[b.dataset.knob] = b.dataset.value;
+    try { localStorage.setItem('fs-knobs:' + FILTER, JSON.stringify(KNOBS)); } catch (e) {}
+    setDevice(DEVICE);
+  });
+}
+function knobQuery() { return Object.entries(KNOBS).map(([k, v]) => '&k.' + encodeURIComponent(k) + '=' + encodeURIComponent(v)).join(''); }
 // No undefined values in view data: the Dart side cannot convert them.
 function viewData(id) {
   const data = {storyId: id};
   if (DEVICE) data.device = DEVICE;
   if (STATUS) data.status = true;
+  if (Object.keys(KNOBS).length) data.knobs = {...KNOBS};
   return data;
 }
-function pngUrl(id, v) { return '/story/' + id + '.png?v=' + v + (DEVICE ? '&device=' + DEVICE : '') + (STATUS ? '&status=1' : ''); }
+function pngUrl(id, v) { return '/story/' + id + '.png?v=' + v + (DEVICE ? '&device=' + DEVICE : '') + (STATUS ? '&status=1' : '') + knobQuery(); }
 function setDevice(d) {
   DEVICE = d;
   try { localStorage.setItem('fs-device', d); } catch (e) {}
   for (const b of deviceButtons) b.classList.toggle('on', b.dataset.device === d);
   for (const b of statusButtons) b.classList.toggle('on', (b.dataset.status === '1') === STATUS);
-  // A device changes a variant's size: back to a plain png card, which
-  // remounts (live cards) from the new render's size.
+  for (const b of knobButtons) b.classList.toggle('on', (KNOBS[b.dataset.knob] ?? knobDefault(b.dataset.knob).dataset.value) === b.dataset.value);
+  // A device (or a knob, whose data may change the size) changes a
+  // variant: back to a plain png card, which remounts (live cards) from
+  // the new render's size.
   for (const card of document.querySelectorAll('.card')) {
     unmount(card);
     const media = card.querySelector('.media');
@@ -1162,7 +1679,7 @@ function unmountAll() {
   for (const c of document.querySelectorAll('.card[data-view]')) unmount(c);
 }
 let shownVersion = {{VERSION}};
-if (deviceButtons.length && (DEVICE !== deviceButtons[0].dataset.device || STATUS)) setDevice(DEVICE);
+if (deviceButtons.length && (DEVICE !== deviceButtons[0].dataset.device || STATUS || Object.keys(KNOBS).length)) setDevice(DEVICE);
 else { for (const b of deviceButtons) b.classList.toggle('on', b.dataset.device === DEVICE); observeAll(); armHover(); }
 // Left/right arrows cycle through the group pages.
 document.addEventListener('keydown', (e) => {

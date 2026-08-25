@@ -42,12 +42,21 @@ Widget bareFrame(BuildContext _, Widget child) => child;
 /// `<line>/<cell>/<variant>`, so it renders, lists and mounts like any
 /// other; the line page only adds the layout.
 class Storyline {
-  const Storyline(this.id, {required this.rows, this.title});
+  const Storyline(
+    this.id, {
+    required this.rows,
+    this.title,
+    this.knobs = const [],
+  });
 
   /// Two segments, group first: `flows/onboarding`.
   final String id;
   final String? title;
   final List<StorylineRow> rows;
+
+  /// The line's switches, mock data mostly; see [Knob]. The line page
+  /// shows them next to the device toggle, and nothing when this is empty.
+  final List<Knob<Object?>> knobs;
 
   List<Story> get stories => [
     for (final row in rows)
@@ -88,6 +97,69 @@ class Cell {
 
   /// Overrides the row's frame for this cell.
   final FrameBuilder? frameBuilder;
+}
+
+/// A switch for a whole storyline: which mock data (a fake backend, a
+/// seeded feed, a user) every screen in the flow runs on. Variants stack
+/// on the page and show states side by side; a knob changes all of them
+/// at once. The line page shows one row of buttons per knob, next to the
+/// device toggle, and only for lines that declare knobs.
+///
+/// A variant reads the chosen value with [of]:
+///
+/// ```dart
+/// final backend = Knob('backend', title: 'Data', options: [
+///   KnobOption('empty', FakeBackend.empty(), title: 'Tom'),
+///   KnobOption('busy', FakeBackend.busy(), title: 'Tre pakker'),
+/// ]);
+/// Story('home', () => Builder(builder: (c) => HomeScreen(backend.of(c))))
+/// ```
+///
+/// Renders and live views take `?k.<knob>=<option>`; the first option is
+/// the default. Build knobs inside `storyline()` like everything else, so
+/// hot reload reaches their values.
+class Knob<T> {
+  const Knob(this.id, {required this.options, this.title});
+
+  /// A slug: it goes in the URL.
+  final String id;
+  final String? title;
+
+  /// The first option is the default.
+  final List<KnobOption<T>> options;
+
+  /// The value of the option the page chose, or the first option's.
+  T of(BuildContext context) {
+    final chosen = KnobScope.chosenOf(context)[id];
+    for (final option in options) {
+      if (option.id == chosen) return option.value;
+    }
+    return options.first.value;
+  }
+}
+
+class KnobOption<T> {
+  const KnobOption(this.id, this.value, {this.title});
+
+  /// A slug: it goes in the URL.
+  final String id;
+  final String? title;
+  final T value;
+}
+
+/// The page's knob choices, option id by knob id; [Knob.of] reads them.
+/// Absent knobs are at their default.
+class KnobScope extends InheritedWidget {
+  const KnobScope({super.key, required this.chosen, required super.child});
+
+  final Map<String, String> chosen;
+
+  static Map<String, String> chosenOf(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<KnobScope>()?.chosen ??
+      const {};
+
+  @override
+  bool updateShouldNotify(KnobScope old) => !mapEquals(old.chosen, chosen);
 }
 
 /// Subclass this and implement [build] to define your stories.

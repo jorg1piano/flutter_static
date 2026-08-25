@@ -55,10 +55,15 @@ a browser gallery for humans, HTTP endpoints and MCP tools for agents.
 4. Agent's pending `wait_for_changes` returns the diff.
 5. Agent fetches new PNGs and semantics for exactly those stories.
 
-Save-to-updated-render target: 1 to 2 seconds (hot reload is the floor).
+Save-to-updated-render, measured 2026-08-25 via `flutter_static render` right
+after a save: 0.28 to 0.45 s on both a 773-library test app and a 1511-library
+app. The VM reload phase (100 to 250 ms) is the floor and grows with heap size,
+which is why the catalog prewarms only the hot set after a reload.
 
 ## Non-goals (v1)
 
-- Interactive knobs (variants are enumerated instead)
+- Knobs on plain stories (variants are enumerated instead). Storylines do get
+  knobs, one per mock the flow can run on, because a flow's screens share the
+  data behind them and a variant per data set would multiply every cell.
 - Pixel parity with Android devices
 - Flutter web build of the catalog

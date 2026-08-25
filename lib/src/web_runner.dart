@@ -93,6 +93,10 @@ class _MultiViewStoriesState extends State<_MultiViewStories>
     }
     final device = PhoneSpec.byName(data?['device'] as String?);
     final statusBar = data?['status'] == true;
+    final knobs = {
+      for (final entry in ((data?['knobs'] as Map?) ?? const {}).entries)
+        '${entry.key}': '${entry.value}',
+    };
     Widget view = matches.first.builder();
     if (device != null || statusBar) {
       view = DeviceScope(
@@ -101,6 +105,7 @@ class _MultiViewStoriesState extends State<_MultiViewStories>
         child: view,
       );
     }
+    if (knobs.isNotEmpty) view = KnobScope(chosen: knobs, child: view);
     return SingleChildScrollView(child: Center(child: view));
   }
 }
