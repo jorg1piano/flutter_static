@@ -1321,7 +1321,7 @@ class _TokensListCommand extends Command<int> {
     for (final file in set.files) {
       stdout.writeln(p.relative(file.path));
       for (final group in file.groups) {
-        stdout.writeln('  $group.name');
+        stdout.writeln('  ${group.name}');
         for (final t in group.tokens) {
           final value = switch (t.kind) {
             TokenKind.color => colorHex(t.argb!),
