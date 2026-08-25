@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_static/src/studio/controller.dart';
 import 'package:flutter_static/src/studio/tokens_panel.dart';
+import 'package:flutter_static/src/story.dart';
 import 'package:flutter_static/src/tokens.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -26,10 +27,10 @@ void main() {
     Directory('${project.path}/lib').createSync();
     File('${project.path}/lib/tokens.dart').writeAsStringSync(_source);
     controller = StudioController(
+      stories: const _NoStories(),
       project: project.path,
       port: 1,
-      packageRoot: project.path,
-    )..loadTokens();
+    );
   });
 
   tearDown(() {
@@ -88,4 +89,11 @@ void main() {
     await tester.pump();
     expect(source(), contains('static const md = 16.0;'));
   });
+}
+
+class _NoStories extends Stories {
+  const _NoStories();
+
+  @override
+  List<Story> build() => const [];
 }

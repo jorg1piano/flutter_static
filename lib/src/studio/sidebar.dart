@@ -83,8 +83,6 @@ class _Header extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final (color, label) = switch (controller.status) {
-      CatalogStatus.stopped => (StudioColors.faint, 'stopped'),
-      CatalogStatus.starting => (StudioColors.warn, 'starting'),
       CatalogStatus.ready => (StudioColors.ok, 'live'),
       CatalogStatus.reloading => (StudioColors.warn, 'reloading'),
       CatalogStatus.error => (StudioColors.bad, 'error'),
@@ -113,12 +111,7 @@ class _Header extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 2),
-          Text(
-            controller.statusDetail ?? 'localhost:${controller.port}',
-            style: StudioText.monoMuted,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-          ),
+          Text('localhost:${controller.port}', style: StudioText.monoMuted),
         ],
       ),
     );
@@ -197,46 +190,41 @@ class _Footer extends StatelessWidget {
   final StudioController controller;
 
   @override
-  Widget build(BuildContext context) {
-    final busy = controller.status == CatalogStatus.starting;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-      child: Row(
-        children: [
-          _IconAction(
-            icon: Icons.terminal,
-            tooltip: 'Logs',
-            active: controller.showLogs,
-            onTap: controller.toggleLogs,
-          ),
-          _IconAction(
-            icon: Icons.language,
-            tooltip: 'Open the gallery in the browser',
-            onTap: () => Process.run('open', [controller.url]),
-          ),
-          const Spacer(),
-          _IconAction(
-            icon: Icons.restart_alt,
-            tooltip: 'Restart the catalog',
-            onTap: busy ? null : () => controller.start(restart: true),
-          ),
-          _IconAction(
-            icon: controller.status == CatalogStatus.stopped
-                ? Icons.play_arrow
-                : Icons.stop,
-            tooltip: controller.status == CatalogStatus.stopped
-                ? 'Start the catalog'
-                : 'Stop the catalog',
-            onTap: busy
-                ? null
-                : controller.status == CatalogStatus.stopped
-                ? controller.start
-                : controller.stop,
-          ),
-        ],
-      ),
-    );
-  }
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+    child: Row(
+      children: [
+        _IconAction(
+          icon: Icons.bolt,
+          tooltip: controller.live
+              ? 'Live widgets on the canvas (click for renders)'
+              : 'PNG renders on the canvas (click for live widgets)',
+          active: controller.live,
+          onTap: controller.toggleLive,
+        ),
+        _IconAction(
+          icon: Icons.touch_app_outlined,
+          tooltip: controller.interact
+              ? 'Interact: clicks reach the widgets'
+              : 'Select: a click selects the card',
+          active: controller.interact,
+          onTap: controller.toggleInteract,
+        ),
+        const Spacer(),
+        _IconAction(
+          icon: Icons.terminal,
+          tooltip: 'Logs',
+          active: controller.showLogs,
+          onTap: controller.toggleLogs,
+        ),
+        _IconAction(
+          icon: Icons.language,
+          tooltip: 'Open the gallery in the browser',
+          onTap: () => Process.run('open', [controller.url]),
+        ),
+      ],
+    ),
+  );
 }
 
 class _IconAction extends StatelessWidget {

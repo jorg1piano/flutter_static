@@ -25,10 +25,17 @@ In flutter_static:
 - `lib/src/server_io.dart`: `GET /tokens.json`, `POST /tokens`, and
   `rows` under each storyline in `/index.json`.
 - `bin/flutter_static.dart`: `studio` and `tokens list|set`.
-- `lib/studio_main.dart` + `lib/src/studio/`: the Studio app
-  (controller, model, canvas, inspector, tokens_panel, sidebar).
+- `lib/src/studio_runner.dart`: `runFlutterStudio(stories)`, the catalog
+  with Studio in its window. `lib/src/studio/`: app, controller, model,
+  canvas, inspector, tokens_panel, sidebar.
+- `lib/src/server_io.dart` public hooks Studio uses in-process:
+  `storiesIndex`, `findStory`, `storyOnPage`, `storyEnvironment`,
+  `renderStoryPng`, `storyShellOf`, `catalogVersion`,
+  `catalogReloadTick`, `projectRoot`, and `runFlutterStatic(shell:)`.
+- `lib/studio_main.dart`: dogfood entry for this package's demo story.
 - `macos/Runner/*.entitlements`: sandbox off; `MainFlutterWindow.swift`
-  opens larger.
+  opens larger. The `studio` command makes the same two edits in a
+  project's runner on first use.
 
 In the playground:
 
@@ -50,9 +57,19 @@ In the playground:
   knob switching the home screen's data).
 - `/tokens.json` lists the four groups; `tokens set` rewrites a value
   and the catalog hot reloads it.
-- Studio launches against the playground, shows pages and tokens, and
-  a colour drag in the `AppColors` panel rewrites `colors.dart` and
-  refreshes the canvas.
+- `flutter_static studio` in the playground scaffolds
+  `story/studio_main.dart`, stops the `up` runner, and opens Studio with
+  the stories mounted live: the welcome logo's float animation runs on
+  the canvas. A `tokens set` from a terminal hot reloads the process and
+  the live widgets follow; the colour picker does the same from inside.
+
+## History
+
+The first Studio (commits `0e70da4`..`a72c732`) was a separate host app
+that ran the project's catalog as a child process and showed PNGs over
+HTTP. It was replaced by the in-process version because Studio is built
+from source per project anyway, and live widgets need no frame
+streaming or pointer forwarding when they are in the same tree.
 
 ## Next
 

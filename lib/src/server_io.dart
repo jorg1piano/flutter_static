@@ -19,15 +19,126 @@ const _catalogPort = int.fromEnvironment(
   defaultValue: 8474,
 );
 
-void runFlutterStatic(Stories stories, {int port = _catalogPort}) {
+/// Builds the catalog window around [mounts], the stories that need a
+/// real view (see [_windowStories]). Keep [mounts] in the tree and painted
+/// so they can still be snapshotted; Studio puts its UI over them.
+typedef CatalogShell = Widget Function(BuildContext context, Widget mounts);
+
+/// The port `flutter_static run` compiled in, or 8474.
+const defaultCatalogPort = _catalogPort;
+
+void runFlutterStatic(
+  Stories stories, {
+  int port = _catalogPort,
+  CatalogShell? shell,
+}) {
   debugDefaultTargetPlatformOverride = stories.platform;
   // At launch the running code includes every save made so far.
   _reloadReportedAt = DateTime.now();
   _stayAwake();
-  runApp(_CatalogApp(stories: stories));
+  runApp(_CatalogApp(stories: stories, shell: shell));
   _serve(stories, port);
   _prewarm(stories, initial: true);
 }
+
+// --- in-process API, for Studio -------------------------------------------
+
+/// Bumped on every hot reload the catalog saw.
+final catalogVersion = ValueNotifier<int>(0);
+
+/// Bumped whenever the reload gate changes state; read
+/// [catalogReloadError] and [catalogReloadPending] then.
+final catalogReloadTick = ValueNotifier<int>(0);
+String? get catalogReloadError => _reloadError;
+bool get catalogReloadPending => _reloadPending;
+
+/// The consumer project root, or null when the binary is not under one.
+String? projectRoot() => _projectRoot();
+
+Story? findStory(Stories stories, String id) {
+  for (final story in stories.all()) {
+    if (story.id == id) return story;
+  }
+  return null;
+}
+
+/// [story]'s widget on [device], with the status bar and on the [knobs]
+/// choices, the way a page or a render shows it. Call from a build.
+Widget storyOnPage(
+  Story story, {
+  PhoneSpec? device,
+  bool statusBar = false,
+  Map<String, String> knobs = const {},
+}) => _onPage(
+  story,
+  device: device,
+  statusBar: statusBar,
+  knobs: knobs,
+).builder();
+
+/// The render of story [id] as `/story/<id>.png` would serve it, from the
+/// same cache and capture queue.
+Future<Uint8List> renderStoryPng(
+  Stories stories,
+  String id, {
+  PhoneSpec? device,
+  bool statusBar = false,
+  Map<String, String> knobs = const {},
+}) {
+  final story = findStory(stories, id);
+  if (story == null) throw ArgumentError.value(id, 'id', 'no such story');
+  _noteRequested(id);
+  return _renderCached(
+    _onPage(story, device: device, statusBar: statusBar, knobs: knobs),
+  );
+}
+
+/// How a story lays out, learnt at its first capture: at its natural
+/// size under unbounded constraints, only inside a phone-sized box, or
+/// only in the real window (a widget the offscreen tree cannot host).
+enum StoryShell { unbounded, bounded, window }
+
+final _storyShells = <String, StoryShell>{};
+
+/// [StoryShell] of story [id], or null until it has been captured once.
+StoryShell? storyShellOf(String id) => _storyShells[id];
+
+String _baseId(String id) => id.split(RegExp('[@~]')).first;
+
+/// The environment a story renders in: phone-sized media query, English
+/// localizations, the default theme, a transparent Material. [bounded]
+/// adds the phone-sized box [StoryShell.bounded] stories need.
+Widget storyEnvironment(Widget child, {bool bounded = false}) =>
+    _storyEnvironment(
+      bounded
+          ? ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 430, maxHeight: 932),
+              child: child,
+            )
+          : child,
+      ThemeData(),
+    );
+
+Widget _storyEnvironment(Widget inner, ThemeData theme) => MediaQuery(
+  data: const MediaQueryData(size: Size(430, 932), devicePixelRatio: 2),
+  child: Localizations(
+    locale: const Locale('en'),
+    delegates: const [
+      DefaultWidgetsLocalizations.delegate,
+      DefaultMaterialLocalizations.delegate,
+    ],
+    child: Directionality(
+      textDirection: TextDirection.ltr,
+      child: Theme(
+        data: theme,
+        child: DefaultTextStyle(
+          style: theme.textTheme.bodyMedium!,
+          child: Material(type: MaterialType.transparency, child: inner),
+        ),
+      ),
+    ),
+  ),
+);
 
 /// Opts the process out of App Nap. The catalog runs hidden and unfocused
 /// (flutter run launches it behind the terminal), so macOS throttles it
@@ -378,6 +489,7 @@ String _eventData() => jsonEncode({
 });
 
 void _broadcastEvent() {
+  catalogReloadTick.value++;
   for (final client in _eventClients) {
     try {
       client.write('data: ${_eventData()}\n\n');
@@ -401,9 +513,10 @@ void _traceLog(String line) {
 final _eventClients = <HttpResponse>[];
 
 class _CatalogApp extends StatefulWidget {
-  const _CatalogApp({required this.stories});
+  const _CatalogApp({required this.stories, this.shell});
 
   final Stories stories;
+  final CatalogShell? shell;
 
   @override
   State<_CatalogApp> createState() => _CatalogAppState();
@@ -416,53 +529,66 @@ class _CatalogAppState extends State<_CatalogApp> {
     // Re-read on every reload: main() never runs again, the getter does.
     debugDefaultTargetPlatformOverride = widget.stories.platform;
     _version++;
+    // Learn each story's shell afresh: a capture that failed offscreen
+    // for a transient reason should not stay window-bound for good.
+    _storyShells.clear();
+    _needsWindow.clear();
     _lastActivity = DateTime.now();
     _prewarm(widget.stories, initial: false);
     _broadcastEvent();
+    catalogVersion.value = _version;
   }
 
   @override
   Widget build(BuildContext context) {
+    final mounts = ValueListenableBuilder<List<Story>>(
+      valueListenable: _windowStories,
+      builder: (context, mounted, _) {
+        if (mounted.isEmpty) {
+          return widget.shell == null
+              ? const Text('flutter_static')
+              : const SizedBox.shrink();
+        }
+        // Their own Material: MaterialApp's fallback text style (the
+        // debug yellow underline) must never reach a window capture,
+        // whatever shell the window has.
+        return Material(
+          type: MaterialType.transparency,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              for (final story in mounted)
+                // Window-mounted stories are app screens (they embed
+                // MaterialApp, which requires BOUNDED constraints - in
+                // an unbounded OverflowBox its layout fails and the
+                // broken render tree poisons every later window frame,
+                // which offscreen captures also flush when pumping).
+                OverflowBox(
+                  minWidth: 0,
+                  minHeight: 0,
+                  maxWidth: 430,
+                  maxHeight: 932,
+                  alignment: Alignment.center,
+                  child: RepaintBoundary(
+                    key: _windowKeys[story.id],
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(
+                        maxWidth: 430,
+                        maxHeight: 932,
+                      ),
+                      child: story.builder(),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+    if (widget.shell != null) return widget.shell!(context, mounts);
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      home: Scaffold(
-        body: Center(
-          child: ValueListenableBuilder<List<Story>>(
-            valueListenable: _windowStories,
-            builder: (context, mounted, _) {
-              if (mounted.isEmpty) return const Text('flutter_static');
-              return Stack(
-                alignment: Alignment.center,
-                children: [
-                  for (final story in mounted)
-                    // Window-mounted stories are app screens (they embed
-                    // MaterialApp, which requires BOUNDED constraints - in
-                    // an unbounded OverflowBox its layout fails and the
-                    // broken render tree poisons every later window frame,
-                    // which offscreen captures also flush when pumping).
-                    OverflowBox(
-                      minWidth: 0,
-                      minHeight: 0,
-                      maxWidth: 430,
-                      maxHeight: 932,
-                      alignment: Alignment.center,
-                      child: RepaintBoundary(
-                        key: _windowKeys[story.id],
-                        child: ConstrainedBox(
-                          constraints: const BoxConstraints(
-                            maxWidth: 430,
-                            maxHeight: 932,
-                          ),
-                          child: story.builder(),
-                        ),
-                      ),
-                    ),
-                ],
-              );
-            },
-          ),
-        ),
-      ),
+      home: Scaffold(body: Center(child: mounts)),
     );
   }
 }
@@ -549,49 +675,7 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
               'error': _reloadError,
               'last': _reloadMessage,
             },
-            'stories': [
-              for (final s in stories.all())
-                {'id': s.id, 'png': '/story/${s.id}.png'},
-            ],
-            'lines': [
-              for (final line in stories.storylines())
-                {
-                  'id': line.id,
-                  'title': line.title,
-                  'page': '/line/${line.id}',
-                  'rows': [
-                    for (final row in line.rows)
-                      {
-                        'title': row.title,
-                        'cells': [
-                          for (final cell in row.cells)
-                            {
-                              'id': cell.id,
-                              'title': cell.title,
-                              'variants': [
-                                for (final v in cell.variants)
-                                  {
-                                    'id': v.id,
-                                    'story': '${line.id}/${cell.id}/${v.id}',
-                                  },
-                              ],
-                            },
-                        ],
-                      },
-                  ],
-                  'knobs': [
-                    for (final knob in line.knobs)
-                      {
-                        'id': knob.id,
-                        'title': knob.title,
-                        'options': [
-                          for (final option in knob.options)
-                            {'id': option.id, 'title': option.title},
-                        ],
-                      },
-                  ],
-                },
-            ],
+            ...storiesIndex(stories),
           }),
         );
         await response.close();
@@ -837,6 +921,50 @@ Story _onPage(
   });
 }
 
+/// The `stories` and `lines` of `/index.json`: every story id, and each
+/// storyline's rows, cells, variants and knobs.
+Map<String, Object?> storiesIndex(Stories stories) => {
+  'stories': [
+    for (final s in stories.all()) {'id': s.id, 'png': '/story/${s.id}.png'},
+  ],
+  'lines': [
+    for (final line in stories.storylines())
+      {
+        'id': line.id,
+        'title': line.title,
+        'page': '/line/${line.id}',
+        'rows': [
+          for (final row in line.rows)
+            {
+              'title': row.title,
+              'cells': [
+                for (final cell in row.cells)
+                  {
+                    'id': cell.id,
+                    'title': cell.title,
+                    'variants': [
+                      for (final v in cell.variants)
+                        {'id': v.id, 'story': '${line.id}/${cell.id}/${v.id}'},
+                    ],
+                  },
+              ],
+            },
+        ],
+        'knobs': [
+          for (final knob in line.knobs)
+            {
+              'id': knob.id,
+              'title': knob.title,
+              'options': [
+                for (final option in knob.options)
+                  {'id': option.id, 'title': option.title},
+              ],
+            },
+        ],
+      },
+  ],
+};
+
 /// The storyline [id] is a variant of, if any.
 Storyline? _lineOf(Stories stories, String id) {
   for (final line in stories.storylines()) {
@@ -987,6 +1115,7 @@ Future<Uint8List> _capture(Story story, {bool offscreenOnly = false}) async {
     return await _captureOffscreen(story);
   } catch (e, st) {
     _needsWindow.add(story.id);
+    _storyShells[_baseId(story.id)] = StoryShell.window;
     final where = st.toString().split('\n').take(4).join(' | ');
     _lastTrace = 'FALLBACK ${story.id}: $e @ $where';
     _traceLog(_lastTrace);
@@ -1058,45 +1187,23 @@ Future<Uint8List> _captureOffscreen(Story story) async {
   // Unbounded like the window's OverflowBox: Column(mainAxisSize.max)
   // shrink-wraps under unbounded constraints but inflates to any bound,
   // so bounded-loose canvases turned every card into a 932px giant.
-  Widget shell(Widget inner, {required bool unbounded}) => MediaQuery(
-    data: const MediaQueryData(size: Size(430, 932), devicePixelRatio: 2),
-    child: Localizations(
-      locale: const Locale('en'),
-      delegates: const [
-        DefaultWidgetsLocalizations.delegate,
-        DefaultMaterialLocalizations.delegate,
-      ],
-      child: Directionality(
-        textDirection: TextDirection.ltr,
-        child: Theme(
-          data: theme,
-          child: DefaultTextStyle(
-            style: theme.textTheme.bodyMedium!,
-            child: Material(
-              type: MaterialType.transparency,
-              child: unbounded
-                  ? OverflowBox(
-                      minWidth: 0,
-                      minHeight: 0,
-                      maxWidth: double.infinity,
-                      maxHeight: double.infinity,
-                      alignment: Alignment.topLeft,
-                      child: RepaintBoundary(child: inner),
-                    )
-                  : RepaintBoundary(
-                      child: ConstrainedBox(
-                        constraints: const BoxConstraints(
-                          maxWidth: 430,
-                          maxHeight: 932,
-                        ),
-                        child: inner,
-                      ),
-                    ),
+  Widget shell(Widget inner, {required bool unbounded}) => _storyEnvironment(
+    unbounded
+        ? OverflowBox(
+            minWidth: 0,
+            minHeight: 0,
+            maxWidth: double.infinity,
+            maxHeight: double.infinity,
+            alignment: Alignment.topLeft,
+            child: RepaintBoundary(child: inner),
+          )
+        : RepaintBoundary(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 430, maxHeight: 932),
+              child: inner,
             ),
           ),
-        ),
-      ),
-    ),
+    theme,
   );
 
   _installErrorHook();
@@ -1150,6 +1257,9 @@ Future<Uint8List> _captureOffscreen(Story story) async {
       unboundedOk = false;
     }
     mark('first-pump');
+    _storyShells[_baseId(story.id)] = unboundedOk
+        ? StoryShell.unbounded
+        : StoryShell.bounded;
     if (!unboundedOk) {
       // Stories that can't lay out unbounded (fill-style sizing) get the
       // phone-bounded shell instead.
@@ -1164,18 +1274,32 @@ Future<Uint8List> _captureOffscreen(Story story) async {
     // then synthetic frame pumps so animations reach a settled-looking
     // state without waiting wall-clock time. The budget bounds stories
     // whose single frame is genuinely expensive.
+    // Real frames while the window has vsync (Studio: a visible window
+    // with live tickers, which must see monotonic timestamps); synthetic
+    // timestamps once it has none (the hidden catalog window), so even
+    // infinitely-animating stories capture in tens of milliseconds.
     var synthetic = binding.currentSystemFrameTimeStamp;
+    var vsync = binding.framesEnabled;
     final budget = DateTime.now().add(const Duration(seconds: 2));
     for (var i = 0; i < 60 && DateTime.now().isBefore(budget); i++) {
       final animating = binding.transientCallbackCount > baselineTickers;
       if (i >= 3 && !animating && !_imagesPending) break;
       if (animating) {
-        synthetic += const Duration(milliseconds: 16);
-        try {
-          binding.handleBeginFrame(synthetic);
-          binding.handleDrawFrame();
-        } catch (_) {
-          // A real engine frame was mid-flight; skip this pump.
+        if (vsync) {
+          try {
+            await binding.endOfFrame.timeout(const Duration(milliseconds: 100));
+          } on TimeoutException {
+            vsync = false;
+          }
+        }
+        if (!vsync) {
+          synthetic += const Duration(milliseconds: 16);
+          try {
+            binding.handleBeginFrame(synthetic);
+            binding.handleDrawFrame();
+          } catch (_) {
+            // A real engine frame was mid-flight; skip this pump.
+          }
         }
       }
       await Future<void>.delayed(const Duration(milliseconds: 4));
@@ -1212,12 +1336,24 @@ Future<Uint8List> _captureOffscreen(Story story) async {
     // Drain one binding frame while the tree is still mounted: widgets
     // like EditableText schedule post-frame callbacks that must run
     // against a live State, or they null-check on every later frame.
-    try {
-      binding.handleBeginFrame(
-        binding.currentSystemFrameTimeStamp + const Duration(milliseconds: 16),
-      );
-      binding.handleDrawFrame();
-    } catch (_) {}
+    var drained = false;
+    if (binding.framesEnabled) {
+      try {
+        await binding.endOfFrame.timeout(const Duration(milliseconds: 100));
+        drained = true;
+      } on TimeoutException {
+        drained = false;
+      }
+    }
+    if (!drained) {
+      try {
+        binding.handleBeginFrame(
+          binding.currentSystemFrameTimeStamp +
+              const Duration(milliseconds: 16),
+        );
+        binding.handleDrawFrame();
+      } catch (_) {}
+    }
     // Unmount so story states (and their tickers) are disposed; an
     // animating story must not keep ticking after its capture.
     try {

@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import 'controller.dart';
 import 'model.dart';
 import 'theme.dart';
-import 'widgets.dart';
 
 /// The page on an infinite pan/zoom surface: rows of cells, each cell a
 /// stack of variant renders. Nothing here is editable; the canvas is a
@@ -250,8 +249,10 @@ class _CellColumn extends StatelessWidget {
   );
 }
 
-/// One render. Keeps the last image while a new one loads, and paints the
-/// selection ring over it so selecting never moves the layout.
+/// One story on the canvas: mounted live when the catalog knows a shell
+/// for it, its PNG render otherwise. Keeps the last image while a new one
+/// captures, and paints the selection ring over it so selecting never
+/// moves the layout.
 class StoryCard extends StatelessWidget {
   const StoryCard({super.key, required this.id, required this.controller});
 
@@ -260,66 +261,129 @@ class StoryCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final png = controller.png(id);
     final selected = controller.selectedStoryId == id;
-    final loading = controller.isFetching(id);
-    return GestureDetector(
-      onTap: () => controller.selectStory(id),
-      child: Container(
-        foregroundDecoration: BoxDecoration(
-          border: Border.all(
-            color: selected ? StudioColors.accent : Colors.transparent,
-            width: 3,
-            strokeAlign: BorderSide.strokeAlignOutside,
-          ),
-          borderRadius: BorderRadius.circular(2),
+    final live = controller.isLive(id);
+    // A story the catalog has not captured yet: ask for the render, which
+    // also tells us how it lays out.
+    final png = live == true ? null : controller.png(id);
+    final Widget body;
+    if (live == true) {
+      body = _LiveSlot(
+        interact: controller.interact,
+        onSelect: () => controller.selectStory(id),
+        child: controller.mount(id),
+      );
+    } else {
+      body = _RenderSlot(
+        id: id,
+        png: png,
+        loading: controller.isFetching(id),
+        onSelect: () => controller.selectStory(id),
+      );
+    }
+    return Container(
+      foregroundDecoration: BoxDecoration(
+        border: Border.all(
+          color: selected ? StudioColors.accent : Colors.transparent,
+          width: 3,
+          strokeAlign: BorderSide.strokeAlignOutside,
         ),
-        decoration: const BoxDecoration(
-          boxShadow: [
-            BoxShadow(
-              color: Color(0x66000000),
-              blurRadius: 24,
-              offset: Offset(0, 8),
-            ),
-          ],
-        ),
-        child: png == null
-            ? Container(
-                width: 390,
-                height: 240,
-                color: StudioColors.raised,
-                alignment: Alignment.center,
-                child: Text(
-                  loading ? 'rendering…' : id,
-                  style: StudioText.monoMuted,
-                ),
-              )
-            : Stack(
-                children: [
-                  Image.memory(
-                    png.bytes,
-                    scale: 2,
-                    gaplessPlayback: true,
-                    filterQuality: FilterQuality.medium,
-                  ),
-                  if (loading)
-                    const Positioned(
-                      right: 8,
-                      top: 8,
-                      child: SizedBox(
-                        width: 12,
-                        height: 12,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: StudioColors.accent,
-                        ),
-                      ),
-                    ),
-                ],
-              ),
+        borderRadius: BorderRadius.circular(2),
       ),
+      decoration: const BoxDecoration(
+        boxShadow: [
+          BoxShadow(
+            color: Color(0x66000000),
+            blurRadius: 24,
+            offset: Offset(0, 8),
+          ),
+        ],
+      ),
+      child: body,
     );
   }
+}
+
+/// A live widget. In select mode a click selects the card and nothing
+/// reaches the widget; in interact mode events go through and a pointer
+/// down still selects.
+class _LiveSlot extends StatelessWidget {
+  const _LiveSlot({
+    required this.child,
+    required this.interact,
+    required this.onSelect,
+  });
+
+  final Widget child;
+  final bool interact;
+  final VoidCallback onSelect;
+
+  @override
+  Widget build(BuildContext context) {
+    // Its own layer: an animating story repaints itself, not the canvas.
+    final isolated = RepaintBoundary(child: child);
+    if (interact) {
+      return Listener(onPointerDown: (_) => onSelect(), child: isolated);
+    }
+    return GestureDetector(
+      onTap: onSelect,
+      behavior: HitTestBehavior.opaque,
+      child: AbsorbPointer(child: isolated),
+    );
+  }
+}
+
+class _RenderSlot extends StatelessWidget {
+  const _RenderSlot({
+    required this.id,
+    required this.png,
+    required this.loading,
+    required this.onSelect,
+  });
+
+  final String id;
+  final StoryPng? png;
+  final bool loading;
+  final VoidCallback onSelect;
+
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+    onTap: onSelect,
+    child: png == null
+        ? Container(
+            width: 390,
+            height: 240,
+            color: StudioColors.raised,
+            alignment: Alignment.center,
+            child: Text(
+              loading ? 'rendering…' : id,
+              style: StudioText.monoMuted,
+            ),
+          )
+        : Stack(
+            children: [
+              Image.memory(
+                png!.bytes,
+                scale: 2,
+                gaplessPlayback: true,
+                filterQuality: FilterQuality.medium,
+              ),
+              if (loading)
+                const Positioned(
+                  right: 8,
+                  top: 8,
+                  child: SizedBox(
+                    width: 12,
+                    height: 12,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: StudioColors.accent,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+  );
 }
 
 /// Dots that move with the canvas, so panning reads as motion.
@@ -352,7 +416,7 @@ class _DotGrid extends CustomPainter {
   bool shouldRepaint(_DotGrid old) => true;
 }
 
-/// Shown instead of the canvas until the catalog is up.
+/// Shown instead of the canvas when the project lists no stories.
 class CanvasPlaceholder extends StatelessWidget {
   const CanvasPlaceholder({super.key, required this.controller});
 
@@ -365,33 +429,14 @@ class CanvasPlaceholder extends StatelessWidget {
     child: Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Text(switch (controller.status) {
-          CatalogStatus.stopped => 'Catalog stopped',
-          CatalogStatus.starting => 'Starting the catalog…',
-          CatalogStatus.error => 'Catalog error',
-          _ => '',
-        }, style: StudioText.title),
+        Text('No stories', style: StudioText.title),
         const SizedBox(height: 6),
         Text(
-          controller.statusDetail ?? controller.project,
+          'Add one with: flutter_static add story <group>/<name>',
           style: StudioText.muted,
         ),
-        const SizedBox(height: 16),
-        if (controller.status == CatalogStatus.starting)
-          const SizedBox(
-            width: 160,
-            child: LinearProgressIndicator(
-              color: StudioColors.accent,
-              backgroundColor: StudioColors.raised,
-            ),
-          )
-        else
-          StudioButton(
-            label: 'Start',
-            icon: Icons.play_arrow,
-            primary: true,
-            onTap: controller.start,
-          ),
+        const SizedBox(height: 4),
+        Text(controller.project, style: StudioText.monoMuted),
       ],
     ),
   );

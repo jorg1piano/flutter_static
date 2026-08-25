@@ -1107,29 +1107,19 @@ Future<String?> _packageRoot() async {
   return lib.existsSync() ? lib.parent.path : null;
 }
 
-/// `flutter_static studio --project <dir>`: the macOS Studio host, a
-/// Flutter app from this package that runs the project's catalog as a
-/// child process and shows its pages, stories and tokens. The project's
-/// code is never compiled into Studio; it runs in the child.
+/// `flutter_static studio`: the catalog with Studio in its window. Runs
+/// the project's `story/studio_main.dart` (scaffolded here if missing)
+/// the way `run` runs `story/main.dart`: same runner, same watcher, same
+/// HTTP API, plus a canvas of live widgets and the token editors.
 class _StudioCommand extends Command<int> {
   _StudioCommand() {
     argParser
-      ..addOption(
-        'project',
-        abbr: 'p',
-        defaultsTo: '.',
-        help: 'The Flutter project whose stories Studio shows.',
-      )
+      ..addOption('device', abbr: 'd', defaultsTo: 'macos')
       ..addOption(
         'port',
         help:
-            'Catalog port for the project (default: its registered port, '
-            'see `flutter_static port`).',
-      )
-      ..addFlag(
-        'release',
-        negatable: false,
-        help: 'Build Studio in release mode (no hot reload of Studio itself).',
+            'Catalog port (default: the port registered for this '
+            'directory, see `flutter_static port`).',
       );
   }
 
@@ -1137,55 +1127,155 @@ class _StudioCommand extends Command<int> {
   String get name => 'studio';
   @override
   String get description =>
-      'Open the macOS Studio: pages, stories and design tokens of a '
-      'project, live.';
+      'Open Studio for this project: stories live on a canvas, design '
+      'tokens editable, the catalog API on the same port.';
+
+  static const target = 'story/studio_main.dart';
 
   @override
   Future<int> run() async {
-    final project = p.canonicalize(argResults!['project'] as String);
-    if (!File(p.join(project, 'pubspec.yaml')).existsSync()) {
-      stderr.writeln('No pubspec.yaml at $project');
+    if (!File('pubspec.yaml').existsSync()) {
+      stderr.writeln('No pubspec.yaml here. Run studio from the project.');
       return 1;
     }
-    final portArg = argResults!['port'] as String?;
-    final int? port;
-    if (portArg == null) {
-      // The registry keys by cwd; claim the project's port from inside it.
-      final previous = Directory.current;
-      Directory.current = project;
-      port = await _PortRegistry.claim();
-      Directory.current = previous;
-    } else {
-      port = int.tryParse(portArg);
+    if (!File('story/main.dart').existsSync()) {
+      stderr.writeln('No story/main.dart. Run: flutter_static setup');
+      return 1;
     }
-    if (port == null || port < 1 || port > 65535) {
-      stderr.writeln('Invalid port: $portArg');
+    if (!Directory('macos').existsSync()) {
+      stderr.writeln('No macOS runner. Run: flutter_static setup');
+      return 1;
+    }
+    final scaffolded = _scaffoldStudioMain();
+    if (scaffolded != null) stdout.writeln(scaffolded);
+    for (final line in _prepareRunner()) {
+      stdout.writeln(line);
+    }
+    // Studio serves the catalog itself; a runner from `up` would fight it
+    // for the port.
+    final pid = _UpCommand._runnerPid();
+    final registered = _PortRegistry.lookup();
+    if (pid != null) {
+      stdout.writeln(
+        'flutter_static: stopping the catalog runner (pid $pid); '
+        'Studio serves the catalog on the same port.',
+      );
+      await _DownCommand.stop(pid, registered);
+    }
+    final requested = argResults!['port'] as String?;
+    final port = await _PortRegistry.claim(
+      requested: requested == null ? null : int.tryParse(requested),
+    );
+    if (port == null) {
+      stderr.writeln('Invalid port: $requested');
       return 64;
     }
-    final root = await _packageRoot();
-    if (root == null) {
-      stderr.writeln('Could not locate the flutter_static package root.');
-      return 1;
-    }
-    stdout.writeln('Studio for $project (catalog on :$port)');
-    final process = await Process.start(
-      'flutter',
-      [
-        'run',
-        '-d',
-        'macos',
-        if (argResults!['release'] as bool) '--release',
-        '-t',
-        'lib/studio_main.dart',
-        '--dart-define=FLUTTER_STATIC_ROOT=$root',
-        '--dart-define=FLUTTER_STATIC_STUDIO_PROJECT=$project',
-        '--dart-define=FLUTTER_STATIC_STUDIO_PORT=$port',
-      ],
-      workingDirectory: root,
-      mode: ProcessStartMode.inheritStdio,
-    );
-    return process.exitCode;
+    stdout.writeln('flutter_static: Studio, catalog on port $port');
+    return _Runner(
+      target: target,
+      device: argResults!['device'] as String,
+      port: port,
+    ).run();
   }
+
+  /// Writes `story/studio_main.dart` for the Stories class in
+  /// `story/main.dart`; returns what it did, or null when it exists.
+  static String? _scaffoldStudioMain() {
+    final file = File(target);
+    if (file.existsSync()) return null;
+    final main = File('story/main.dart').readAsStringSync();
+    final cls = RegExp(r'class\s+(\w+)\s+extends\s+Stories').firstMatch(main);
+    if (cls == null) {
+      return 'Could not find `class X extends Stories` in story/main.dart; '
+          'write $target by hand: '
+          'void main() => runFlutterStudio(const X());';
+    }
+    file.writeAsStringSync('''
+import 'package:flutter_static/flutter_static.dart';
+
+import 'main.dart';
+
+// Run with: flutter_static studio
+// The catalog with Studio in its window: the same stories mounted live
+// on a canvas, and the design tokens from lib/**/tokens.dart editable.
+void main() => runFlutterStudio(const ${cls.group(1)}());
+''');
+    return 'Created $target.';
+  }
+
+  /// Studio reads and writes the project's source and wants a window
+  /// with room for a canvas: sandbox off, template window enlarged. Both
+  /// are one-time edits to the runner, reported when made.
+  static List<String> _prepareRunner() {
+    final done = <String>[];
+    for (final name in ['DebugProfile', 'Release']) {
+      final file = File('macos/Runner/$name.entitlements');
+      if (!file.existsSync()) continue;
+      final content = file.readAsStringSync();
+      const key = '<key>com.apple.security.app-sandbox</key>';
+      final on = RegExp('$key\\s*<true/>');
+      if (!on.hasMatch(content)) continue;
+      file.writeAsStringSync(content.replaceFirst(on, '$key\n\t<false/>'));
+      done.add(
+        'Turned the app sandbox off in ${file.path} '
+        '(Studio edits the project\'s files).',
+      );
+    }
+    final window = File('macos/Runner/MainFlutterWindow.swift');
+    if (window.existsSync() &&
+        window.readAsStringSync().trim() == _templateWindow.trim()) {
+      window.writeAsStringSync(_studioWindow);
+      done.add('Enlarged the default window in ${window.path}.');
+    }
+    return done;
+  }
+
+  static const _templateWindow = '''
+import Cocoa
+import FlutterMacOS
+
+class MainFlutterWindow: NSWindow {
+  override func awakeFromNib() {
+    let flutterViewController = FlutterViewController()
+    let windowFrame = self.frame
+    self.contentViewController = flutterViewController
+    self.setFrame(windowFrame, display: true)
+
+    RegisterGeneratedPlugins(registry: flutterViewController)
+
+    super.awakeFromNib()
+  }
+}
+''';
+
+  static const _studioWindow = '''
+import Cocoa
+import FlutterMacOS
+
+class MainFlutterWindow: NSWindow {
+  override func awakeFromNib() {
+    let flutterViewController = FlutterViewController()
+    // flutter_static studio: room for a sidebar, a canvas and an
+    // inspector. The template opened at 800x600.
+    var windowFrame = self.frame
+    if let screen = NSScreen.main?.visibleFrame {
+      let width = min(1480, screen.width - 80)
+      let height = min(940, screen.height - 60)
+      windowFrame = NSRect(
+        x: screen.minX + (screen.width - width) / 2,
+        y: screen.minY + (screen.height - height) / 2,
+        width: width,
+        height: height)
+    }
+    self.contentViewController = flutterViewController
+    self.setFrame(windowFrame, display: true)
+
+    RegisterGeneratedPlugins(registry: flutterViewController)
+
+    super.awakeFromNib()
+  }
+}
+''';
 }
 
 /// `flutter_static tokens [list|set]`: the project's design tokens,

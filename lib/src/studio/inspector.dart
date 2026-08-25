@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../phone_mockup.dart';
+import '../server_io.dart';
 import 'controller.dart';
 import 'theme.dart';
 import 'tokens_panel.dart';
@@ -86,6 +87,20 @@ class _StoryInspector extends StatelessWidget {
             Text('Click a render to select it.', style: StudioText.muted)
           else ...[
             SelectableText(story, style: StudioText.mono),
+            const SizedBox(height: 8),
+            StudioChips<bool>(
+              options: const [(true, 'Live'), (false, 'Render')],
+              selected: !controller.renderOnly.contains(story),
+              onSelect: (_) => controller.toggleRenderOnly(story),
+            ),
+            if (storyShellOf(story) == StoryShell.window)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(
+                  'Needs a real window; shown as its render.',
+                  style: StudioText.muted,
+                ),
+              ),
             const SizedBox(height: 10),
             Wrap(
               spacing: 6,
