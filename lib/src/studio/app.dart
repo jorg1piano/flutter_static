@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'agent.dart';
+import 'agent_panel.dart';
 import 'canvas.dart';
 import 'controller.dart';
 import 'inspector.dart';
@@ -9,9 +11,15 @@ import 'theme.dart';
 /// The Studio window: the catalog's window mounts painted underneath
 /// (so they can still be snapshotted), the Studio UI on top.
 class StudioApp extends StatelessWidget {
-  const StudioApp({super.key, required this.controller, required this.mounts});
+  const StudioApp({
+    super.key,
+    required this.controller,
+    required this.agent,
+    required this.mounts,
+  });
 
   final StudioController controller;
+  final AgentSession agent;
   final Widget mounts;
 
   @override
@@ -42,16 +50,19 @@ class StudioApp extends StatelessWidget {
     home: Stack(
       children: [
         Positioned.fill(child: Center(child: mounts)),
-        Positioned.fill(child: StudioShell(controller: controller)),
+        Positioned.fill(
+          child: StudioShell(controller: controller, agent: agent),
+        ),
       ],
     ),
   );
 }
 
 class StudioShell extends StatelessWidget {
-  const StudioShell({super.key, required this.controller});
+  const StudioShell({super.key, required this.controller, required this.agent});
 
   final StudioController controller;
+  final AgentSession agent;
 
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -76,9 +87,18 @@ class StudioShell extends StatelessWidget {
         ),
         const VerticalDivider(width: 1, color: StudioColors.border),
         Container(
-          width: 304,
+          width: 320,
           color: StudioColors.panel,
-          child: Inspector(controller: controller),
+          child: Column(
+            children: [
+              Expanded(child: Inspector(controller: controller)),
+              const Divider(height: 1, color: StudioColors.border),
+              SizedBox(
+                height: 360,
+                child: AgentPanel(agent: agent, controller: controller),
+              ),
+            ],
+          ),
         ),
       ],
     ),

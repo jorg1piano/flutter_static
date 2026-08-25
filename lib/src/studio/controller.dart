@@ -100,6 +100,38 @@ class StudioController extends ChangeNotifier {
     WidgetsBinding.instance.scheduleFrame();
   }
 
+  /// What the agent should know before a turn: where it is, what the
+  /// user is looking at, and how to check its work without touching the
+  /// process it is talking to.
+  String agentContext() {
+    final page = selectedPage;
+    final story = selectedStoryId;
+    final knobArgs = knobs.entries.map((e) => ' -k ${e.key}=${e.value}').join();
+    return [
+      'You are working inside Flutter Static Studio on the Flutter project '
+          'at $project. Its story catalog is this very process, live at '
+          '$url, and it hot reloads every save under lib/, story/ and the '
+          'path packages. Never run `flutter_static up`, `run`, `down` or '
+          '`studio`; the catalog is already running.',
+      'Check your work by rendering: `dart run flutter_static render '
+          '<story id> -o /tmp/<name>.png` (run from the project), then read '
+          'the PNG. `dart run flutter_static list` lists story ids; '
+          '`dart run flutter_static tokens list` lists design tokens '
+          '(static consts in lib/**/tokens/*.dart), and `dart run '
+          'flutter_static tokens set <Group.name> <value>` edits one.',
+      'Prefer changing tokens and components over one-off values: the '
+          'design system lives in the path packages under packages/, the '
+          'stories in story/. Keep answers to a few sentences; the user '
+          'sees the result on the canvas.',
+      if (page != null)
+        'The user is looking at the page "${page.title}" (${page.id}).',
+      if (story != null)
+        'The selected story is `$story`; its render command is '
+            '`dart run flutter_static render $story$knobArgs`. Requests '
+            'that do not name a story are about this one.',
+    ].join('\n');
+  }
+
   StudioPage? get selectedPage {
     for (final p in pages) {
       if (p.id == selectedPageId) return p;

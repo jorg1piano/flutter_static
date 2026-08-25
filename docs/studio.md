@@ -154,6 +154,45 @@ RadiusScale(radii: {'lg': Radii.lg, ...})
 They take the runtime values, so they follow a token edit through hot
 reload like any component. `SpecimenStyle.dark` for dark sheets.
 
+## The agent
+
+The chat under the inspector drives a coding agent rather than being
+one. Each prompt starts the agent CLI as a child process in the project
+and streams what it says and does into the panel; the canvas shows the
+result because every save hot reloads the process. Nothing is sent
+anywhere by Studio itself.
+
+The default is Claude Code headless:
+
+```text
+claude -p <prompt> --output-format stream-json --verbose
+  --permission-mode acceptEdits --allowedTools <edit, read, render, analyze>
+  --append-system-prompt <context> [--resume <session>]
+```
+
+The system prompt tells it where it is (the project, the live catalog
+port), what not to do (`up`, `run`, `down`, `studio`: this process is
+the catalog), how to check its work (`dart run flutter_static render`,
+then read the PNG), where tokens live and how to edit them, which page
+is open and which story is selected. Requests that name no story are
+about the selected one. The session id from the first turn resumes the
+conversation on the next; "New conversation" starts over.
+
+Allowed without prompting: file edits under the project, reads, and
+`dart run flutter_static render|list|tokens|add`, `flutter analyze`,
+`dart format`. Anything else the agent asks for is denied, and the
+denial shows in the panel.
+
+Another agent: `FLUTTER_STATIC_AGENT="codex exec {prompt}"` in the
+environment Studio is launched from runs that instead, its output shown
+as plain text. `{system}` and `{resume}` are the other placeholders.
+The `claude` executable (or whatever is named) must be on the PATH of
+that terminal.
+
+Measured on the playground: "change the headline to X and render it to
+confirm" took 34 s and 11 turns (grep, read, edit, render, read the
+PNG) and the canvas had the new copy before the answer arrived.
+
 ## Storyline rows in the index
 
 `/index.json` `lines[].rows[]` now lists each row's title, its cells
@@ -173,8 +212,8 @@ step, the buttons, badges and screens follow within half a second.
 
 ## Not yet
 
-- No prompt box. The agent loop is `flutter_static render` / `tokens`
-  from a terminal or MCP; Studio is the human's view of the same files.
+- The agent runs one turn at a time and cannot be interrupted mid-tool;
+  Stop kills the process.
 - One project per Studio process.
 - A story whose live layout fails (an `Expanded` under unbounded
   height, say) shows Flutter's error box in its slot; the render

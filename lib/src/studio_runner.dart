@@ -17,6 +17,7 @@ import 'dart:io';
 
 import 'server_io.dart';
 import 'story.dart';
+import 'studio/agent.dart';
 import 'studio/app.dart';
 import 'studio/controller.dart';
 
@@ -27,10 +28,14 @@ void runFlutterStudio(Stories stories, {int? port}) {
     project: projectRoot() ?? Directory.current.path,
     port: resolvedPort,
   );
+  final agent = AgentSession(
+    project: controller.project,
+    context: controller.agentContext,
+  );
   runFlutterStatic(
     stories,
     port: resolvedPort,
     shell: (context, mounts) =>
-        StudioApp(controller: controller, mounts: mounts),
+        StudioApp(controller: controller, agent: agent, mounts: mounts),
   );
 }

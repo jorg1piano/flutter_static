@@ -32,6 +32,9 @@ In flutter_static:
   `storiesIndex`, `findStory`, `storyOnPage`, `storyEnvironment`,
   `renderStoryPng`, `storyShellOf`, `catalogVersion`,
   `catalogReloadTick`, `projectRoot`, and `runFlutterStatic(shell:)`.
+- `lib/src/studio/agent.dart` + `agent_panel.dart`: the chat, a
+  child-process runner for Claude Code headless (or any CLI via
+  `FLUTTER_STATIC_AGENT`), with the Studio context as system prompt.
 - `lib/studio_main.dart`: dogfood entry for this package's demo story.
 - `macos/Runner/*.entitlements`: sandbox off; `MainFlutterWindow.swift`
   opens larger. The `studio` command makes the same two edits in a
@@ -63,6 +66,11 @@ In the playground:
   the canvas. A `tokens set` from a terminal hot reloads the process and
   the live widgets follow; the colour picker does the same from inside.
 
+- The agent: with the welcome story selected, "change the headline to
+  X and render it to confirm" edited `welcome_screen.dart`, rendered,
+  read the PNG and reported in 34 s; the live canvas showed the new copy
+  before the answer.
+
 ## History
 
 The first Studio (commits `0e70da4`..`a72c732`) was a separate host app
@@ -79,6 +87,6 @@ streaming or pointer forwarding when they are in the same tree.
 2. Token references in components ("this button uses `Radii.md`") for
    a Figma-like "where is this used" panel. A grep over `lib/` for
    `Group.name` is enough for a first version.
-3. A prompt box that writes the request plus the selected story id and
-   render command to a file or MCP call for an agent to pick up.
+3. Show the agent's renders inline in the chat (it reads PNGs it made;
+   the panel could show them too), and the diff of each Edit.
 4. Multi-select and side-by-side device comparison on the canvas.
