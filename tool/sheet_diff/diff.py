@@ -5,11 +5,13 @@ difference (0-255), the worst 16 logical px band, and a composite PNG
 (reference | render | x4 heatmap) in --out.
 
 Usage:
-  python3 diff.py --ref DIR --out DIR [--port 8474] [--renders DIR]
+  python3 diff.py --ref DIR --out DIR [--port N] [--renders DIR]
                   (--pairs FILE | --pair STORY=REF.png ...) [STORY ...]
 
 --pairs FILE   JSON object {story id: reference path relative to --ref}
 --pair ID=REF  one pair on the command line (repeatable)
+--port N       catalog port (default: this directory's entry in
+               ~/.flutter_static/ports.jsonl, else 8474)
 --renders DIR  read DIR/<story>.png instead of fetching from the catalog
                (story ids with slashes become files in subdirectories)
 STORY ...      only compare these ids
@@ -28,11 +30,29 @@ from PIL import Image, ImageChops
 BAND_PX = 32  # 16 logical px at 2x
 
 
+def registered_port():
+    """Port `flutter_static run` registered for the cwd, else 8474."""
+    path = os.path.expanduser('~/.flutter_static/ports.jsonl')
+    cwd = os.path.realpath(os.getcwd())
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get('pwd') == cwd:
+                    return int(entry['port'])
+    except OSError:
+        pass
+    return 8474
+
+
 def parse():
     p = argparse.ArgumentParser()
     p.add_argument('--ref', required=True)
     p.add_argument('--out', required=True)
-    p.add_argument('--port', type=int, default=8474)
+    p.add_argument('--port', type=int, default=registered_port())
     p.add_argument('--renders')
     p.add_argument('--pairs')
     p.add_argument('--pair', action='append', default=[])

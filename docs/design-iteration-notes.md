@@ -131,7 +131,11 @@ pixel diff ~3-4/255, which is the rasterizer floor (see below). Widgets live in
     The new runner's server dies on bind ("Address already in use" scrolls
     by in the log) while its app and hot reload run fine - so renders hit
     the zombie serving old code and edits "don't apply". Kill port holders
-    (`lsof -ti tcp:8474 | xargs kill`) before `flutter_static run`.
+    (`lsof -ti tcp:$(flutter_static port) | xargs kill`) before
+    `flutter_static run`. Since 2026-08-25 each project has its own port
+    from `~/.flutter_static/ports.jsonl` (see `flutter_static port --all`),
+    so a zombie is always this project's; other checkouts' catalogs never
+    take the port.
 24. **The runner can silently lose its app** ("Lost connection to device"
     mid-session); the server keeps answering but subsequent edits stop
     landing. If a render stops reflecting saves, check the run log tail and

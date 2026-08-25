@@ -7,7 +7,10 @@ import 'package:args/command_runner.dart';
 import 'package:path/path.dart' as p;
 import 'package:watcher/watcher.dart';
 
-const _defaultUrl = 'http://localhost:8474';
+/// Catalog URL for the current directory: the port registered for it in
+/// ~/.flutter_static/ports.jsonl, else the base port.
+String _defaultUrl() =>
+    'http://localhost:${_PortRegistry.lookup() ?? _PortRegistry.basePort}';
 
 Future<void> main(List<String> arguments) async {
   final runner =
@@ -20,7 +23,8 @@ Future<void> main(List<String> arguments) async {
         ..addCommand(_BuildWebCommand())
         ..addCommand(_SetupCommand())
         ..addCommand(_ListCommand())
-        ..addCommand(_RenderCommand());
+        ..addCommand(_RenderCommand())
+        ..addCommand(_PortCommand());
   try {
     exitCode = await runner.run(arguments) ?? 0;
   } on UsageException catch (e) {
@@ -39,7 +43,13 @@ class _RunCommand extends Command<int> {
         help: 'Entry point that calls runFlutterStatic().',
       )
       ..addOption('device', abbr: 'd', defaultsTo: 'macos')
-      ..addOption('port', defaultsTo: '8474', help: 'Catalog server port.');
+      ..addOption(
+        'port',
+        help:
+            'Catalog server port. Default: the port registered for this '
+            'directory in ~/.flutter_static/ports.jsonl, allocating the next '
+            'free one on first use.',
+      );
   }
 
   @override
@@ -64,7 +74,18 @@ class _RunCommand extends Command<int> {
       );
       return 1;
     }
-    final port = argResults!['port'] as String;
+    final requested = argResults!['port'] as String?;
+    final port = await _PortRegistry.claim(
+      requested: requested == null ? null : int.tryParse(requested),
+    );
+    if (port == null) {
+      stderr.writeln('Invalid port: $requested');
+      return 64;
+    }
+    stdout.writeln(
+      'flutter_static: catalog port $port '
+      '(registered in ${_PortRegistry.file.path})',
+    );
     final pidFile = File('.dart_tool/flutter_static.pid');
     pidFile.parent.createSync(recursive: true);
     final child = await Process.start('flutter', [
@@ -466,7 +487,7 @@ class _ListCommand extends Command<int> {
   _ListCommand() {
     argParser
       ..addFlag('json', negatable: false, help: 'Print the raw index JSON.')
-      ..addOption('url', defaultsTo: _defaultUrl);
+      ..addOption('url', help: _urlHelp);
   }
 
   @override
@@ -476,7 +497,7 @@ class _ListCommand extends Command<int> {
 
   @override
   Future<int> run() async {
-    final url = argResults!['url'] as String;
+    final url = (argResults!['url'] as String?) ?? _defaultUrl();
     final body = await _fetch('$url/index.json', url);
     if (body == null) return 1;
     if (argResults!['json'] as bool) {
@@ -500,7 +521,7 @@ class _RenderCommand extends Command<int> {
         abbr: 'o',
         help: 'Output file (default: <id>.png with / as _).',
       )
-      ..addOption('url', defaultsTo: _defaultUrl);
+      ..addOption('url', help: _urlHelp);
   }
 
   @override
@@ -515,7 +536,7 @@ class _RenderCommand extends Command<int> {
     final rest = argResults!.rest;
     if (rest.isEmpty) usageException('A story id is required.');
     final id = rest.first;
-    final url = argResults!['url'] as String;
+    final url = (argResults!['url'] as String?) ?? _defaultUrl();
     final bytes = await _fetch(
       '$url/story/$id.png',
       url,
@@ -527,6 +548,153 @@ class _RenderCommand extends Command<int> {
     File(out).writeAsBytesSync(bytes);
     stdout.writeln(out);
     return 0;
+  }
+}
+
+const _urlHelp =
+    'Catalog URL. Default: localhost on the port registered for this '
+    'directory in ~/.flutter_static/ports.jsonl (else 8474).';
+
+class _PortCommand extends Command<int> {
+  _PortCommand() {
+    argParser.addFlag(
+      'all',
+      negatable: false,
+      help: 'Print every registered project and its port.',
+    );
+  }
+
+  @override
+  String get name => 'port';
+  @override
+  String get description =>
+      'Print the catalog port for this directory (allocating one if needed).';
+
+  @override
+  Future<int> run() async {
+    if (argResults!['all'] as bool) {
+      for (final entry in _PortRegistry.read().entries) {
+        stdout.writeln('${entry.value}\t${entry.key}');
+      }
+      return 0;
+    }
+    stdout.writeln(await _PortRegistry.claim());
+    return 0;
+  }
+}
+
+/// Global port registry: ~/.flutter_static/ports.jsonl holds one
+/// `{"pwd": "/abs/project", "port": 8474}` line per project, so catalogs of
+/// different projects never fight over a port and `list`/`render` find the
+/// right one without --url. A project keeps its port across sessions.
+class _PortRegistry {
+  static const basePort = 8474;
+
+  static File get file {
+    final home =
+        Platform.environment['HOME'] ??
+        Platform.environment['USERPROFILE'] ??
+        Directory.current.path;
+    return File(p.join(home, '.flutter_static', 'ports.jsonl'));
+  }
+
+  /// Canonical current directory: symlinked checkouts map to one entry.
+  static String get _cwd {
+    try {
+      return Directory.current.resolveSymbolicLinksSync();
+    } on FileSystemException {
+      return Directory.current.path;
+    }
+  }
+
+  /// pwd -> port in file order. Malformed lines are skipped, not fatal.
+  static Map<String, int> read() {
+    final f = file;
+    if (!f.existsSync()) return {};
+    final entries = <String, int>{};
+    for (final line in f.readAsLinesSync()) {
+      if (line.trim().isEmpty) continue;
+      try {
+        final json = jsonDecode(line);
+        if (json is! Map) continue;
+        final pwd = json['pwd'];
+        final port = json['port'];
+        if (pwd is String && port is int) entries[pwd] = port;
+      } on FormatException {
+        continue;
+      }
+    }
+    return entries;
+  }
+
+  static void _write(Map<String, int> entries) {
+    final f = file;
+    f.parent.createSync(recursive: true);
+    final out = StringBuffer();
+    for (final entry in entries.entries) {
+      out.writeln(jsonEncode({'pwd': entry.key, 'port': entry.value}));
+    }
+    f.writeAsStringSync(out.toString());
+  }
+
+  /// Port registered for the current directory, or null.
+  static int? lookup() => read()[_cwd];
+
+  /// Port for the current directory. Reuses the registered one; otherwise
+  /// (or when [requested] is given) records the port and returns it. A new
+  /// allocation is the lowest port from [basePort] that no other project
+  /// holds and that binds right now. Returns null for an invalid request.
+  static Future<int?> claim({int? requested}) async {
+    if (requested != null && (requested < 1 || requested > 65535)) return null;
+    final entries = read();
+    final dir = _cwd;
+    // Projects that were deleted or moved free their ports.
+    final before = entries.length;
+    entries.removeWhere((pwd, _) => pwd != dir && !Directory(pwd).existsSync());
+    var dirty = entries.length != before;
+    final int port;
+    final registered = entries[dir];
+    if (requested != null) {
+      port = requested;
+    } else if (registered != null) {
+      port = registered;
+    } else {
+      final taken = entries.values.toSet();
+      var candidate = basePort;
+      while (taken.contains(candidate) || !await _bindable(candidate)) {
+        candidate++;
+      }
+      port = candidate;
+    }
+    if (requested != null) {
+      final holders = entries.entries
+          .where((e) => e.value == requested && e.key != dir)
+          .map((e) => e.key);
+      for (final holder in holders) {
+        stderr.writeln(
+          'flutter_static: port $requested is also registered to $holder',
+        );
+      }
+    }
+    if (entries[dir] != port) {
+      entries[dir] = port;
+      dirty = true;
+    }
+    if (dirty || !file.existsSync()) _write(entries);
+    return port;
+  }
+
+  static Future<bool> _bindable(int port) async {
+    try {
+      final socket = await ServerSocket.bind(
+        InternetAddress.loopbackIPv4,
+        port,
+      );
+      await socket.close();
+      return true;
+    } on SocketException {
+      return false;
+    }
   }
 }
 
