@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:isolate';
 
 import 'package:args/command_runner.dart';
+import 'package:flutter_static/src/tokens.dart';
 import 'package:path/path.dart' as p;
 import 'package:watcher/watcher.dart';
 
@@ -21,12 +22,14 @@ Future<void> main(List<String> arguments) async {
         ..addCommand(_UpCommand())
         ..addCommand(_DownCommand())
         ..addCommand(_RunCommand())
+        ..addCommand(_StudioCommand())
         ..addCommand(_InitCommand())
         ..addCommand(_BuildWebCommand())
         ..addCommand(_SetupCommand())
         ..addCommand(_ListCommand())
         ..addCommand(_RenderCommand())
         ..addCommand(_PortCommand())
+        ..addCommand(_TokensCommand())
         ..addCommand(_AddCommand());
   try {
     exitCode = await runner.run(arguments) ?? 0;
@@ -1086,21 +1089,218 @@ class _SetupCommand extends Command<int> {
     stdout.writeln('Start the catalog with: flutter_static run');
     return 0;
   }
+}
 
-  /// Where the flutter_static package lives: baked in at compile time for
-  /// the global binary (-DFLUTTER_STATIC_ROOT=...), resolved from the
-  /// package config when running via `dart run flutter_static`.
-  Future<String?> _packageRoot() async {
-    const compiled = String.fromEnvironment('FLUTTER_STATIC_ROOT');
-    if (compiled.isNotEmpty && Directory(compiled).existsSync()) {
-      return compiled;
+/// Where the flutter_static package lives: baked in at compile time for
+/// the global binary (-DFLUTTER_STATIC_ROOT=...), resolved from the
+/// package config when running via `dart run flutter_static`.
+Future<String?> _packageRoot() async {
+  const compiled = String.fromEnvironment('FLUTTER_STATIC_ROOT');
+  if (compiled.isNotEmpty && Directory(compiled).existsSync()) {
+    return compiled;
+  }
+  final uri = await Isolate.resolvePackageUri(
+    Uri.parse('package:flutter_static/'),
+  );
+  if (uri == null) return null;
+  final lib = Directory.fromUri(uri);
+  return lib.existsSync() ? lib.parent.path : null;
+}
+
+/// `flutter_static studio --project <dir>`: the macOS Studio host, a
+/// Flutter app from this package that runs the project's catalog as a
+/// child process and shows its pages, stories and tokens. The project's
+/// code is never compiled into Studio; it runs in the child.
+class _StudioCommand extends Command<int> {
+  _StudioCommand() {
+    argParser
+      ..addOption(
+        'project',
+        abbr: 'p',
+        defaultsTo: '.',
+        help: 'The Flutter project whose stories Studio shows.',
+      )
+      ..addOption(
+        'port',
+        help:
+            'Catalog port for the project (default: its registered port, '
+            'see `flutter_static port`).',
+      )
+      ..addFlag(
+        'release',
+        negatable: false,
+        help: 'Build Studio in release mode (no hot reload of Studio itself).',
+      );
+  }
+
+  @override
+  String get name => 'studio';
+  @override
+  String get description =>
+      'Open the macOS Studio: pages, stories and design tokens of a '
+      'project, live.';
+
+  @override
+  Future<int> run() async {
+    final project = p.canonicalize(argResults!['project'] as String);
+    if (!File(p.join(project, 'pubspec.yaml')).existsSync()) {
+      stderr.writeln('No pubspec.yaml at $project');
+      return 1;
     }
-    final uri = await Isolate.resolvePackageUri(
-      Uri.parse('package:flutter_static/'),
+    final portArg = argResults!['port'] as String?;
+    final int? port;
+    if (portArg == null) {
+      // The registry keys by cwd; claim the project's port from inside it.
+      final previous = Directory.current;
+      Directory.current = project;
+      port = await _PortRegistry.claim();
+      Directory.current = previous;
+    } else {
+      port = int.tryParse(portArg);
+    }
+    if (port == null || port < 1 || port > 65535) {
+      stderr.writeln('Invalid port: $portArg');
+      return 64;
+    }
+    final root = await _packageRoot();
+    if (root == null) {
+      stderr.writeln('Could not locate the flutter_static package root.');
+      return 1;
+    }
+    stdout.writeln('Studio for $project (catalog on :$port)');
+    final process = await Process.start(
+      'flutter',
+      [
+        'run',
+        '-d',
+        'macos',
+        if (argResults!['release'] as bool) '--release',
+        '-t',
+        'lib/studio_main.dart',
+        '--dart-define=FLUTTER_STATIC_ROOT=$root',
+        '--dart-define=FLUTTER_STATIC_STUDIO_PROJECT=$project',
+        '--dart-define=FLUTTER_STATIC_STUDIO_PORT=$port',
+      ],
+      workingDirectory: root,
+      mode: ProcessStartMode.inheritStdio,
     );
-    if (uri == null) return null;
-    final lib = Directory.fromUri(uri);
-    return lib.existsSync() ? lib.parent.path : null;
+    return process.exitCode;
+  }
+}
+
+/// `flutter_static tokens [list|set]`: the project's design tokens,
+/// straight from source. No catalog needed.
+class _TokensCommand extends Command<int> {
+  _TokensCommand() {
+    addSubcommand(_TokensListCommand());
+    addSubcommand(_TokensSetCommand());
+  }
+
+  @override
+  String get name => 'tokens';
+  @override
+  String get description =>
+      'List or edit design tokens (static consts in tokens.dart files).';
+}
+
+class _TokensListCommand extends Command<int> {
+  _TokensListCommand() {
+    argParser.addFlag('json', negatable: false, help: 'Print the full JSON.');
+  }
+
+  @override
+  String get name => 'list';
+  @override
+  String get description =>
+      'List tokens under lib/ of this project and its path dependencies.';
+
+  @override
+  Future<int> run() async {
+    final set = TokenSet.load(Directory.current.path);
+    if (argResults!['json'] as bool) {
+      stdout.writeln(tokensJson(set));
+      return 0;
+    }
+    if (set.files.isEmpty) {
+      stdout.writeln(
+        'No token files. Convention: lib/**/tokens.dart or lib/**/tokens/*.dart '
+        'with `static const` members, in the project or a path dependency.',
+      );
+      return 0;
+    }
+    for (final file in set.files) {
+      stdout.writeln(p.relative(file.path));
+      for (final group in file.groups) {
+        stdout.writeln('  $group.name');
+        for (final t in group.tokens) {
+          final value = switch (t.kind) {
+            TokenKind.color => colorHex(t.argb!),
+            TokenKind.text =>
+              t.args.map((a) => '${a.name}: ${a.value}').join(', '),
+            _ => t.source,
+          };
+          stdout.writeln('    ${t.id}  ${t.kind.name}  $value');
+        }
+      }
+    }
+    return 0;
+  }
+}
+
+class _TokensSetCommand extends Command<int> {
+  _TokensSetCommand() {
+    argParser.addOption(
+      'arg',
+      help: 'For a TextStyle token: the argument to set (fontSize, ...).',
+    );
+  }
+
+  @override
+  String get name => 'set';
+  @override
+  String get description =>
+      'Set a token: `tokens set AppColors.primary "#4F46E5"`, '
+      '`tokens set Space.md 16`, `tokens set AppText.title --arg fontSize 28`.';
+  @override
+  String get invocation => 'flutter_static tokens set <Group.name> <value>';
+
+  @override
+  Future<int> run() async {
+    final rest = argResults!.rest;
+    if (rest.length != 2) usageException('Expected <Group.name> <value>.');
+    final [id, raw] = rest;
+    final set = TokenSet.load(Directory.current.path);
+    final token = set.find(id);
+    if (token == null) {
+      stderr.writeln('No token $id. `flutter_static tokens list` shows them.');
+      return 1;
+    }
+    final arg = argResults!['arg'] as String?;
+    final DesignToken written;
+    if (arg != null) {
+      written = writeTokenArg(token, arg, raw);
+    } else {
+      final expression = switch (token.kind) {
+        TokenKind.color => colorSource(
+          parseColorHex(raw) ??
+              (throw UsageException('Not a colour: $raw', usage)),
+        ),
+        TokenKind.number ||
+        TokenKind.radius ||
+        TokenKind.duration => numberSourceFor(
+          token,
+          double.tryParse(raw) ??
+              (throw UsageException('Not a number: $raw', usage)),
+        ),
+        _ => raw,
+      };
+      written = writeToken(token, expression);
+    }
+    stdout.writeln(
+      '${written.id} = ${written.source} '
+      '(${p.relative(written.file)}:${written.line})',
+    );
+    return 0;
   }
 }
 
@@ -1686,8 +1886,9 @@ class _AddStoryCommand extends Command<int> {
           usageException('--bg takes six hex digits, like 0A0B0D.');
         }
         final w = width ?? '390';
-        if (double.tryParse(w) == null)
+        if (double.tryParse(w) == null) {
           usageException('--width must be a number.');
+        }
         head =
             '/// The design\'s background and outer width, so renders line up\n'
             '/// with the reference. Every story in this group renders in it.\n'
