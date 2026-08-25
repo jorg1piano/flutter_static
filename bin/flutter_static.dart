@@ -24,7 +24,8 @@ Future<void> main(List<String> arguments) async {
         ..addCommand(_SetupCommand())
         ..addCommand(_ListCommand())
         ..addCommand(_RenderCommand())
-        ..addCommand(_PortCommand());
+        ..addCommand(_PortCommand())
+        ..addCommand(_AddCommand());
   try {
     exitCode = await runner.run(arguments) ?? 0;
   } on UsageException catch (e) {
@@ -202,9 +203,10 @@ class _InitCommand extends Command<int> {
       stderr.writeln('${file.path} already exists (use --force to overwrite).');
       return 1;
     }
-    file.parent.createSync(recursive: true);
-    file.writeAsStringSync(_storyTemplate);
-    stdout.writeln('Created ${file.path}. Start the catalog with:');
+    for (final created in _scaffoldStories(force: true)) {
+      stdout.writeln('Created $created.');
+    }
+    stdout.writeln('Start the catalog with:');
     stdout.writeln('  flutter_static run');
     return 0;
   }
@@ -244,13 +246,13 @@ class _SetupCommand extends Command<int> {
       );
       return 1;
     }
-    final file = File('story/main.dart');
-    if (file.existsSync()) {
-      stdout.writeln('${file.path} already exists; keeping it.');
+    final created = _scaffoldStories();
+    if (created.isEmpty) {
+      stdout.writeln('story/main.dart already exists; keeping it.');
     } else {
-      file.parent.createSync(recursive: true);
-      file.writeAsStringSync(_storyTemplate);
-      stdout.writeln('Created ${file.path}.');
+      for (final path in created) {
+        stdout.writeln('Created $path.');
+      }
     }
 
     final content = pubspec.readAsStringSync();
@@ -728,32 +730,550 @@ Future<List<int>?> _fetch(
   }
 }
 
-const _storyTemplate = '''
-import 'package:flutter/material.dart';
+/// Writes story/main.dart and story/stories/example.dart, skipping files
+/// that exist unless [force]. Returns the paths written.
+List<String> _scaffoldStories({bool force = false}) {
+  final written = <String>[];
+  for (final (path, content) in [
+    ('story/main.dart', _mainTemplate),
+    ('story/stories/example.dart', _exampleTemplate),
+  ]) {
+    final file = File(path);
+    if (file.existsSync() && !force) continue;
+    file.parent.createSync(recursive: true);
+    file.writeAsStringSync(content);
+    written.add(path);
+  }
+  return written;
+}
+
+const _mainTemplate = '''
 import 'package:flutter_static/flutter_static.dart';
+
+import 'stories/example.dart' as example;
 
 // Run with: flutter_static run
 void main() => runFlutterStatic(const MyStories());
 
-// Stories must live in a class method (not a stored closure) so hot reload
-// picks up edits: main() never re-runs, but method dispatch always reaches
-// the newest code.
+// One file per story group under stories/ and one per flow under lines/,
+// each exposing a top-level function that build() calls fresh on every
+// hot reload. Never store stories in a variable: main() never re-runs,
+// so a closure created by the old main() keeps its old code.
+//
+// Scaffold more with:
+//   flutter_static add story <group>/<name>
+//   flutter_static add storyline <name>
 class MyStories extends Stories {
   const MyStories();
 
   @override
+  List<Storyline> storylines() => [];
+
+  @override
   List<Story> build() => [
-        Story(
-          'example/hello',
-          () => Container(
-            padding: const EdgeInsets.all(24),
-            color: Colors.indigo,
-            child: const Text(
-              'Hello, flutter_static',
-              style: TextStyle(color: Colors.white, fontSize: 24),
-            ),
-          ),
-        ),
-      ];
+    ...example.stories(),
+  ];
 }
 ''';
+
+const _exampleTemplate = '''
+import 'package:flutter/material.dart';
+import 'package:flutter_static/flutter_static.dart';
+
+List<Story> stories() => [
+  Story(
+    'example/hello',
+    () => Container(
+      padding: const EdgeInsets.all(24),
+      color: Colors.indigo,
+      child: const Text(
+        'Hello, flutter_static',
+        style: TextStyle(color: Colors.white, fontSize: 24),
+      ),
+    ),
+  ),
+];
+''';
+
+class _AddCommand extends Command<int> {
+  _AddCommand() {
+    addSubcommand(_AddStoryCommand());
+    addSubcommand(_AddStorylineCommand());
+  }
+
+  @override
+  String get name => 'add';
+  @override
+  String get description =>
+      'Scaffold a story or a storyline and register it in story/main.dart.';
+}
+
+/// `add story <group>/<name>`: a placeholder story in `stories/<group>.dart`
+/// (created on first use), registered in main.dart.
+class _AddStoryCommand extends Command<int> {
+  _AddStoryCommand() {
+    argParser
+      ..addOption(
+        'width',
+        help:
+            "The design's outer width, for a new group's shell "
+            '(default: 390). Ignored when the group file exists.',
+      )
+      ..addOption(
+        'bg',
+        help:
+            "The design's background as hex, for a new group's shell "
+            '(default: FFFFFF). Ignored when the group file exists.',
+      )
+      ..addOption('url', help: _urlHelp);
+  }
+
+  @override
+  String get name => 'story';
+  @override
+  String get description =>
+      'Add a placeholder story. The group becomes stories/<group>.dart; '
+      'the first story in a group also gets the shell (background, width) '
+      'every story in it renders in.';
+  @override
+  String get invocation =>
+      'flutter_static add story <group>/<name> [--width 390] [--bg 0A0B0D]';
+
+  @override
+  Future<int> run() async {
+    final rest = argResults!.rest;
+    if (rest.isEmpty) usageException('A story id is required.');
+    final id = rest.first;
+    if (!RegExp(r'^[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)+$').hasMatch(id)) {
+      usageException(
+        'Story ids are lowercase slugs with at least two segments, '
+        'like torget/listing-card.',
+      );
+    }
+    if (!_StoryDir.check()) return 1;
+
+    final segments = id.split('/');
+    final group = segments.sublist(0, segments.length - 1);
+    final relPath = '${group.map(_StoryDir.ident).join('/')}.dart';
+    final file = File('story/stories/$relPath');
+    final alias = group.map(_StoryDir.ident).join('_');
+
+    final String frameCall;
+    if (file.existsSync()) {
+      final existing = file.readAsStringSync();
+      if (RegExp("'${RegExp.escape(id)}'").hasMatch(existing)) {
+        stderr.writeln('$id already exists in ${file.path}.');
+        return 1;
+      }
+      frameCall = _StoryDir.frameIn(existing);
+      final lines = existing.split('\n');
+      final ok = _StoryDir.insertInList(
+        lines,
+        RegExp(r'List<Story> stories\(\)\s*=>'),
+        "Story('$id', () => ${frameCall}const Placeholder())),",
+      );
+      if (!ok) {
+        stderr.writeln(
+          'Could not find `List<Story> stories() => [` in ${file.path}; '
+          'add the story by hand.',
+        );
+        return 1;
+      }
+      file.writeAsStringSync(lines.join('\n'));
+      stdout.writeln('Added $id to ${file.path}');
+    } else {
+      final width = argResults!['width'] as String?;
+      final bg = argResults!['bg'] as String?;
+      final support = File('story/stories/support.dart');
+      final useSupport =
+          width == null &&
+          bg == null &&
+          support.existsSync() &&
+          support.readAsStringSync().contains('Widget storyFrame(');
+      final String head;
+      if (useSupport) {
+        // The project already has a frame every story uses; join it.
+        final rel = p.posix.relative(
+          'stories/support.dart',
+          from: p.posix.dirname('stories/$relPath'),
+        );
+        head = "import '$rel';\n";
+        frameCall = 'storyFrame(';
+      } else {
+        final hex = (bg ?? 'FFFFFF').replaceFirst('#', '').toUpperCase();
+        if (!RegExp(r'^[0-9A-F]{6}$').hasMatch(hex)) {
+          usageException('--bg takes six hex digits, like 0A0B0D.');
+        }
+        final w = width ?? '390';
+        if (double.tryParse(w) == null)
+          usageException('--width must be a number.');
+        head =
+            '/// The design\'s background and outer width, so renders line up\n'
+            '/// with the reference. Every story in this group renders in it.\n'
+            'Widget _shell(Widget child) => ColoredBox(\n'
+            '  color: const Color(0xFF$hex),\n'
+            '  child: SizedBox(width: $w, child: child),\n'
+            ');\n';
+        frameCall = '_shell(';
+      }
+      file.parent.createSync(recursive: true);
+      file.writeAsStringSync(
+        "import 'package:flutter/material.dart';\n"
+        "import 'package:flutter_static/flutter_static.dart';\n"
+        '\n'
+        '$head'
+        '\n'
+        'List<Story> stories() => [\n'
+        "  Story('$id', () => ${frameCall}const Placeholder())),\n"
+        '];\n',
+      );
+      stdout.writeln('Created ${file.path}');
+      final registered = _StoryDir.registerGroup(relPath, alias);
+      if (!registered) return 1;
+    }
+    stdout.writeln('  $id');
+    await _StoryDir.reportListed([
+      id,
+    ], (argResults!['url'] as String?) ?? _defaultUrl());
+    return 0;
+  }
+}
+
+/// `add storyline <name>`: `lines/<name>.dart` with one row of placeholder
+/// cells, registered in main.dart.
+class _AddStorylineCommand extends Command<int> {
+  _AddStorylineCommand() {
+    argParser
+      ..addOption('title', help: 'Page title (default: from the name).')
+      ..addOption(
+        'cells',
+        help:
+            'Comma-separated cell ids for the first row, one screen each '
+            '(default: one cell, "home").',
+      )
+      ..addOption('url', help: _urlHelp);
+  }
+
+  @override
+  String get name => 'storyline';
+  @override
+  String get description =>
+      'Add a flow: lines/<name>.dart with a row of placeholder screens. '
+      'The id is flows/<name> unless you give both segments.';
+  @override
+  String get invocation =>
+      'flutter_static add storyline <name> [--title T] [--cells a,b,c]';
+
+  @override
+  Future<int> run() async {
+    final rest = argResults!.rest;
+    if (rest.isEmpty) usageException('A storyline name is required.');
+    final arg = rest.first;
+    if (!RegExp(
+      r'^[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)?$',
+    ).hasMatch(arg)) {
+      usageException(
+        'Storyline names are lowercase slugs: house-os or flows/house-os.',
+      );
+    }
+    if (!_StoryDir.check()) return 1;
+
+    final id = arg.contains('/') ? arg : 'flows/$arg';
+    final name = id.split('/').last;
+    final fileName = _StoryDir.ident(name);
+    final file = File('story/lines/$fileName.dart');
+    if (file.existsSync()) {
+      stderr.writeln('${file.path} already exists.');
+      return 1;
+    }
+    final title = (argResults!['title'] as String?) ?? _StoryDir.title(name);
+    final cells = ((argResults!['cells'] as String?) ?? 'home')
+        .split(',')
+        .map((c) => c.trim())
+        .where((c) => c.isNotEmpty)
+        .toSet()
+        .toList();
+    for (final cell in cells) {
+      if (!RegExp(r'^[a-z0-9][a-z0-9_-]*$').hasMatch(cell)) {
+        usageException('Cell ids are lowercase slugs; got "$cell".');
+      }
+    }
+
+    final buf = StringBuffer()
+      ..writeln("import 'package:flutter/material.dart';")
+      ..writeln("import 'package:flutter_static/flutter_static.dart';")
+      ..writeln()
+      ..writeln('/// $title.')
+      ..writeln('Storyline storyline() => const Storyline(')
+      ..writeln("  '$id',")
+      ..writeln("  title: '${title.replaceAll("'", r"\'")}',")
+      ..writeln('  rows: [')
+      ..writeln('    StorylineRow(')
+      ..writeln("      'Screens',")
+      ..writeln('      cells: [');
+    for (final cell in cells) {
+      buf
+        ..writeln('        Cell(')
+        ..writeln("          '$cell',")
+        ..writeln("          title: '${_StoryDir.title(cell)}',")
+        ..writeln(
+          "          variants: [Story('default', _${_StoryDir.camel(cell)})],",
+        )
+        ..writeln('        ),');
+    }
+    buf
+      ..writeln('      ],')
+      ..writeln('    ),')
+      ..writeln('  ],')
+      ..writeln(');');
+    for (final cell in cells) {
+      buf
+        ..writeln()
+        ..writeln('Widget _${_StoryDir.camel(cell)}() => const Placeholder();');
+    }
+    file.parent.createSync(recursive: true);
+    file.writeAsStringSync(buf.toString());
+    stdout.writeln('Created ${file.path}');
+
+    if (!_StoryDir.registerLine(fileName)) return 1;
+    final ids = [for (final cell in cells) '$id/$cell/default'];
+    for (final storyId in ids) {
+      stdout.writeln('  $storyId');
+    }
+    await _StoryDir.reportListed(
+      ids,
+      (argResults!['url'] as String?) ?? _defaultUrl(),
+    );
+    return 0;
+  }
+}
+
+/// The consumer's story/ folder and the edits `add` makes to main.dart.
+class _StoryDir {
+  static final main = File('story/main.dart');
+
+  static bool check() {
+    if (main.existsSync()) return true;
+    stderr.writeln(
+      'No story/main.dart here. Scaffold one with: flutter_static setup',
+    );
+    return false;
+  }
+
+  /// `house-os` -> `house_os`.
+  static String ident(String segment) => segment.replaceAll('-', '_');
+
+  /// `house-os` -> `houseOs`.
+  static String camel(String s) {
+    final parts = s.split(RegExp(r'[-_]')).where((x) => x.isNotEmpty).toList();
+    return parts.first +
+        parts.skip(1).map((x) => x[0].toUpperCase() + x.substring(1)).join();
+  }
+
+  /// `house-os` -> `House os`.
+  static String title(String s) {
+    final t = s.replaceAll(RegExp(r'[-_]'), ' ');
+    return t[0].toUpperCase() + t.substring(1);
+  }
+
+  /// The frame call (with its opening paren) the stories in [source]
+  /// wrap themselves in, or '' when they render bare.
+  static String frameIn(String source) {
+    for (final frame in ['storyFrame(', '_shell(', '_frame(']) {
+      if (source.contains(frame)) return frame;
+    }
+    return '';
+  }
+
+  /// Registers `stories/<relPath>` in main.dart: an import and a spread in
+  /// build(). Prints what to do by hand if main.dart is not in the
+  /// expected shape.
+  static bool registerGroup(String relPath, String alias) {
+    final lines = main.readAsStringSync().split('\n');
+    final importLine = "import 'stories/$relPath' as $alias;";
+    if (!lines.contains(importLine)) {
+      _addImport(lines, importLine, "import 'stories/", fallbackAfter: null);
+    }
+    final ok = insertInList(
+      lines,
+      RegExp(r'List<Story> build\(\)\s*=>'),
+      '...$alias.stories(),',
+    );
+    if (!ok) {
+      stderr.writeln(
+        'Could not find `List<Story> build() => [` in story/main.dart. '
+        'Register the group by hand:\n'
+        '  $importLine\n'
+        '  ...$alias.stories(),',
+      );
+      return false;
+    }
+    main.writeAsStringSync(lines.join('\n'));
+    stdout.writeln('Registered $alias in story/main.dart');
+    return true;
+  }
+
+  /// Registers `lines/<fileName>.dart` in main.dart: an import and an
+  /// entry in storylines(), adding the override if the class has none.
+  static bool registerLine(String fileName) {
+    final lines = main.readAsStringSync().split('\n');
+    final alias = 'line_$fileName';
+    final importLine = "import 'lines/$fileName.dart' as $alias;";
+    if (!lines.contains(importLine)) {
+      _addImport(
+        lines,
+        importLine,
+        "import 'lines/",
+        fallbackAfter: "import 'stories/",
+      );
+    }
+    final opener = RegExp(r'List<Storyline> storylines\(\)\s*=>');
+    if (!lines.any(opener.hasMatch)) {
+      // No override yet: add one just above build()'s @override.
+      var at = lines.indexWhere(RegExp(r'List<Story> build\(\)').hasMatch);
+      if (at == -1) {
+        stderr.writeln(
+          'Could not find build() in story/main.dart. Register the line by '
+          'hand:\n  $importLine\n  $alias.storyline(),',
+        );
+        return false;
+      }
+      if (at > 0 && lines[at - 1].trim() == '@override') {
+        at--;
+      }
+      final indent = RegExp(r'^\s*').firstMatch(lines[at])!.group(0)!;
+      lines.insertAll(at, [
+        '$indent@override',
+        '${indent}List<Storyline> storylines() => [];',
+        '',
+      ]);
+    }
+    insertInList(lines, opener, '$alias.storyline(),');
+    main.writeAsStringSync(lines.join('\n'));
+    stdout.writeln('Registered $alias in story/main.dart');
+    return true;
+  }
+
+  /// Inserts [importLine] among the imports starting with [prefix],
+  /// keeping them sorted; starts a new block after the last
+  /// [fallbackAfter] import (or the last import at all) when there are
+  /// none yet.
+  static void _addImport(
+    List<String> lines,
+    String importLine,
+    String prefix, {
+    required String? fallbackAfter,
+  }) {
+    final block = [
+      for (var i = 0; i < lines.length; i++)
+        if (lines[i].startsWith(prefix)) i,
+    ];
+    if (block.isNotEmpty) {
+      for (final i in block) {
+        if (lines[i].compareTo(importLine) > 0) {
+          lines.insert(i, importLine);
+          return;
+        }
+      }
+      lines.insert(block.last + 1, importLine);
+      return;
+    }
+    var after = -1;
+    if (fallbackAfter != null) {
+      after = lines.lastIndexWhere((l) => l.startsWith(fallbackAfter));
+    }
+    if (after == -1) {
+      after = lines.lastIndexWhere((l) => l.startsWith('import '));
+    }
+    if (after == -1) {
+      lines.insertAll(0, [importLine, '']);
+      return;
+    }
+    lines.insertAll(after + 1, ['', importLine]);
+  }
+
+  /// Appends [entry] to the list literal that the first line matching
+  /// [opener] opens, handling both `=> [` with a closing `];` on its own
+  /// line and the one-line `=> [];`. Returns false if neither is found.
+  static bool insertInList(List<String> lines, Pattern opener, String entry) {
+    final start = lines.indexWhere((l) => l.contains(opener));
+    if (start == -1) return false;
+    final line = lines[start];
+    final oneLine = RegExp(r'=>\s*(const\s+)?\[\];\s*$');
+    if (oneLine.hasMatch(line)) {
+      final indent = RegExp(r'^\s*').firstMatch(line)!.group(0)!;
+      lines.replaceRange(start, start + 1, [
+        line.replaceFirst(oneLine, '=> ['),
+        '$indent  $entry',
+        '$indent];',
+      ]);
+      return true;
+    }
+    if (!RegExp(r'\[\s*$').hasMatch(line)) return false;
+    final close = lines.indexWhere(
+      (l) => RegExp(r'^\s*\];\s*$').hasMatch(l),
+      start,
+    );
+    if (close == -1) return false;
+    final prev = lines[close - 1];
+    final closeIndent = RegExp(r'^\s*').firstMatch(lines[close])!.group(0)!;
+    final indent = close - 1 > start && prev.trim().isNotEmpty
+        ? RegExp(r'^\s*').firstMatch(prev)!.group(0)!
+        : '$closeIndent  ';
+    lines.insert(close, '$indent$entry');
+    return true;
+  }
+
+  /// Polls the running catalog until every id in [ids] is listed, for a
+  /// few seconds, and says what happened. Never fails the command: the
+  /// files are written either way.
+  static Future<void> reportListed(List<String> ids, String url) async {
+    final deadline = DateTime.now().add(const Duration(seconds: 8));
+    while (true) {
+      final listed = await _index(url);
+      if (listed == null) {
+        stdout.writeln(
+          'No catalog running at $url; start one with: flutter_static run',
+        );
+        return;
+      }
+      final missing = ids.where((id) => !listed.contains(id)).toList();
+      if (missing.isEmpty) {
+        stdout.writeln('Listed at $url/story/${ids.first}');
+        stdout.writeln('Render: flutter_static render ${ids.first} -o out.png');
+        return;
+      }
+      if (DateTime.now().isAfter(deadline)) {
+        stdout.writeln(
+          'Not listed yet at $url: ${missing.join(', ')}. The reload may '
+          'have failed; check the flutter_static run terminal.',
+        );
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    }
+  }
+
+  /// Story ids from the catalog at [url], or null when nothing answers.
+  static Future<Set<String>?> _index(String url) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+    try {
+      final request = await client.getUrl(Uri.parse('$url/index.json'));
+      final response = await request.close();
+      if (response.statusCode != HttpStatus.ok) return null;
+      final body = await response.transform(utf8.decoder).join();
+      final index = jsonDecode(body) as Map<String, dynamic>;
+      return {
+        for (final story
+            in (index['stories'] as List).cast<Map<String, dynamic>>())
+          story['id'] as String,
+      };
+    } on SocketException {
+      return null;
+    } on HttpException {
+      return null;
+    } finally {
+      client.close();
+    }
+  }
+}
