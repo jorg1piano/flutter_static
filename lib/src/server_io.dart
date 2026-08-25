@@ -1465,7 +1465,10 @@ figure{margin:0;background:#131518;border-radius:12px;padding:12px}
 img{display:block;max-width:460px;height:auto;border-radius:8px;background:#0A0B0D}
 .media{position:relative}
 .png{display:block}
-.host{position:absolute;left:0;top:0;border-radius:8px;overflow:hidden;pointer-events:none}
+.host{position:absolute;left:0;top:0;border-radius:8px;overflow:hidden;pointer-events:none;transition:opacity .15s}
+/* Hovering a card lifts the live view: the png under it is the current
+   render and links to the story page. Leave, and the view is back. */
+.card:hover .host{opacity:0;pointer-events:none!important}
 .card.booting img{opacity:.5;transition:opacity .3s}
 h1.line{font-size:16px;font-family:ui-monospace,monospace;margin:8px 0 0}
 .toolbar{margin:16px 0 0;font-size:12px;color:#9B9FAB;display:flex;gap:8px;align-items:center}
@@ -1495,7 +1498,9 @@ const LIVE_BUILD = {{LIVE_BUILD}};
 // inside a group every card goes live while it is near the viewport; the
 // front page keeps its pngs and swaps a card for the real widget on
 // hover. The engine boots on first need, not on page load. The png stays
-// the size reference (rendered at 2x) and the fallback for automation.
+// the size reference (rendered at 2x), the fallback for automation, and
+// what a hovered card shows: it follows every hot reload, while the view
+// runs the last build-web.
 const WEB = '/live/';
 const LIVE = LIVE_BUILD && !navigator.webdriver;
 // Device toggle (storyline pages): renders and views take ?device / the
@@ -1697,7 +1702,7 @@ async function load(v){
     // Server-rendered layout; only the pngs move.
     if (v !== shownVersion) {
       shownVersion = v;
-      if (!LIVE) for (const img of document.querySelectorAll('.card img')) img.src = pngUrl(img.alt, v);
+      for (const img of document.querySelectorAll('.card img')) img.src = pngUrl(img.alt, v);
     }
     return;
   }
@@ -1705,9 +1710,9 @@ async function load(v){
   const ids = idx.stories.map((s) => s.id).filter((id) => !FILTER || id.split('/')[0] === FILTER);
   const shown = [...document.querySelectorAll('.card')].map((c) => c.dataset.id);
   if (ids.join('|') === shown.join('|')) {
-    // Same stories: refresh the PNGs when they are what is visible (the
-    // static live views only change with a new build-web).
-    if (!LIVE && (v ?? idx.version) !== shownVersion) {
+    // Same stories: refresh the PNGs (the live views only change with a
+    // new build-web; the png under each is what a hover shows).
+    if ((v ?? idx.version) !== shownVersion) {
       shownVersion = v ?? idx.version;
       for (const img of document.querySelectorAll('.card img')) {
         img.src = pngUrl(img.alt, shownVersion);
