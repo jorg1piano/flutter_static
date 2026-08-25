@@ -64,7 +64,7 @@ void main() {
     // green.
     final box = tester.getRect(hue);
     await tester.tapAt(Offset(box.left + box.width / 3, box.center.dy));
-    await tester.pump(const Duration(milliseconds: 200));
+    await tester.pump(const Duration(milliseconds: 300));
     expect(source(), isNot(contains('Color(0xFFFF0000)')));
     final written = TokenSet.load(project.path).find('AppColors.primary')!;
     final color = Color(written.argb!);
@@ -78,7 +78,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.enterText(find.byType(TextField).last, '#00FF00');
     await tester.testTextInput.receiveAction(TextInputAction.done);
-    await tester.pump(const Duration(milliseconds: 200));
+    await tester.pump(const Duration(milliseconds: 300));
     expect(source(), contains('static const primary = Color(0xFF00FF00);'));
   });
 

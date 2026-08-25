@@ -1,3 +1,5 @@
+import 'dart:ui' show PointMode;
+
 import 'package:flutter/material.dart';
 
 import 'controller.dart';
@@ -263,14 +265,16 @@ class StoryCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final selected = controller.selectedStoryId == id;
     final live = controller.isLive(id);
-    // A story the catalog has not captured yet: ask for the render, which
-    // also tells us how it lays out.
+    // A story the catalog has not captured yet: a background capture
+    // tells us how it lays out, and its PNG stands in meanwhile.
+    if (live == null) controller.discover(id);
     final png = live == true ? null : controller.png(id);
     final Widget body;
     if (live == true) {
       body = _LiveSlot(
         interact: controller.interact,
         onSelect: () => controller.selectStory(id),
+        onSize: (size) => controller.noteSize(id, size),
         child: controller.mount(id),
       );
     } else {
@@ -278,6 +282,7 @@ class StoryCard extends StatelessWidget {
         id: id,
         png: png,
         loading: controller.isFetching(id),
+        placeholder: controller.placeholderSize(id),
         onSelect: () => controller.selectStory(id),
       );
     }
@@ -307,26 +312,46 @@ class StoryCard extends StatelessWidget {
 /// A live widget. In select mode a click selects the card and nothing
 /// reaches the widget; in interact mode events go through and a pointer
 /// down still selects.
-class _LiveSlot extends StatelessWidget {
+class _LiveSlot extends StatefulWidget {
   const _LiveSlot({
     required this.child,
     required this.interact,
     required this.onSelect,
+    required this.onSize,
   });
 
   final Widget child;
   final bool interact;
   final VoidCallback onSelect;
 
+  /// Reports the mounted story's size after each layout, so a later
+  /// placeholder for it takes the same room.
+  final ValueChanged<Size> onSize;
+
+  @override
+  State<_LiveSlot> createState() => _LiveSlotState();
+}
+
+class _LiveSlotState extends State<_LiveSlot> {
+  Size? _reported;
+
   @override
   Widget build(BuildContext context) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final size = context.size;
+      if (size != null && size != _reported) {
+        _reported = size;
+        widget.onSize(size);
+      }
+    });
     // Its own layer: an animating story repaints itself, not the canvas.
-    final isolated = RepaintBoundary(child: child);
-    if (interact) {
-      return Listener(onPointerDown: (_) => onSelect(), child: isolated);
+    final isolated = RepaintBoundary(child: widget.child);
+    if (widget.interact) {
+      return Listener(onPointerDown: (_) => widget.onSelect(), child: isolated);
     }
     return GestureDetector(
-      onTap: onSelect,
+      onTap: widget.onSelect,
       behavior: HitTestBehavior.opaque,
       child: AbsorbPointer(child: isolated),
     );
@@ -338,12 +363,14 @@ class _RenderSlot extends StatelessWidget {
     required this.id,
     required this.png,
     required this.loading,
+    required this.placeholder,
     required this.onSelect,
   });
 
   final String id;
   final StoryPng? png;
   final bool loading;
+  final Size placeholder;
   final VoidCallback onSelect;
 
   @override
@@ -351,8 +378,8 @@ class _RenderSlot extends StatelessWidget {
     onTap: onSelect,
     child: png == null
         ? Container(
-            width: 390,
-            height: 240,
+            width: placeholder.width,
+            height: placeholder.height,
             color: StudioColors.raised,
             alignment: Alignment.center,
             child: Text(
@@ -404,12 +431,20 @@ class _DotGrid extends CustomPainter {
     }
     final dx = m.storage[12] % step;
     final dy = m.storage[13] % step;
-    final paint = Paint()..color = StudioColors.canvasDot;
-    for (var x = dx; x < size.width; x += step) {
-      for (var y = dy; y < size.height; y += step) {
-        canvas.drawCircle(Offset(x, y), 1, paint);
-      }
-    }
+    // One draw call: a circle per dot was ten thousand calls a frame
+    // while panning.
+    final points = <Offset>[
+      for (var x = dx; x < size.width; x += step)
+        for (var y = dy; y < size.height; y += step) Offset(x, y),
+    ];
+    canvas.drawPoints(
+      PointMode.points,
+      points,
+      Paint()
+        ..color = StudioColors.canvasDot
+        ..strokeWidth = 2
+        ..strokeCap = StrokeCap.round,
+    );
   }
 
   @override

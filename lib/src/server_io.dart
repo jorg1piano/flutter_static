@@ -38,6 +38,10 @@ void runFlutterStatic(
   _stayAwake();
   runApp(_CatalogApp(stories: stories, shell: shell));
   _serve(stories, port);
+  // Studio hosts the window: its cards ask for the captures they need,
+  // in the background, and an unasked sweep after every save would only
+  // hitch the UI thread while someone drags a slider.
+  _prewarmEnabled = shell == null;
   _prewarm(stories, initial: true);
 }
 
@@ -77,19 +81,23 @@ Widget storyOnPage(
 ).builder();
 
 /// The render of story [id] as `/story/<id>.png` would serve it, from the
-/// same cache and capture queue.
+/// same cache and capture queue. A [background] capture yields to
+/// foreground ones and does not join the hot set that re-renders first
+/// after every reload.
 Future<Uint8List> renderStoryPng(
   Stories stories,
   String id, {
   PhoneSpec? device,
   bool statusBar = false,
   Map<String, String> knobs = const {},
+  bool background = false,
 }) {
   final story = findStory(stories, id);
   if (story == null) throw ArgumentError.value(id, 'id', 'no such story');
-  _noteRequested(id);
+  if (!background) _noteRequested(id);
   return _renderCached(
     _onPage(story, device: device, statusBar: statusBar, knobs: knobs),
+    background: background,
   );
 }
 
@@ -116,8 +124,12 @@ Widget storyEnvironment(Widget child, {bool bounded = false}) =>
               child: child,
             )
           : child,
-      ThemeData(),
+      _defaultTheme,
     );
+
+/// One default theme for every mount: building a ThemeData is not free,
+/// and a canvas rebuild mounts every card on the page.
+final _defaultTheme = ThemeData();
 
 Widget _storyEnvironment(Widget inner, ThemeData theme) => MediaQuery(
   data: const MediaQueryData(size: Size(430, 932), devicePixelRatio: 2),
@@ -249,7 +261,10 @@ void _stayAwake() {
 /// has saved or rendered for 4 seconds. Someone iterating on one story
 /// saves every few seconds; a 130-story sweep after each save would queue
 /// their next render behind a minute of work instead of 50ms.
+bool _prewarmEnabled = true;
+
 void _prewarm(Stories stories, {required bool initial}) {
+  if (!_prewarmEnabled) return;
   final version = _version;
   bool superseded() => _version != version || _reloadPending;
   Future(() async {
@@ -529,9 +544,9 @@ class _CatalogAppState extends State<_CatalogApp> {
     // Re-read on every reload: main() never runs again, the getter does.
     debugDefaultTargetPlatformOverride = widget.stories.platform;
     _version++;
-    // Learn each story's shell afresh: a capture that failed offscreen
-    // for a transient reason should not stay window-bound for good.
-    _storyShells.clear();
+    // Shells survive a reload (a story rarely changes how it lays out,
+    // and live cards never capture), but a story that failed offscreen
+    // for a transient reason gets another try at its next capture.
     _needsWindow.clear();
     _lastActivity = DateTime.now();
     _prewarm(widget.stories, initial: false);

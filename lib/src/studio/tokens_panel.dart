@@ -101,13 +101,16 @@ class _TokenHeader extends StatelessWidget {
   );
 }
 
-/// Coalesces slider drags into one write per 120 ms.
+/// Coalesces slider drags into one write per 250 ms: each write is a
+/// save, each save a hot reload of the whole process (about 350 ms),
+/// and reloads that queue up behind each other make the canvas lag the
+/// pointer instead of following it.
 class _Debounce {
   Timer? _timer;
 
   void call(VoidCallback action) {
     _timer?.cancel();
-    _timer = Timer(const Duration(milliseconds: 120), action);
+    _timer = Timer(const Duration(milliseconds: 250), action);
   }
 
   void dispose() => _timer?.cancel();

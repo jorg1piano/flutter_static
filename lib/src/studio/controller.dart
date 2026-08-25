@@ -4,6 +4,10 @@
 /// tokens. One [ChangeNotifier]; the views rebuild off it.
 library;
 
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 
@@ -15,12 +19,14 @@ import 'model.dart';
 
 enum CatalogStatus { ready, reloading, error }
 
-/// One fetched render, with the version it was captured at.
+/// One fetched render, with the version and options it was captured at.
 class StoryPng {
-  const StoryPng(this.bytes, this.version);
+  const StoryPng(this.bytes, this.key);
 
   final Uint8List bytes;
-  final int version;
+
+  /// Version plus render options; a different key means stale.
+  final String key;
 }
 
 class StudioController extends ChangeNotifier {
@@ -31,6 +37,7 @@ class StudioController extends ChangeNotifier {
   }) {
     catalogVersion.addListener(_onVersion);
     catalogReloadTick.addListener(notifyListeners);
+    _loadSizes();
     refreshIndex();
     loadTokens();
   }
@@ -79,6 +86,19 @@ class StudioController extends ChangeNotifier {
   final _pngs = <String, StoryPng>{};
   final _inflight = <String>{};
   bool _disposed = false;
+  bool _notifyScheduled = false;
+
+  /// One notification per frame however many captures land in it: every
+  /// notification rebuilds the whole page of live cards.
+  void _notifySoon() {
+    if (_notifyScheduled || _disposed) return;
+    _notifyScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _notifyScheduled = false;
+      if (!_disposed) notifyListeners();
+    });
+    WidgetsBinding.instance.scheduleFrame();
+  }
 
   StudioPage? get selectedPage {
     for (final p in pages) {
@@ -111,7 +131,6 @@ class StudioController extends ChangeNotifier {
 
   void _onVersion() {
     version = catalogVersion.value;
-    _pngs.clear();
     refreshIndex();
     // Tokens may have changed on disk (an agent editing the file is the
     // point), and stories may have been added or renamed.
@@ -137,19 +156,16 @@ class StudioController extends ChangeNotifier {
 
   void setDevice(String? name) {
     device = name;
-    _pngs.clear();
     notifyListeners();
   }
 
   void setStatusBar(bool on) {
     statusBar = on;
-    _pngs.clear();
     notifyListeners();
   }
 
   void setKnob(String knob, String option) {
     knobs[knob] = option;
-    _pngs.clear();
     notifyListeners();
   }
 
@@ -212,30 +228,45 @@ class StudioController extends ChangeNotifier {
 
   // --- renders ------------------------------------------------------------
 
+  /// What a render depends on: a card whose render has a different key
+  /// shows it, stale, while the current one captures.
+  String get _renderKey =>
+      '$version|$device|$statusBar|${knobs.entries.map((e) => '${e.key}=${e.value}').join(',')}';
+
   /// The latest render of [id], capturing a fresh one when it is behind
-  /// [version]. Returns the stale one meanwhile so cards never blank.
+  /// [version] or the render options. Returns the stale one meanwhile so
+  /// cards keep their size and their last screen.
   StoryPng? png(String id) {
     final cached = _pngs[id];
-    if (cached == null || cached.version != version) _fetch(id);
+    if (cached == null || cached.key != _renderKey) _fetch(id);
     return cached;
+  }
+
+  /// A background capture of [id], so the catalog learns its shell and a
+  /// live card can replace the placeholder. Never joins the hot set.
+  void discover(String id) {
+    if (storyShellOf(id) == null) _fetch(id, background: true);
   }
 
   bool isFetching(String id) => _inflight.contains(id);
 
-  void _fetch(String id) {
+  void _fetch(String id, {bool background = false}) {
     if (_inflight.contains(id)) return;
     _inflight.add(id);
-    final wanted = version;
+    final key = _renderKey;
     renderStoryPng(
           stories,
           id,
           device: deviceSpec,
           statusBar: statusBar,
           knobs: Map.of(knobs),
+          background: background,
         )
         .then((bytes) {
           if (_disposed) return;
-          _pngs[id] = StoryPng(bytes, wanted);
+          _pngs[id] = StoryPng(bytes, key);
+          final size = _pngSize(bytes);
+          if (size != null) noteSize(id, size);
         })
         .catchError((Object e) {
           if (!_disposed) log('render $id: $e');
@@ -243,14 +274,85 @@ class StudioController extends ChangeNotifier {
         .whenComplete(() {
           if (_disposed) return;
           _inflight.remove(id);
-          notifyListeners();
+          _notifySoon();
         });
   }
 
-  /// Drops a render so the next paint captures it again.
+  /// Marks a render stale so the next paint captures it again, keeping
+  /// the old one on screen meanwhile.
   void rerender(String id) {
-    _pngs.remove(id);
+    final old = _pngs[id];
+    if (old != null) _pngs[id] = StoryPng(old.bytes, 'stale');
     notifyListeners();
+  }
+
+  // --- sizes --------------------------------------------------------------
+
+  /// Every story's last known size, so a placeholder or a card whose
+  /// render is on its way takes the room the story took last time and
+  /// the canvas does not shift. Kept in .dart_tool across sessions.
+  final _sizes = <String, Size>{};
+  Timer? _sizesSave;
+
+  File get _sizesFile => File('$project/.dart_tool/flutter_static_studio.json');
+
+  Size? sizeOf(String id) => _sizes[id];
+
+  /// The size a card takes before its content is known: the story's
+  /// last size, else the device mockup on a flow page, else a card.
+  Size placeholderSize(String id) {
+    final known = _sizes[id];
+    if (known != null) return known;
+    if (selectedPage?.isLine == true) {
+      return PhoneMockup(
+        spec: deviceSpec ?? PhoneSpec.fallback,
+        child: const SizedBox.shrink(),
+      ).size;
+    }
+    return const Size(390, 240);
+  }
+
+  void noteSize(String id, Size size) {
+    if (_sizes[id] == size) return;
+    _sizes[id] = size;
+    _sizesSave?.cancel();
+    _sizesSave = Timer(const Duration(seconds: 1), _saveSizes);
+  }
+
+  void _loadSizes() {
+    try {
+      if (!_sizesFile.existsSync()) return;
+      final json = jsonDecode(_sizesFile.readAsStringSync()) as Map;
+      for (final entry in (json['sizes'] as Map).entries) {
+        final wh = (entry.value as List).cast<num>();
+        _sizes[entry.key as String] = Size(wh[0].toDouble(), wh[1].toDouble());
+      }
+    } catch (e) {
+      log('sizes: $e');
+    }
+  }
+
+  void _saveSizes() {
+    try {
+      _sizesFile.parent.createSync(recursive: true);
+      _sizesFile.writeAsStringSync(
+        jsonEncode({
+          'sizes': {
+            for (final e in _sizes.entries)
+              e.key: [e.value.width, e.value.height],
+          },
+        }),
+      );
+    } catch (e) {
+      log('sizes: $e');
+    }
+  }
+
+  /// Logical size of a 2x PNG from its header, or null.
+  static Size? _pngSize(Uint8List bytes) {
+    if (bytes.length < 24) return null;
+    final data = ByteData.sublistView(bytes, 16, 24);
+    return Size(data.getUint32(0) / 2, data.getUint32(4) / 2);
   }
 
   // --- tokens -------------------------------------------------------------
@@ -290,6 +392,7 @@ class StudioController extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    _sizesSave?.cancel();
     catalogVersion.removeListener(_onVersion);
     catalogReloadTick.removeListener(notifyListeners);
     super.dispose();
