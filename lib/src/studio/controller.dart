@@ -76,9 +76,9 @@ class StudioController extends ChangeNotifier {
   /// Live mounts on the canvas, or the PNG renders the catalog serves.
   bool live = true;
 
-  /// Whether pointer events reach the mounted widgets (else a click
-  /// selects the card).
-  bool interact = false;
+  /// Whether pointer events reach the mounted widgets, which a pointer
+  /// down also selects; off, a click only selects the card.
+  bool interact = true;
 
   /// Stories shown as renders even while [live] is on.
   final renderOnly = <String>{};

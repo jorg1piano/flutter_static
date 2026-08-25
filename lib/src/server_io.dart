@@ -111,6 +111,10 @@ final _storyShells = <String, StoryShell>{};
 /// [StoryShell] of story [id], or null until it has been captured once.
 StoryShell? storyShellOf(String id) => _storyShells[id];
 
+/// Tests mount stories without a capture; this stands in for one.
+@visibleForTesting
+void setStoryShell(String id, StoryShell shell) => _storyShells[id] = shell;
+
 String _baseId(String id) => id.split(RegExp('[@~]')).first;
 
 /// The environment a story renders in: phone-sized media query, English
