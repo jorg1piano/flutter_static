@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import 'phone_mockup.dart';
@@ -18,6 +18,7 @@ const _catalogPort = int.fromEnvironment(
 );
 
 void runFlutterStatic(Stories stories, {int port = _catalogPort}) {
+  debugDefaultTargetPlatformOverride = stories.platform;
   runApp(_CatalogApp(stories: stories));
   _serve(stories, port);
   _prewarm(stories);
@@ -128,6 +129,8 @@ class _CatalogAppState extends State<_CatalogApp> {
   @override
   void reassemble() {
     super.reassemble();
+    // Re-read on every reload: main() never runs again, the getter does.
+    debugDefaultTargetPlatformOverride = widget.stories.platform;
     _version++;
     _prewarm(widget.stories);
     _broadcastEvent();
@@ -285,9 +288,14 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
           final device = PhoneSpec.byName(
             request.uri.queryParameters['device'],
           );
-          final story = device == null
+          final statusBar = request.uri.queryParameters['status'] == '1';
+          final story = device == null && !statusBar
               ? matches.first
-              : _onDevice(matches.first, device);
+              : _onDevice(
+                  matches.first,
+                  device ?? PhoneSpec.fallback,
+                  statusBar: statusBar,
+                );
           final png = await _renderCached(story);
           response.headers.set('x-render-trace', _lastTrace);
           response.headers.contentType = ContentType('image', 'png');
@@ -312,6 +320,7 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
               all,
               index,
               device: PhoneSpec.byName(request.uri.queryParameters['device']),
+              statusBar: request.uri.queryParameters['status'] == '1',
               showDevices: inLine,
             ),
           );
@@ -384,23 +393,43 @@ bool _liveBuildExists() {
       File('$root/build/web/flutter_bootstrap.js').existsSync();
 }
 
-/// [story] rendered for [device]: the frame builders read the scope.
-/// A distinct id keeps the render cache per device.
-Story _onDevice(Story story, PhoneSpec device) => Story(
-  '${story.id}@${device.name}',
-  () => DeviceScope(spec: device, child: story.builder()),
-);
+/// [story] rendered for [device], with or without the status bar: the
+/// frame builders read the scope. A distinct id keeps the render cache
+/// per combination.
+Story _onDevice(Story story, PhoneSpec device, {bool statusBar = false}) =>
+    Story(
+      '${story.id}@${device.name}${statusBar ? '+status' : ''}',
+      () => DeviceScope(
+        spec: device,
+        statusBar: statusBar,
+        child: story.builder(),
+      ),
+    );
 
-/// The device toggle for pages of storyline variants.
-String _deviceToolbar({String? selected, bool links = false}) {
+/// The device and status-bar toggles for pages of storyline variants.
+String _deviceToolbar({
+  String? selected,
+  bool statusBar = false,
+  bool links = false,
+}) {
   final buffer = StringBuffer('<div class="toolbar"><span>Enhet</span>');
+  final device = selected ?? PhoneSpec.all.first.name;
+  final status = statusBar ? '&status=1' : '';
   for (final spec in PhoneSpec.all) {
-    final on = spec.name == (selected ?? PhoneSpec.all.first.name);
-    final cls = on ? 'device on' : 'device';
+    final cls = spec.name == device ? 'device on' : 'device';
     buffer.write(
       links
-          ? '<a class="$cls" href="?device=${spec.name}">${_escape(spec.label)}</a>'
+          ? '<a class="$cls" href="?device=${spec.name}$status">${_escape(spec.label)}</a>'
           : '<button class="$cls" data-device="${spec.name}">${_escape(spec.label)}</button>',
+    );
+  }
+  buffer.write('<span class="sep">Statuslinje</span>');
+  for (final (value, label) in [('1', 'P&aring;'), ('0', 'Av')]) {
+    final cls = (value == '1') == statusBar ? 'status on' : 'status';
+    buffer.write(
+      links
+          ? '<a class="$cls" href="?device=$device${value == '1' ? '&status=1' : ''}">$label</a>'
+          : '<button class="$cls" data-status="$value">$label</button>',
     );
   }
   buffer.write('</div>');
@@ -697,13 +726,19 @@ String _storyDetailPage(
   List<Story> all,
   int index, {
   PhoneSpec? device,
+  bool statusBar = false,
   bool showDevices = false,
 }) {
   final story = all[index];
   final id = _escape(story.id);
-  final dev = device == null ? '' : '&device=${device.name}';
+  final dev =
+      '${device == null ? '' : '&device=${device.name}'}${statusBar ? '&status=1' : ''}';
   final toolbar = showDevices
-      ? _deviceToolbar(selected: device?.name, links: true)
+      ? _deviceToolbar(
+          selected: device?.name,
+          statusBar: statusBar,
+          links: true,
+        )
       : '';
   final group = _escape(story.id.split('/').first);
   final prev = all[(index - 1 + all.length) % all.length].id;
@@ -723,6 +758,10 @@ section h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#6
 .png img{display:block;max-width:min(840px,100%);height:auto;border-radius:8px}
 #live{background:#131518;border-radius:12px;padding:16px;min-height:120px;display:flex;align-items:center;justify-content:center;resize:vertical;overflow:hidden}
 #live .hint{color:#6B6E7A;font-size:12.5px}
+.toolbar{margin:-12px 0 16px;font-size:12px;color:#9B9FAB;display:flex;gap:8px;align-items:center}
+.toolbar .device,.toolbar .status{font:inherit;color:#9B9FAB;background:#131518;border:1px solid #2A2D35;border-radius:8px;padding:4px 10px;text-decoration:none}
+.toolbar .device.on,.toolbar .status.on{color:#E2E4E9;border-color:#6B6E7A}
+.toolbar .sep{margin-left:12px}
 #host{width:100%;height:100%;min-height:120px}
 </style></head><body>
 <div class="nav"><a href="/">&larr; alle</a><a href="/$group">$group</a>
@@ -739,6 +778,7 @@ $toolbar
 <script>
 const STORY = '$id';
 const DEVICE = ${jsonEncode(device?.name)};
+const STATUS = $statusBar;
 document.addEventListener('keydown', (e) => {
   if (e.key === 'ArrowLeft') location.href = '/story/${_escape(prev)}';
   if (e.key === 'ArrowRight') location.href = '/story/${_escape(next)}';
@@ -762,7 +802,7 @@ if (!navigator.webdriver) {
     const d = JSON.parse(e.data);
     if (d.version !== seen) {
       seen = d.version;
-      img.src = '/story/' + STORY + '.png?v=' + d.version + (DEVICE ? '&device=' + DEVICE : '');
+      img.src = '/story/' + STORY + '.png?v=' + d.version + (DEVICE ? '&device=' + DEVICE : '') + (STATUS ? '&status=1' : '');
     }
   };
 }
@@ -771,7 +811,11 @@ if (!navigator.webdriver) {
     if (!r.ok) throw 0;
     // The page adds the view itself: the device travels in its data.
     document.addEventListener('flutter-static-ready', (e) => {
-      e.detail.addView({hostElement: document.getElementById('host'), initialData: {storyId: STORY, device: DEVICE || undefined}});
+      // No undefined values: the Dart side cannot convert them.
+      const data = {storyId: STORY};
+      if (DEVICE) data.device = DEVICE;
+      if (STATUS) data.status = true;
+      e.detail.addView({hostElement: document.getElementById('host'), initialData: data});
     });
     const s = document.createElement('script');
     s.src = '/live/flutter_bootstrap.js';
@@ -923,7 +967,7 @@ h2 a:hover{color:#E2E4E9}
 figure{margin:0;background:#131518;border-radius:12px;padding:12px}
 .card:hover figure{background:#1A1D23}
 .media{display:block}
-img{display:block;max-width:420px;height:auto;border-radius:8px;background:#0A0B0D}
+img{display:block;max-width:460px;height:auto;border-radius:8px;background:#0A0B0D}
 .media{position:relative}
 .png{display:block}
 .host{position:absolute;left:0;top:0;border-radius:8px;overflow:hidden;pointer-events:none}
@@ -931,7 +975,9 @@ img{display:block;max-width:420px;height:auto;border-radius:8px;background:#0A0B
 h1.line{font-size:16px;font-family:ui-monospace,monospace;margin:8px 0 0}
 .toolbar{margin:16px 0 0;font-size:12px;color:#9B9FAB;display:flex;gap:8px;align-items:center}
 .toolbar .device{font:inherit;color:#9B9FAB;background:#131518;border:1px solid #2A2D35;border-radius:8px;padding:4px 10px;cursor:pointer;text-decoration:none}
-.toolbar .device.on{color:#E2E4E9;border-color:#6B6E7A}
+.toolbar .device.on,.toolbar .status.on{color:#E2E4E9;border-color:#6B6E7A}
+.toolbar .status{font:inherit;color:#9B9FAB;background:#131518;border:1px solid #2A2D35;border-radius:8px;padding:4px 10px;cursor:pointer;text-decoration:none}
+.toolbar .sep{margin-left:12px}
 .lines a{display:inline-block;margin:0 12px 8px 0;font-family:ui-monospace,monospace;font-size:12px;color:#9B9FAB;text-decoration:none}
 .lines a:hover{color:#E2E4E9}
 .cell{display:flex;flex-direction:column;gap:16px}
@@ -966,11 +1012,25 @@ if (deviceButtons.length) {
   if (!deviceButtons.some((b) => b.dataset.device === DEVICE)) DEVICE = deviceButtons[0].dataset.device;
   for (const b of deviceButtons) b.addEventListener('click', () => setDevice(b.dataset.device));
 }
-function pngUrl(id, v) { return '/story/' + id + '.png?v=' + v + (DEVICE ? '&device=' + DEVICE : ''); }
+let STATUS = false;
+const statusButtons = [...document.querySelectorAll('.toolbar button.status')];
+if (statusButtons.length) {
+  try { STATUS = localStorage.getItem('fs-status') === '1'; } catch (e) {}
+  for (const b of statusButtons) b.addEventListener('click', () => { STATUS = b.dataset.status === '1'; try { localStorage.setItem('fs-status', STATUS ? '1' : '0'); } catch (e) {} setDevice(DEVICE); });
+}
+// No undefined values in view data: the Dart side cannot convert them.
+function viewData(id) {
+  const data = {storyId: id};
+  if (DEVICE) data.device = DEVICE;
+  if (STATUS) data.status = true;
+  return data;
+}
+function pngUrl(id, v) { return '/story/' + id + '.png?v=' + v + (DEVICE ? '&device=' + DEVICE : '') + (STATUS ? '&status=1' : ''); }
 function setDevice(d) {
   DEVICE = d;
   try { localStorage.setItem('fs-device', d); } catch (e) {}
   for (const b of deviceButtons) b.classList.toggle('on', b.dataset.device === d);
+  for (const b of statusButtons) b.classList.toggle('on', (b.dataset.status === '1') === STATUS);
   // A device changes a variant's size: back to a plain png card, which
   // remounts (live cards) from the new render's size.
   for (const card of document.querySelectorAll('.card')) {
@@ -1015,7 +1075,9 @@ function hostFor(card) {
   const img = card.querySelector('img');
   const w = Math.round(img.naturalWidth / 2), h = Math.round(img.naturalHeight / 2);
   if (!w || !h) return null;
-  const scale = Math.min(1, 420 / w);
+  // Wide enough for a phone mockup (the 13's is 440) to stay 1:1, so
+  // devices keep their real size difference on the page.
+  const scale = Math.min(1, 460 / w);
   const box = document.createElement('div');
   box.className = 'media';
   box.style.cssText = 'width:' + Math.round(w * scale) + 'px;height:' + Math.round(h * scale) + 'px';
@@ -1062,7 +1124,7 @@ function addView(card) {
     card.dataset.view = app.addView({
       hostElement: host,
       viewConstraints: {minWidth: w, maxWidth: w, minHeight: h, maxHeight: h},
-      initialData: {storyId: card.dataset.id, device: DEVICE || undefined},
+      initialData: viewData(card.dataset.id),
     });
     host.style.pointerEvents = 'auto';
     card.classList.remove('booting');
@@ -1100,7 +1162,7 @@ function unmountAll() {
   for (const c of document.querySelectorAll('.card[data-view]')) unmount(c);
 }
 let shownVersion = {{VERSION}};
-if (deviceButtons.length && DEVICE !== deviceButtons[0].dataset.device) setDevice(DEVICE);
+if (deviceButtons.length && (DEVICE !== deviceButtons[0].dataset.device || STATUS)) setDevice(DEVICE);
 else { for (const b of deviceButtons) b.classList.toggle('on', b.dataset.device === DEVICE); observeAll(); armHover(); }
 // Left/right arrows cycle through the group pages.
 document.addEventListener('keydown', (e) => {

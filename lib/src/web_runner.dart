@@ -92,8 +92,15 @@ class _MultiViewStoriesState extends State<_MultiViewStories>
       return Center(child: Text('unknown story: ${id ?? '<none>'}'));
     }
     final device = PhoneSpec.byName(data?['device'] as String?);
+    final statusBar = data?['status'] == true;
     Widget view = matches.first.builder();
-    if (device != null) view = DeviceScope(spec: device, child: view);
+    if (device != null || statusBar) {
+      view = DeviceScope(
+        spec: device ?? PhoneSpec.fallback,
+        statusBar: statusBar,
+        child: view,
+      );
+    }
     return SingleChildScrollView(child: Center(child: view));
   }
 }

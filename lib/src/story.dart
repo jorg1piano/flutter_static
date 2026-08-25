@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 
 import 'phone_mockup.dart';
@@ -14,8 +15,22 @@ typedef FrameBuilder = Widget Function(BuildContext context, Widget child);
 
 /// The default frame: the variant as a screen inside a [PhoneMockup] of
 /// the device the page asked for ([DeviceScope]).
-Widget phoneMockupFrame(BuildContext context, Widget child) =>
-    PhoneMockup(spec: DeviceScope.of(context), child: child);
+Widget phoneMockupFrame(BuildContext context, Widget child) => PhoneMockup(
+  spec: DeviceScope.of(context),
+  keyboard: DeviceScope.keyboardOf(context),
+  statusBar: DeviceScope.statusBarOf(context),
+  child: child,
+);
+
+/// The default frame with the keyboard up, for a variant that shows a
+/// focused field. Use as a cell's frameBuilder.
+Widget phoneMockupKeyboardFrame(BuildContext context, Widget child) =>
+    PhoneMockup(
+      spec: DeviceScope.of(context),
+      keyboard: true,
+      statusBar: DeviceScope.statusBarOf(context),
+      child: child,
+    );
 
 /// No frame: the variant at its own size, like a gallery card.
 Widget bareFrame(BuildContext _, Widget child) => child;
@@ -90,9 +105,22 @@ abstract class Stories {
   /// Flows; their variants join [build]'s stories in [all].
   List<Storyline> storylines() => const [];
 
-  /// Every story: [build] plus every storyline variant.
+  /// The platform the stories run as, whatever the catalog's host is.
+  ///
+  /// Null keeps the host's. A catalog of iPhone screens sets
+  /// [TargetPlatform.iOS]: scrollables then bounce, Material controls
+  /// keep phone density instead of the desktop's compact one, and
+  /// `Theme.of` reports iOS, so a Mac host stops getting those subtly
+  /// wrong. Applied through [debugDefaultTargetPlatformOverride], which
+  /// holds in the debug build the catalog runs as.
+  TargetPlatform? get platform => null;
+
+  /// Every story: each storyline's variants, then [build]'s stories.
+  ///
+  /// Flows first, so they lead the gallery: a storyline is what the parts
+  /// under it add up to, and the page reads top-down.
   List<Story> all() => [
-    ...build(),
     for (final line in storylines()) ...line.stories,
+    ...build(),
   ];
 }
