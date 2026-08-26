@@ -58,7 +58,7 @@ class StudioController extends ChangeNotifier {
     catalogVersion.addListener(_onVersion);
     catalogReloadTick.addListener(notifyListeners);
     watchKeyboard();
-    _loadSizes();
+    _loadStudioState();
     refreshIndex();
     loadTokens();
   }
@@ -79,6 +79,11 @@ class StudioController extends ChangeNotifier {
 
   final logs = <String>[];
   bool showLogs = false;
+
+  /// Studio chrome expansion state. Persisted in .dart_tool so restarting
+  /// Studio restores the same open/collapsed panels.
+  bool promptPanelOpen = true;
+  bool inspectorPanelOpen = true;
 
   List<StudioPage> pages = const [];
 
@@ -279,6 +284,108 @@ class StudioController extends ChangeNotifier {
     pick = null;
     notifyListeners();
   }
+
+  Future<void> addPage() async {
+    try {
+      final storiesDir = Directory('$project/story/stories');
+      storiesDir.createSync(recursive: true);
+      var slug = 'studio_page';
+      var n = 2;
+      while (File('${storiesDir.path}/$slug.dart').existsSync()) {
+        slug = 'studio_page_$n';
+        n++;
+      }
+      final title = slug.replaceAll('_', ' ');
+      final className = _pageClassName(slug);
+      final file = File('${storiesDir.path}/$slug.dart');
+      file.writeAsStringSync('''
+import 'package:flutter/material.dart';
+import 'package:flutter_static_story/flutter_static_story.dart';
+
+List<Story> stories() => [
+  Story('$slug/default', () => const $className()),
+];
+
+/// Page created from Flutter Static Studio.
+class $className extends StatelessWidget {
+  const $className({super.key});
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: const Color(0xFFF8FAFC),
+    body: Center(
+      child: Text(
+        '${_titleCase(title)}',
+        style: const TextStyle(
+          color: Color(0xFF0F172A),
+          fontSize: 28,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    ),
+  );
+}
+''');
+      _wireStoryFile(slug);
+      log('Created page story ${file.path}');
+      selectedPageId = slug;
+      selectedTokenGroup = null;
+      notifyListeners();
+    } on Object catch (e) {
+      log('add page: $e');
+    }
+  }
+
+  void _wireStoryFile(String slug) {
+    final main = File('$project/story/main.dart');
+    if (!main.existsSync()) {
+      log(
+        'add page: story/main.dart not found; import stories/$slug.dart manually',
+      );
+      return;
+    }
+    var text = main.readAsStringSync();
+    final alias = slug;
+    final importLine = "import 'stories/$slug.dart' as $alias;";
+    if (!text.contains(importLine)) {
+      final storyImport = RegExp(
+        r"^import 'stories/[^']+' as \w+;\n",
+        multiLine: true,
+      ).allMatches(text).lastOrNull;
+      if (storyImport != null) {
+        text = text.replaceRange(
+          storyImport.end,
+          storyImport.end,
+          '$importLine\n',
+        );
+      } else {
+        text = '$importLine\n$text';
+      }
+    }
+    final spread = '    ...$alias.stories(),\n';
+    if (!text.contains(spread)) {
+      const marker = '  List<Story> build() => [\n';
+      final index = text.indexOf(marker);
+      if (index < 0) {
+        log(
+          'add page: add `...$alias.stories(),` to SendiStories.build() manually',
+        );
+      } else {
+        final insert = index + marker.length;
+        text = text.replaceRange(insert, insert, spread);
+      }
+    }
+    main.writeAsStringSync(text);
+  }
+
+  static String _titleCase(String text) => text
+      .split(RegExp(r'[_\s-]+'))
+      .where((part) => part.isNotEmpty)
+      .map((part) => part[0].toUpperCase() + part.substring(1))
+      .join(' ');
+
+  static String _pageClassName(String slug) =>
+      '${_titleCase(slug).replaceAll(' ', '')}Page';
 
   static const _emptySlotsLeft = 1;
   static const _emptySlotsRight = 1;
@@ -876,8 +983,31 @@ class $name extends StatelessWidget {
     notifyListeners();
   }
 
+  void setPromptPanelOpen(bool open) {
+    if (promptPanelOpen == open) return;
+    promptPanelOpen = open;
+    _saveStudioState();
+    notifyListeners();
+  }
+
+  void setInspectorPanelOpen(bool open) {
+    if (inspectorPanelOpen == open) return;
+    inspectorPanelOpen = open;
+    _saveStudioState();
+    notifyListeners();
+  }
+
+  void setChromePanelsOpen({required bool prompt, required bool inspector}) {
+    if (promptPanelOpen == prompt && inspectorPanelOpen == inspector) return;
+    promptPanelOpen = prompt;
+    inspectorPanelOpen = inspector;
+    _saveStudioState();
+    notifyListeners();
+  }
+
   void toggleLogs() {
     showLogs = !showLogs;
+    _saveStudioState();
     notifyListeners();
   }
 
@@ -1001,7 +1131,8 @@ class $name extends StatelessWidget {
   final _sizes = <String, Size>{};
   Timer? _sizesSave;
 
-  File get _sizesFile => File('$project/.dart_tool/flutter_static_studio.json');
+  File get _studioStateFile =>
+      File('$project/.dart_tool/flutter_static_studio.json');
 
   Size? sizeOf(String id) => _sizes[id];
 
@@ -1026,32 +1157,51 @@ class $name extends StatelessWidget {
     _sizesSave = Timer(const Duration(seconds: 1), _saveSizes);
   }
 
-  void _loadSizes() {
+  void _loadStudioState() {
     try {
-      if (!_sizesFile.existsSync()) return;
-      final json = jsonDecode(_sizesFile.readAsStringSync()) as Map;
-      for (final entry in (json['sizes'] as Map).entries) {
-        final wh = (entry.value as List).cast<num>();
-        _sizes[entry.key as String] = Size(wh[0].toDouble(), wh[1].toDouble());
+      if (!_studioStateFile.existsSync()) return;
+      final json = jsonDecode(_studioStateFile.readAsStringSync()) as Map;
+      final sizes = json['sizes'];
+      if (sizes is Map) {
+        for (final entry in sizes.entries) {
+          final wh = (entry.value as List).cast<num>();
+          _sizes[entry.key as String] = Size(
+            wh[0].toDouble(),
+            wh[1].toDouble(),
+          );
+        }
+      }
+      final panels = json['panels'];
+      if (panels is Map) {
+        promptPanelOpen = panels['prompt'] as bool? ?? promptPanelOpen;
+        inspectorPanelOpen = panels['inspector'] as bool? ?? inspectorPanelOpen;
+        showLogs = panels['logs'] as bool? ?? showLogs;
       }
     } catch (e) {
-      log('sizes: $e');
+      log('studio state: $e');
     }
   }
 
-  void _saveSizes() {
+  void _saveSizes() => _saveStudioState();
+
+  void _saveStudioState() {
     try {
-      _sizesFile.parent.createSync(recursive: true);
-      _sizesFile.writeAsStringSync(
+      _studioStateFile.parent.createSync(recursive: true);
+      _studioStateFile.writeAsStringSync(
         jsonEncode({
           'sizes': {
             for (final e in _sizes.entries)
               e.key: [e.value.width, e.value.height],
           },
+          'panels': {
+            'prompt': promptPanelOpen,
+            'inspector': inspectorPanelOpen,
+            'logs': showLogs,
+          },
         }),
       );
     } catch (e) {
-      log('sizes: $e');
+      log('studio state: $e');
     }
   }
 

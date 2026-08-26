@@ -1211,6 +1211,14 @@ void _isolate(HttpResponse response) {
 String? _projectRootCache;
 String? _projectRoot() {
   if (_projectRootCache != null) return _projectRootCache;
+  const defined = String.fromEnvironment('FLUTTER_STATIC_PROJECT_ROOT');
+  if (defined.isNotEmpty && Directory(defined).existsSync()) {
+    return _projectRootCache = defined;
+  }
+  final env = Platform.environment['FLUTTER_STATIC_PROJECT_ROOT'];
+  if (env != null && env.isNotEmpty && Directory(env).existsSync()) {
+    return _projectRootCache = env;
+  }
   var dir = File(Platform.resolvedExecutable).parent;
   while (dir.path != dir.parent.path) {
     if (File('${dir.path}/pubspec.yaml').existsSync()) {

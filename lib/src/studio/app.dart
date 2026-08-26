@@ -76,9 +76,6 @@ class StudioShell extends StatefulWidget {
 
 class _StudioShellState extends State<StudioShell> {
   final _focus = FocusNode(debugLabel: 'studio shell');
-  bool _promptOpen = true;
-  bool _inspectorOpen = true;
-
   @override
   void dispose() {
     _focus.dispose();
@@ -94,12 +91,15 @@ class _StudioShellState extends State<StudioShell> {
     }
     setState(() {
       if (keyboard.isShiftPressed) {
-        _promptOpen = true;
-        _inspectorOpen = true;
+        widget.controller.setChromePanelsOpen(prompt: true, inspector: true);
       } else {
-        final anyOpen = _promptOpen || _inspectorOpen;
-        _promptOpen = !anyOpen;
-        _inspectorOpen = !anyOpen;
+        final anyOpen =
+            widget.controller.promptPanelOpen ||
+            widget.controller.inspectorPanelOpen;
+        widget.controller.setChromePanelsOpen(
+          prompt: !anyOpen,
+          inspector: !anyOpen,
+        );
       }
     });
     return KeyEventResult.handled;
@@ -116,16 +116,21 @@ class _StudioShellState extends State<StudioShell> {
           SizedBox(width: 224, child: Sidebar(controller: widget.controller)),
           const VerticalDivider(width: 1, color: StudioColors.border),
           _CollapsiblePane(
-            open: _promptOpen,
+            open: widget.controller.promptPanelOpen,
             width: 340,
             label: 'Codex',
             icon: Icons.auto_awesome,
             side: _PaneSide.left,
-            onToggle: () => setState(() => _promptOpen = !_promptOpen),
+            onToggle: () => setState(
+              () => widget.controller.setPromptPanelOpen(
+                !widget.controller.promptPanelOpen,
+              ),
+            ),
             child: PromptPanel(
               controller: widget.controller,
               terminal: widget.terminal,
-              onCollapse: () => setState(() => _promptOpen = false),
+              onCollapse: () =>
+                  setState(() => widget.controller.setPromptPanelOpen(false)),
             ),
           ),
           const VerticalDivider(width: 1, color: StudioColors.border),
@@ -146,16 +151,22 @@ class _StudioShellState extends State<StudioShell> {
           ),
           const VerticalDivider(width: 1, color: StudioColors.border),
           _CollapsiblePane(
-            open: _inspectorOpen,
+            open: widget.controller.inspectorPanelOpen,
             width: 380,
             label: 'Inspector',
             icon: Icons.tune,
             side: _PaneSide.right,
-            onToggle: () => setState(() => _inspectorOpen = !_inspectorOpen),
+            onToggle: () => setState(
+              () => widget.controller.setInspectorPanelOpen(
+                !widget.controller.inspectorPanelOpen,
+              ),
+            ),
             child: _RightPanel(
               controller: widget.controller,
               terminal: widget.terminal,
-              onCollapse: () => setState(() => _inspectorOpen = false),
+              onCollapse: () => setState(
+                () => widget.controller.setInspectorPanelOpen(false),
+              ),
             ),
           ),
         ],

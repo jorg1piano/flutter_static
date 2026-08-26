@@ -26,7 +26,21 @@ class Sidebar extends StatelessWidget {
             child: ListView(
               padding: const EdgeInsets.symmetric(vertical: 8),
               children: [
-                const _Section('Pages'),
+                _Section(
+                  'Pages',
+                  action: IconButton(
+                    tooltip: 'Add page',
+                    onPressed: controller.addPage,
+                    icon: const Icon(Icons.add, size: 15),
+                    color: StudioColors.muted,
+                    visualDensity: VisualDensity.compact,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints.tightFor(
+                      width: 24,
+                      height: 24,
+                    ),
+                  ),
+                ),
                 for (final page in controller.pages)
                   _Item(
                     label: page.title,
@@ -119,14 +133,20 @@ class _Header extends StatelessWidget {
 }
 
 class _Section extends StatelessWidget {
-  const _Section(this.text);
+  const _Section(this.text, {this.action});
 
   final String text;
+  final Widget? action;
 
   @override
   Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-    child: Text(text.toUpperCase(), style: StudioText.section),
+    padding: const EdgeInsets.fromLTRB(16, 12, 8, 4),
+    child: Row(
+      children: [
+        Expanded(child: Text(text.toUpperCase(), style: StudioText.section)),
+        ?action,
+      ],
+    ),
   );
 }
 
