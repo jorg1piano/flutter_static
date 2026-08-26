@@ -10,6 +10,8 @@ executables:
   flutter_static:
 
 dependencies:
+  flutter_static_story:
+    path: packages/flutter_static_story
   args: ^2.7.0
   path: ^1.9.0
   flutter:

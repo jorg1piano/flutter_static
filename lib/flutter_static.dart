@@ -1,6 +1,5 @@
-export 'src/phone_mockup.dart';
-export 'src/specimens.dart';
-export 'src/story.dart';
+export 'package:flutter_static_story/flutter_static_story.dart';
+
 export 'src/tokens.dart';
 // `export 'a.dart' if (dart.library.io) 'b.dart'` picks b when dart:io exists.
 export 'src/server_stub.dart' if (dart.library.io) 'src/server_io.dart';

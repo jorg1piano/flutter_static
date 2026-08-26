@@ -16,3 +16,13 @@ flutter_static inspect buttons/kinds --at 240,80   # which widget is there, whic
 flutter_static tokens list              # design tokens from source
 flutter_static studio --project <dir>   # the macOS Studio
 ```
+
+Package split:
+
+- `packages/flutter_static_story`: pure Flutter story primitives and generic
+  composition widgets (`Story`, `Stories`, storylines, phone mockups,
+  specimens). App repositories can depend on this from their `story/` files
+  without pulling in Studio/macOS plugin dependencies.
+- `flutter_static`: CLI, catalog server, Studio runtime and macOS tooling.
+  This package still owns dependencies such as `speech_to_text` and
+  `flutter_pty`.

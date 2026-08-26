@@ -102,6 +102,13 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "0.4.2"
+  flutter_static_story:
+    dependency: "direct main"
+    description:
+      path: "packages/flutter_static_story"
+      relative: true
+    source: path
+    version: "0.1.0+1"
   flutter_test:
     dependency: "direct dev"
     description: flutter
