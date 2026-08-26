@@ -154,44 +154,31 @@ RadiusScale(radii: {'lg': Radii.lg, ...})
 They take the runtime values, so they follow a token edit through hot
 reload like any component. `SpecimenStyle.dark` for dark sheets.
 
-## The agent
+## The terminal
 
-The chat under the inspector drives a coding agent rather than being
-one. Each prompt starts the agent CLI as a child process in the project
-and streams what it says and does into the panel; the canvas shows the
-result because every save hot reloads the process. Nothing is sent
-anywhere by Studio itself.
+Under the inspector is a terminal (xterm + a pty) running your login
+shell in the project. Your agent runs there, whichever it is: Claude
+Code interactively, codex, a TUI of your own, with its own permission
+prompts, skills and history. Studio does not talk to a model and sends
+nothing anywhere; it types into that terminal:
 
-The default is Claude Code headless:
+- A click on a story on the canvas types its id at the cursor, in
+  backticks: `` `flows/onboarding/welcome/default` ``. Finish the
+  sentence and press Enter.
+- The sparkle button types and runs `claude --append-system-prompt
+  '<context>'`: where the project is, that the catalog is this live
+  process (so never `up`, `run`, `down` or `studio`), how to check work
+  (`dart run flutter_static render`, then read the PNG), where tokens
+  live and how to edit them, and that backticked ids in the prompt are
+  stories.
 
-```text
-claude -p <prompt> --output-format stream-json --verbose
-  --permission-mode acceptEdits --allowedTools <edit, read, render, analyze>
-  --append-system-prompt <context> [--resume <session>]
-```
+Because the shell is a login shell, PATH is your terminal's. The
+"new shell" button restarts it; a shell that exits says so.
 
-The system prompt tells it where it is (the project, the live catalog
-port), what not to do (`up`, `run`, `down`, `studio`: this process is
-the catalog), how to check its work (`dart run flutter_static render`,
-then read the PNG), where tokens live and how to edit them, which page
-is open and which story is selected. Requests that name no story are
-about the selected one. The session id from the first turn resumes the
-conversation on the next; "New conversation" starts over.
-
-Allowed without prompting: file edits under the project, reads, and
-`dart run flutter_static render|list|tokens|add`, `flutter analyze`,
-`dart format`. Anything else the agent asks for is denied, and the
-denial shows in the panel.
-
-Another agent: `FLUTTER_STATIC_AGENT="codex exec {prompt}"` in the
-environment Studio is launched from runs that instead, its output shown
-as plain text. `{system}` and `{resume}` are the other placeholders.
-The `claude` executable (or whatever is named) must be on the PATH of
-that terminal.
-
-Measured on the playground: "change the headline to X and render it to
-confirm" took 34 s and 11 turns (grep, read, edit, render, read the
-PNG) and the canvas had the new copy before the answer arrived.
+An earlier version ran Claude Code headless (`claude -p`) from a chat
+box. It worked, but it was a second, thinner harness around the same
+tool, and whether a subscription covers a third-party app spawning it
+was unclear from the docs. The terminal is the user's own session.
 
 ## Storyline rows in the index
 
@@ -212,8 +199,7 @@ step, the buttons, badges and screens follow within half a second.
 
 ## Not yet
 
-- The agent runs one turn at a time and cannot be interrupted mid-tool;
-  Stop kills the process.
+- The terminal is one shell; no tabs.
 - One project per Studio process.
 - A story whose live layout fails (an `Expanded` under unbounded
   height, say) shows Flutter's error box in its slot; the render

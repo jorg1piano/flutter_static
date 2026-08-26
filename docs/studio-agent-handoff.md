@@ -32,9 +32,10 @@ In flutter_static:
   `storiesIndex`, `findStory`, `storyOnPage`, `storyEnvironment`,
   `renderStoryPng`, `storyShellOf`, `catalogVersion`,
   `catalogReloadTick`, `projectRoot`, and `runFlutterStatic(shell:)`.
-- `lib/src/studio/agent.dart` + `agent_panel.dart`: the chat, a
-  child-process runner for Claude Code headless (or any CLI via
-  `FLUTTER_STATIC_AGENT`), with the Studio context as system prompt.
+- `lib/src/studio/terminal.dart` + `terminal_panel.dart`: an embedded
+  terminal (xterm, flutter_pty) with the user's login shell in the
+  project; selection types story ids into it, a button launches Claude
+  Code with `--append-system-prompt` from `controller.agentContext`.
 - `lib/studio_main.dart`: dogfood entry for this package's demo story.
 - `macos/Runner/*.entitlements`: sandbox off; `MainFlutterWindow.swift`
   opens larger. The `studio` command makes the same two edits in a
@@ -66,10 +67,12 @@ In the playground:
   the canvas. A `tokens set` from a terminal hot reloads the process and
   the live widgets follow; the colour picker does the same from inside.
 
-- The agent: with the welcome story selected, "change the headline to
-  X and render it to confirm" edited `welcome_screen.dart`, rendered,
-  read the PNG and reported in 34 s; the live canvas showed the new copy
-  before the answer.
+- The agent loop, run as `claude -p` with the same system prompt Studio
+  gives the interactive launch: "change the headline to X and render it
+  to confirm" edited `welcome_screen.dart`, rendered, read the PNG and
+  reported in 34 s; the live canvas showed the new copy before the
+  answer. The headless chat panel was then replaced by the terminal
+  (commit history has it).
 
 ## History
 
@@ -87,6 +90,6 @@ streaming or pointer forwarding when they are in the same tree.
 2. Token references in components ("this button uses `Radii.md`") for
    a Figma-like "where is this used" panel. A grep over `lib/` for
    `Group.name` is enough for a first version.
-3. Show the agent's renders inline in the chat (it reads PNGs it made;
-   the panel could show them too), and the diff of each Edit.
+3. Terminal niceties: a tab per shell, Cmd+K to clear, and typing the
+   render command (not only the id) on a modifier-click.
 4. Multi-select and side-by-side device comparison on the canvas.

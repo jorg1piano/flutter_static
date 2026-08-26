@@ -17,9 +17,9 @@ import 'dart:io';
 
 import 'server_io.dart';
 import 'story.dart';
-import 'studio/agent.dart';
 import 'studio/app.dart';
 import 'studio/controller.dart';
+import 'studio/terminal.dart';
 
 void runFlutterStudio(Stories stories, {int? port}) {
   final resolvedPort = port ?? defaultCatalogPort;
@@ -28,14 +28,24 @@ void runFlutterStudio(Stories stories, {int? port}) {
     project: projectRoot() ?? Directory.current.path,
     port: resolvedPort,
   );
-  final agent = AgentSession(
+  final terminal = StudioTerminal(
     project: controller.project,
-    context: controller.agentContext,
+    context: () => controller.agentContext(withSelection: false),
   );
+  // A click on the canvas types the story it selected into the terminal,
+  // at the agent's cursor.
+  String? mentioned;
+  controller.addListener(() {
+    final id = controller.selectedStoryId;
+    if (id != null && id != mentioned && terminal.running) {
+      terminal.mention(id);
+    }
+    mentioned = id;
+  });
   runFlutterStatic(
     stories,
     port: resolvedPort,
     shell: (context, mounts) =>
-        StudioApp(controller: controller, agent: agent, mounts: mounts),
+        StudioApp(controller: controller, terminal: terminal, mounts: mounts),
   );
 }

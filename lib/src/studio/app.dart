@@ -1,11 +1,11 @@
 import 'package:flutter/material.dart';
 
-import 'agent.dart';
-import 'agent_panel.dart';
 import 'canvas.dart';
 import 'controller.dart';
 import 'inspector.dart';
 import 'sidebar.dart';
+import 'terminal.dart';
+import 'terminal_panel.dart';
 import 'theme.dart';
 
 /// The Studio window: the catalog's window mounts painted underneath
@@ -14,12 +14,12 @@ class StudioApp extends StatelessWidget {
   const StudioApp({
     super.key,
     required this.controller,
-    required this.agent,
+    required this.terminal,
     required this.mounts,
   });
 
   final StudioController controller;
-  final AgentSession agent;
+  final StudioTerminal terminal;
   final Widget mounts;
 
   @override
@@ -51,7 +51,7 @@ class StudioApp extends StatelessWidget {
       children: [
         Positioned.fill(child: Center(child: mounts)),
         Positioned.fill(
-          child: StudioShell(controller: controller, agent: agent),
+          child: StudioShell(controller: controller, terminal: terminal),
         ),
       ],
     ),
@@ -59,10 +59,14 @@ class StudioApp extends StatelessWidget {
 }
 
 class StudioShell extends StatelessWidget {
-  const StudioShell({super.key, required this.controller, required this.agent});
+  const StudioShell({
+    super.key,
+    required this.controller,
+    required this.terminal,
+  });
 
   final StudioController controller;
-  final AgentSession agent;
+  final StudioTerminal terminal;
 
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -87,16 +91,13 @@ class StudioShell extends StatelessWidget {
         ),
         const VerticalDivider(width: 1, color: StudioColors.border),
         Container(
-          width: 320,
+          width: 380,
           color: StudioColors.panel,
           child: Column(
             children: [
               Expanded(child: Inspector(controller: controller)),
               const Divider(height: 1, color: StudioColors.border),
-              SizedBox(
-                height: 360,
-                child: AgentPanel(agent: agent, controller: controller),
-              ),
+              SizedBox(height: 400, child: TerminalPanel(terminal: terminal)),
             ],
           ),
         ),

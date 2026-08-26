@@ -103,9 +103,9 @@ class StudioController extends ChangeNotifier {
   /// What the agent should know before a turn: where it is, what the
   /// user is looking at, and how to check its work without touching the
   /// process it is talking to.
-  String agentContext() {
-    final page = selectedPage;
-    final story = selectedStoryId;
+  String agentContext({bool withSelection = true}) {
+    final page = withSelection ? selectedPage : null;
+    final story = withSelection ? selectedStoryId : null;
     final knobArgs = knobs.entries.map((e) => ' -k ${e.key}=${e.value}').join();
     return [
       'You are working inside Flutter Static Studio on the Flutter project '
@@ -123,6 +123,10 @@ class StudioController extends ChangeNotifier {
           'design system lives in the path packages under packages/, the '
           'stories in story/. Keep answers to a few sentences; the user '
           'sees the result on the canvas.',
+      if (!withSelection)
+        'When the user clicks a story on the canvas its id is typed into '
+            'this terminal in backticks, like `buttons/kinds`; a request '
+            'after such an id is about that story.',
       if (page != null)
         'The user is looking at the page "${page.title}" (${page.id}).',
       if (story != null)
