@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import '../phone_mockup.dart';
 import '../server_io.dart';
+import '../widget_pick.dart';
 import 'controller.dart';
 import 'theme.dart';
 import 'tokens_panel.dart';
@@ -127,15 +128,161 @@ class _StoryInspector extends StatelessWidget {
                 ),
               ],
             ),
+            const SectionLabel('Widget'),
+            if (controller.pick == null || controller.pickStoryId != story)
+              Text(
+                'Option-click a widget on the card to find it in the source.',
+                style: StudioText.muted,
+              )
+            else
+              _WidgetChain(controller: controller),
             const SectionLabel('For an agent'),
             SelectableText(
               'flutter_static render $story'
-              '${controller.knobs.entries.map((e) => ' -k ${e.key}=${e.value}').join()}',
+              '${controller.knobs.entries.map((e) => ' -k ${e.key}=${e.value}').join()}'
+              '${_pickedLine(controller)}',
               style: StudioText.monoMuted,
             ),
           ],
         ],
       ],
+    );
+  }
+
+  static String _pickedLine(StudioController controller) {
+    final picked = controller.pickedWidget;
+    final location = picked?.location;
+    if (picked == null || location == null) return '';
+    return '\n${picked.type} at ${controller.scopes.describe(location)}';
+  }
+}
+
+/// The Option-clicked widget and the project's widgets around it,
+/// nearest first; a row selects that widget. Framework and package
+/// widgets in between are counted, not listed.
+class _WidgetChain extends StatelessWidget {
+  const _WidgetChain({required this.controller});
+
+  final StudioController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final chain = controller.pick!.chain;
+    final picked = controller.pickedWidget;
+    final hidden = chain.where((w) => !w.isLocal).length;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (final (i, w) in chain.indexed)
+          if (w.isLocal)
+            _ChainRow(
+              widget: w,
+              selected: i == controller.pickIndex,
+              scopes: controller.scopes,
+              onTap: () => controller.setPickIndex(i),
+            ),
+        if (chain.every((w) => !w.isLocal))
+          Text(
+            'Nothing here is written in the project.',
+            style: StudioText.muted,
+          ),
+        if (hidden > 0)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              '$hidden more from Flutter and packages',
+              style: StudioText.muted,
+            ),
+          ),
+        if (picked?.location != null) ...[
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: [
+              StudioButton(
+                label: 'Copy location',
+                icon: Icons.copy,
+                dense: true,
+                onTap: () => Clipboard.setData(
+                  ClipboardData(text: '${picked!.location}'),
+                ),
+              ),
+              StudioButton(
+                label: 'Open in editor',
+                icon: Icons.code,
+                dense: true,
+                onTap: () => controller.openInEditor(picked!),
+              ),
+            ],
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _ChainRow extends StatelessWidget {
+  const _ChainRow({
+    required this.widget,
+    required this.selected,
+    required this.scopes,
+    required this.onTap,
+  });
+
+  final PickedWidget widget;
+  final bool selected;
+  final SourceScopes scopes;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final location = widget.location;
+    return Material(
+      color: selected ? StudioColors.accentSoft : Colors.transparent,
+      borderRadius: BorderRadius.circular(5),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(5),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      widget.description,
+                      style: StudioText.mono.copyWith(
+                        color: selected
+                            ? StudioColors.accent
+                            : StudioColors.text,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  if (widget.text != null)
+                    Flexible(
+                      child: Text(
+                        '"${widget.text}"',
+                        style: StudioText.muted,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                ],
+              ),
+              Text(
+                location == null
+                    ? 'no source location'
+                    : scopes.describe(location),
+                style: StudioText.monoMuted,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

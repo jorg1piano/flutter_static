@@ -15,6 +15,8 @@ library;
 
 import 'dart:io';
 
+import 'package:flutter/widgets.dart';
+
 import 'server_io.dart';
 import 'story.dart';
 import 'studio/app.dart';
@@ -22,6 +24,8 @@ import 'studio/controller.dart';
 import 'studio/terminal.dart';
 
 void runFlutterStudio(Stories stories, {int? port}) {
+  // The controller listens to the keyboard from construction.
+  WidgetsFlutterBinding.ensureInitialized();
   final resolvedPort = port ?? defaultCatalogPort;
   final controller = StudioController(
     stories: stories,
@@ -33,14 +37,24 @@ void runFlutterStudio(Stories stories, {int? port}) {
     context: () => controller.agentContext(withSelection: false),
   );
   // A click on the canvas types the story it selected into the terminal,
-  // at the agent's cursor.
+  // at the agent's cursor; an Option-click types the picked widget's
+  // source position after it (and again when a chain row picks another).
   String? mentioned;
+  String? mentionedLocation;
   controller.addListener(() {
     final id = controller.selectedStoryId;
     if (id != null && id != mentioned && terminal.running) {
       terminal.mention(id);
     }
     mentioned = id;
+    final location = controller.pickedWidget?.location;
+    final where = location == null
+        ? null
+        : controller.scopes.describe(location);
+    if (where != null && where != mentionedLocation && terminal.running) {
+      terminal.mention(where);
+    }
+    mentionedLocation = where;
   });
   runFlutterStatic(
     stories,

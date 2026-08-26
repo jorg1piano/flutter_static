@@ -12,6 +12,7 @@ design work whose output is real widgets.
 ```text
 flutter_static up                       # catalog for the project in cwd
 flutter_static render buttons/kinds -o out.png
+flutter_static inspect buttons/kinds --at 240,80   # which widget is there, which line made it
 flutter_static tokens list              # design tokens from source
 flutter_static studio --project <dir>   # the macOS Studio
 ```

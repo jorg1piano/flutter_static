@@ -9,12 +9,14 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
 import '../phone_mockup.dart';
 import '../server_io.dart';
 import '../story.dart';
 import '../tokens.dart';
+import '../widget_pick.dart';
 import 'model.dart';
 
 enum CatalogStatus { ready, reloading, error }
@@ -37,6 +39,7 @@ class StudioController extends ChangeNotifier {
   }) {
     catalogVersion.addListener(_onVersion);
     catalogReloadTick.addListener(notifyListeners);
+    HardwareKeyboard.instance.addHandler(_onKey);
     _loadSizes();
     refreshIndex();
     loadTokens();
@@ -123,17 +126,60 @@ class StudioController extends ChangeNotifier {
           'design system lives in the path packages under packages/, the '
           'stories in story/. Keep answers to a few sentences; the user '
           'sees the result on the canvas.',
-      if (!withSelection)
+      if (!withSelection) ...[
         'When the user clicks a story on the canvas its id is typed into '
             'this terminal in backticks, like `buttons/kinds`; a request '
             'after such an id is about that story.',
+        'When the user Option-clicks a widget on the canvas its source '
+            'position is typed in backticks, like '
+            '`story/stories/buttons.dart:13:11`: the file, line and column '
+            'where that widget is constructed. A request after one is '
+            'about that widget; edit that call to change what it shows, '
+            'and its class to change how it looks. '
+            '`dart run flutter_static inspect <story id> --at X,Y` (PNG '
+            'pixels) tells which widgets and lines made a point in a '
+            'render you are looking at.',
+      ],
       if (page != null)
         'The user is looking at the page "${page.title}" (${page.id}).',
       if (story != null)
         'The selected story is `$story`; its render command is '
             '`dart run flutter_static render $story$knobArgs`. Requests '
             'that do not name a story are about this one.',
+      ?_pickContext(),
     ].join('\n');
+  }
+
+  /// The Option-clicked widget, for the agent: the project's widgets from
+  /// the clicked one outward, each with its source line.
+  String? _pickContext() {
+    final pick = this.pick;
+    final picked = pickedWidget;
+    if (pick == null || picked == null || pickStoryId != selectedStoryId) {
+      return null;
+    }
+    String line(PickedWidget w) {
+      final where = w.location == null
+          ? 'no source location'
+          : scopes.describe(w.location!);
+      final text = w.text == null ? '' : ' with text "${w.text}"';
+      return '`${w.type}`$text at $where';
+    }
+
+    final outward = [
+      for (final w in pick.local)
+        if (w != picked) line(w),
+    ];
+    return [
+      'The user Option-clicked a widget on the canvas and selected '
+          '${line(picked)}. Requests about "this", "it" or "the selected '
+          'widget" mean that one; the line is where it is constructed, so '
+          'edit that call to change what it shows and its own class to '
+          'change how it looks.',
+      if (outward.isNotEmpty)
+        'The project\'s widgets around it, from the selection outward: '
+            '${outward.join('; ')}.',
+    ].join(' ');
   }
 
   StudioPage? get selectedPage {
@@ -167,6 +213,8 @@ class StudioController extends ChangeNotifier {
 
   void _onVersion() {
     version = catalogVersion.value;
+    // The picked elements are rebuilt, and their lines may have moved.
+    pick = null;
     refreshIndex();
     // Tokens may have changed on disk (an agent editing the file is the
     // point), and stories may have been added or renamed.
@@ -182,7 +230,86 @@ class StudioController extends ChangeNotifier {
   void selectStory(String? id) {
     selectedStoryId = id;
     selectedTokenGroup = null;
+    pick = null;
     notifyListeners();
+  }
+
+  // --- picking a widget ---------------------------------------------------
+
+  /// Whether Option is held: a click on a live card then picks the widget
+  /// under the pointer instead of reaching it or selecting the card.
+  bool altHeld = false;
+
+  bool _onKey(KeyEvent event) {
+    final alt = HardwareKeyboard.instance.isAltPressed;
+    if (alt != altHeld) {
+      altHeld = alt;
+      notifyListeners();
+    }
+    return false;
+  }
+
+  /// The last Option-click: the widgets under it, nearest first, and
+  /// which story's card it landed on. Cleared by a plain click or a
+  /// reload (the tree is rebuilt, and lines move).
+  WidgetPick? pick;
+  String? pickStoryId;
+
+  /// Which widget in [pick]'s chain is selected; starts at the nearest
+  /// one written in the project.
+  int pickIndex = 0;
+
+  PickedWidget? get pickedWidget {
+    final chain = pick?.chain;
+    if (chain == null || pickIndex >= chain.length) return null;
+    return chain[pickIndex];
+  }
+
+  /// The project and its path packages, for telling a story's widgets
+  /// from a component's and both from the framework's.
+  late final scopes = SourceScopes(
+    project,
+    packageRoots: TokenSet.packageRoots(project),
+  );
+
+  /// Picks the widget at [position] (in [root]'s coordinates) on story
+  /// [id]'s card, and selects the story.
+  void pickAt(String id, RenderObject root, Offset position) {
+    selectedStoryId = id;
+    selectedTokenGroup = null;
+    pickStoryId = id;
+    pick = pickWidgetAt(root, position, scopes);
+    pickIndex = pick?.localIndex ?? 0;
+    notifyListeners();
+  }
+
+  void setPickIndex(int index) {
+    pickIndex = index;
+    notifyListeners();
+  }
+
+  /// Opens [widget]'s line in the editor `FLUTTER_STATIC_EDITOR` names
+  /// (`{file}`, `{line}` and `{column}` placeholders), VS Code's
+  /// `code -g` when unset.
+  Future<void> openInEditor(PickedWidget widget) async {
+    final location = widget.location;
+    if (location == null) return;
+    final template =
+        Platform.environment['FLUTTER_STATIC_EDITOR'] ??
+        'code -g {file}:{line}:{column}';
+    final parts = [
+      for (final part in template.trim().split(RegExp(r'\s+')))
+        part
+            .replaceAll('{file}', location.file)
+            .replaceAll('{line}', '${location.line}')
+            .replaceAll('{column}', '${location.column}'),
+    ];
+    try {
+      final result = await Process.run(parts.first, parts.skip(1).toList());
+      if (result.exitCode != 0) log('editor: ${result.stderr}'.trim());
+    } on ProcessException catch (e) {
+      log('editor: ${e.message}; set FLUTTER_STATIC_EDITOR');
+    }
   }
 
   void selectTokenGroup(String? name) {
@@ -429,6 +556,7 @@ class StudioController extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     _sizesSave?.cancel();
+    HardwareKeyboard.instance.removeHandler(_onKey);
     catalogVersion.removeListener(_onVersion);
     catalogReloadTick.removeListener(notifyListeners);
     super.dispose();

@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'phone_mockup.dart';
 import 'story.dart';
 import 'tokens.dart';
+import 'widget_pick.dart';
 import 'package:flutter/rendering.dart';
 
 /// Port, overridable at build time (flutter_static run --port passes it
@@ -99,6 +100,83 @@ Future<Uint8List> renderStoryPng(
     _onPage(story, device: device, statusBar: statusBar, knobs: knobs),
     background: background,
   );
+}
+
+/// The pixel ratio renders are captured at: PNG pixels per logical pixel.
+const renderScale = 2.0;
+
+/// Which widgets made story [id]'s render, with their source lines, as
+/// `/story/<id>/tree.json` and `/story/<id>/at.json` serve it: the
+/// render's own tree, captured the way the PNG is and walked before it
+/// is torn down. With [at] (logical pixels from the render's top-left),
+/// the widgets under that point, nearest first; without, the project's
+/// widgets in the whole render, nested. Bounds and coordinates in the
+/// result are PNG pixels, the ones an agent measures on the render.
+Future<Map<String, Object?>> inspectStory(
+  Stories stories,
+  String id, {
+  PhoneSpec? device,
+  bool statusBar = false,
+  Map<String, String> knobs = const {},
+  Offset? at,
+}) {
+  final story = findStory(stories, id);
+  if (story == null) throw ArgumentError.value(id, 'id', 'no such story');
+  final onPage = _onPage(
+    story,
+    device: device,
+    statusBar: statusBar,
+    knobs: knobs,
+  );
+  // Behind the capture queue like a render: one tree pumps at a time.
+  final previous = _captureQueue ?? Future<void>.value();
+  final completer = Completer<void>();
+  _captureQueue = completer.future;
+  return previous.then((_) async {
+    try {
+      if (_reloadPending) await _awaitFresh();
+      final scopes = _sourceScopes();
+      Map<String, Object?>? result;
+      await _capture(
+        onPage,
+        inspect: (boundary) {
+          final size = boundary.size;
+          result = {
+            'story': id,
+            'scale': renderScale,
+            'size': [
+              (size.width * renderScale).round(),
+              (size.height * renderScale).round(),
+            ],
+            if (at == null)
+              'widgets': widgetTreeJson(boundary, scopes, scale: renderScale)
+            else ...{
+              'x': (at.dx * renderScale).round(),
+              'y': (at.dy * renderScale).round(),
+              // Nothing under the point (outside the render): an empty
+              // chain, so clients can count on the key.
+              ...pickWidgetAt(
+                    boundary,
+                    at,
+                    scopes,
+                  )?.toJson(scopes, scale: renderScale) ??
+                  const {'chain': <Object>[]},
+            },
+          };
+        },
+      );
+      return result ?? (throw StateError('no render tree to inspect'));
+    } finally {
+      completer.complete();
+    }
+  });
+}
+
+/// The project and its path packages, for telling its widgets from the
+/// framework's.
+SourceScopes _sourceScopes() {
+  final root = _projectRoot() ?? Directory.current.path;
+  return SourceScopes(root, packageRoots: TokenSet.packageRoots(root));
 }
 
 /// How a story lays out, learnt at its first capture: at its natural
@@ -755,6 +833,46 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
         response.flush();
         _eventClients.add(response);
         response.done.whenComplete(() => _eventClients.remove(response));
+      } else if (path.startsWith('/story/') &&
+          (path.endsWith('/at.json') || path.endsWith('/tree.json'))) {
+        // Which widgets made the render, with their source lines: under
+        // a point (`at.json?x=&y=`, PNG pixels) or the whole tree. Same
+        // options and freshness gate as the PNG.
+        final tree = path.endsWith('/tree.json');
+        final suffix = tree ? '/tree.json' : '/at.json';
+        final id = Uri.decodeComponent(
+          path.substring('/story/'.length, path.length - suffix.length),
+        );
+        final matches = stories.all().where((s) => s.id == id);
+        await _awaitEdited(_editedParam(request), _settleParam(request));
+        final params = request.uri.queryParameters;
+        final x = double.tryParse(params['x'] ?? '');
+        final y = double.tryParse(params['y'] ?? '');
+        if (matches.isEmpty) {
+          response.statusCode = HttpStatus.notFound;
+        } else if (_reloadError != null) {
+          response.statusCode = HttpStatus.conflict;
+          response.headers.contentType = ContentType.text;
+          response.write(
+            'hot reload failed; this would inspect the pre-edit code.\n'
+            'Fix the error and save again:\n\n$_reloadError\n',
+          );
+        } else if (!tree && (x == null || y == null)) {
+          response.statusCode = HttpStatus.badRequest;
+          response.write('x and y are required: pixels in the story\'s PNG');
+        } else {
+          final json = await inspectStory(
+            stories,
+            id,
+            device: PhoneSpec.byName(params['device']),
+            statusBar: params['status'] == '1',
+            knobs: _knobsParam(request, _lineOf(stories, id)),
+            at: tree ? null : Offset(x! / renderScale, y! / renderScale),
+          );
+          response.headers.contentType = ContentType.json;
+          response.write(jsonEncode(json));
+        }
+        await response.close();
       } else if (path.startsWith('/story/') && path.endsWith('.png')) {
         final id = path.substring(
           '/story/'.length,
@@ -1125,13 +1243,21 @@ ContentType _mimeFor(String path) {
   }
 }
 
-Future<Uint8List> _capture(Story story, {bool offscreenOnly = false}) async {
+/// A look at a story's render tree while it is laid out and painted,
+/// instead of its PNG (which is then not encoded).
+typedef RenderInspector = void Function(RenderRepaintBoundary boundary);
+
+Future<Uint8List> _capture(
+  Story story, {
+  bool offscreenOnly = false,
+  RenderInspector? inspect,
+}) async {
   if (_needsWindow.contains(story.id)) {
     if (offscreenOnly) throw StateError('needs window');
-    return _captureOnWindow(story);
+    return _captureOnWindow(story, inspect: inspect);
   }
   try {
-    return await _captureOffscreen(story);
+    return await _captureOffscreen(story, inspect: inspect);
   } catch (e, st) {
     _needsWindow.add(story.id);
     _storyShells[_baseId(story.id)] = StoryShell.window;
@@ -1143,7 +1269,7 @@ Future<Uint8List> _capture(Story story, {bool offscreenOnly = false}) async {
       'flutter_static: offscreen capture failed for ${story.id} ($e); '
       'falling back to window capture',
     );
-    return _captureOnWindow(story);
+    return _captureOnWindow(story, inspect: inspect);
   }
 }
 
@@ -1182,7 +1308,10 @@ void _installErrorHook() {
   };
 }
 
-Future<Uint8List> _captureOffscreen(Story story) async {
+Future<Uint8List> _captureOffscreen(
+  Story story, {
+  RenderInspector? inspect,
+}) async {
   final binding = WidgetsBinding.instance;
   final theme = ThemeData();
 
@@ -1342,6 +1471,13 @@ Future<Uint8List> _captureOffscreen(Story story) async {
     if (boundary == null) {
       throw StateError('offscreen boundary not mounted');
     }
+    if (inspect != null) {
+      inspect(boundary);
+      mark('inspect');
+      _lastTrace = '${story.id}: $trace';
+      _traceLog(_lastTrace);
+      return Uint8List(0);
+    }
     final image = await boundary.toImage(pixelRatio: 2);
     mark('toImage');
     final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
@@ -1384,12 +1520,19 @@ Future<Uint8List> _captureOffscreen(Story story) async {
   }
 }
 
-Future<Uint8List> _captureOnWindow(Story story) async {
+Future<Uint8List> _captureOnWindow(
+  Story story, {
+  RenderInspector? inspect,
+}) async {
   _mountWindowStory(story);
   await (_windowSettled ??= _settleWindow());
   final boundary =
       _windowKeys[story.id]!.currentContext!.findRenderObject()
           as RenderRepaintBoundary;
+  if (inspect != null) {
+    inspect(boundary);
+    return Uint8List(0);
+  }
   final image = await boundary.toImage(pixelRatio: 2);
   final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
   image.dispose();

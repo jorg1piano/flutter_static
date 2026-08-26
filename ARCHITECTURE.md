@@ -37,7 +37,11 @@ a browser gallery for humans, HTTP endpoints and MCP tools for agents.
 
 ### HTTP server (in-app, shelf)
 - `GET /` plain HTML/JS gallery. Real DOM, agent-readable, no Flutter web canvas.
-- `GET /story/<id>.png`, `GET /story/<id>/semantics.json`, `GET /index.json`
+- `GET /story/<id>.png`, `GET /index.json`, `GET /tokens.json`
+- `GET /story/<id>/at.json?x=&y=`: the widgets under a PNG pixel, nearest first,
+  each with the source file, line and column that constructed it (from the
+  debug build's `--track-widget-creation` stamps). `GET /story/<id>/tree.json`:
+  the project's widgets in the render, nested, with bounds.
 - SSE endpoint for gallery live reload.
 - Later: `POST /story/<id>/tap?node=N` for interactive stories.
 

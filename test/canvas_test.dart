@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_static/src/server_io.dart';
 import 'package:flutter_static/src/story.dart';
 import 'package:flutter_static/src/studio/canvas.dart';
@@ -74,6 +75,40 @@ void main() {
     await tester.pumpAndSettle();
     expect(taps, 0);
     expect(controller.selectedStoryId, 'buttons/one');
+    await tester.pump(const Duration(seconds: 1)); // the sizes-save timer
+  });
+
+  testWidgets('option-click picks the widget under the pointer, in interact '
+      'mode too, and reaches nothing', (tester) async {
+    controller.interact = true;
+    await tester.pumpWidget(canvas());
+    await tester.pumpAndSettle();
+
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+    await tester.pump();
+    expect(controller.altHeld, isTrue);
+    // The card absorbs the click by design; the Listener above it picks.
+    await tester.tap(find.text('Press me'), warnIfMissed: false);
+    await tester.pumpAndSettle();
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+    await tester.pump();
+
+    expect(taps, 0);
+    expect(controller.selectedStoryId, 'buttons/one');
+    expect(controller.pickStoryId, 'buttons/one');
+    final pick = controller.pick!;
+    final text = pick.chain.firstWhere((w) => w.type == 'Text');
+    expect(text.text, 'Press me');
+    expect(text.location!.file, endsWith('canvas_test.dart'));
+    // The story's widgets and nothing of Studio's above the mount.
+    expect(pick.chain.map((w) => w.type), contains('GestureDetector'));
+    expect(pick.chain.map((w) => w.type), isNot(contains('StoryCard')));
+
+    // A plain click afterwards reaches the widget and clears the pick.
+    await tester.tap(find.text('Press me'));
+    await tester.pumpAndSettle();
+    expect(taps, 1);
+    expect(controller.pick, isNull);
     await tester.pump(const Duration(seconds: 1)); // the sizes-save timer
   });
 }

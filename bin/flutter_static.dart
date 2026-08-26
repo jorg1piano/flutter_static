@@ -28,6 +28,7 @@ Future<void> main(List<String> arguments) async {
         ..addCommand(_SetupCommand())
         ..addCommand(_ListCommand())
         ..addCommand(_RenderCommand())
+        ..addCommand(_InspectCommand())
         ..addCommand(_PortCommand())
         ..addCommand(_TokensCommand())
         ..addCommand(_AddCommand());
@@ -422,21 +423,7 @@ Future<String?> _renderStory(
   String out, {
   Map<String, String> knobs = const {},
 }) async {
-  // A render sent right after a save can reach the catalog before the
-  // watcher's notice of that save. `edited` is the newest source mtime
-  // under the watched roots; when it is newer than the last reload, the
-  // catalog waits for the next one. `settle` is the fallback outside a
-  // project, where there are no roots to walk.
-  final edited = _newestSourceMtime();
-  final query = StringBuffer(
-    edited == null ? 'settle=250' : 'edited=${edited.millisecondsSinceEpoch}',
-  );
-  for (final entry in knobs.entries) {
-    query.write(
-      '&k.${Uri.encodeQueryComponent(entry.key)}='
-      '${Uri.encodeQueryComponent(entry.value)}',
-    );
-  }
+  final query = _freshQuery(knobs);
   final bytes = await _fetch(
     '$url/story/$id.png?$query',
     url,
@@ -1601,17 +1588,116 @@ class _RenderCommand extends Command<int> {
     final url = (argResults!['url'] as String?) ?? _defaultUrl();
     final out =
         (argResults!['out'] as String?) ?? '${id.replaceAll('/', '_')}.png';
-    final knobs = <String, String>{};
-    for (final choice in argResults!['knob'] as List<String>) {
-      final eq = choice.indexOf('=');
-      if (eq < 1 || eq == choice.length - 1) {
-        usageException('--knob takes id=option; got "$choice".');
-      }
-      knobs[choice.substring(0, eq)] = choice.substring(eq + 1);
-    }
+    final knobs = _knobChoices(argResults!['knob'] as List<String>);
     if (await _renderStory(id, url, out, knobs: knobs) == null) return 1;
     stdout.writeln(out);
     return 0;
+  }
+}
+
+/// Which widgets made a render and where they are written: the widget
+/// under a point of the PNG, or the whole tree. The agent-side twin of
+/// Studio's Option-click.
+class _InspectCommand extends Command<int> {
+  _InspectCommand() {
+    argParser
+      ..addOption(
+        'at',
+        valueHelp: 'X,Y',
+        help:
+            'A point in pixels of the story\'s PNG (as `render` writes it): '
+            'the widgets under it, nearest first, instead of the whole tree.',
+      )
+      ..addMultiOption(
+        'knob',
+        abbr: 'k',
+        valueHelp: 'id=option',
+        help: 'A storyline knob choice, as for `render`. Repeatable.',
+      )
+      ..addFlag('json', negatable: false, help: 'Print the raw JSON.')
+      ..addOption('url', help: _urlHelp);
+  }
+
+  @override
+  String get name => 'inspect';
+  @override
+  String get description =>
+      'Which widgets are in a story\'s render, and which source lines '
+      'made them.';
+  @override
+  String get invocation =>
+      'flutter_static inspect <story-id> [--at X,Y] [-k knob=option] [--json]';
+
+  @override
+  Future<int> run() async {
+    final rest = argResults!.rest;
+    if (rest.isEmpty) usageException('A story id is required.');
+    final id = rest.first;
+    final url = (argResults!['url'] as String?) ?? _defaultUrl();
+    final knobs = _knobChoices(argResults!['knob'] as List<String>);
+    final at = argResults!['at'] as String?;
+    var query = _freshQuery(knobs);
+    var kind = 'tree';
+    if (at != null) {
+      final xy = at.split(',').map((s) => double.tryParse(s.trim())).toList();
+      if (xy.length != 2 || xy.contains(null)) {
+        usageException('--at takes X,Y in PNG pixels; got "$at".');
+      }
+      query += '&x=${xy[0]}&y=${xy[1]}';
+      kind = 'at';
+    }
+    final body = await _fetch(
+      '$url/story/$id/$kind.json?$query',
+      url,
+      notFound: 'Story "$id" not found. See: flutter_static list',
+    );
+    if (body == null) return 1;
+    final text = utf8.decode(body);
+    if (argResults!['json'] as bool) {
+      stdout.writeln(text);
+      return 0;
+    }
+    final json = jsonDecode(text) as Map<String, dynamic>;
+    if (kind == 'tree') {
+      final widgets = (json['widgets'] as List).cast<Map<String, dynamic>>();
+      if (widgets.isEmpty) {
+        stdout.writeln('No widgets from this project in $id.');
+      }
+      _printTree(widgets, 0);
+    } else {
+      final chain = (json['chain'] as List).cast<Map<String, dynamic>>();
+      if (chain.isEmpty) {
+        stdout.writeln(
+          'Nothing from this project at ${json['x']},${json['y']}.',
+        );
+      } else {
+        stdout.writeln('At ${json['x']},${json['y']}, nearest first:');
+        for (final w in chain) {
+          stdout.writeln('  ${_widgetLine(w)}');
+        }
+      }
+    }
+    return 0;
+  }
+
+  void _printTree(List<Map<String, dynamic>> widgets, int depth) {
+    for (final w in widgets) {
+      stdout.writeln('${'  ' * depth}${_widgetLine(w)}');
+      _printTree(
+        (w['children'] as List).cast<Map<String, dynamic>>(),
+        depth + 1,
+      );
+    }
+  }
+
+  /// `AppButton "Primary"  story/stories/buttons.dart:13:11  @24,24 120x40`
+  static String _widgetLine(Map<String, dynamic> w) {
+    final text = w['text'] == null ? '' : ' "${w['text']}"';
+    final bounds = w['bounds'] as List?;
+    final where = bounds == null
+        ? ''
+        : '  @${bounds[0]},${bounds[1]} ${bounds[2]}x${bounds[3]}';
+    return '${w['widget']}$text  ${w['location'] ?? 'no source location'}$where';
   }
 }
 
@@ -1760,6 +1846,40 @@ class _PortRegistry {
       return false;
     }
   }
+}
+
+/// The query that makes a request see the latest save, plus the [knobs].
+///
+/// A request sent right after a save can reach the catalog before the
+/// watcher's notice of that save. `edited` is the newest source mtime
+/// under the watched roots; when it is newer than the last reload, the
+/// catalog waits for the next one. `settle` is the fallback outside a
+/// project, where there are no roots to walk.
+String _freshQuery(Map<String, String> knobs) {
+  final edited = _newestSourceMtime();
+  final query = StringBuffer(
+    edited == null ? 'settle=250' : 'edited=${edited.millisecondsSinceEpoch}',
+  );
+  for (final entry in knobs.entries) {
+    query.write(
+      '&k.${Uri.encodeQueryComponent(entry.key)}='
+      '${Uri.encodeQueryComponent(entry.value)}',
+    );
+  }
+  return '$query';
+}
+
+/// `id=option` choices from a repeated `--knob`.
+Map<String, String> _knobChoices(List<String> choices) {
+  final knobs = <String, String>{};
+  for (final choice in choices) {
+    final eq = choice.indexOf('=');
+    if (eq < 1 || eq == choice.length - 1) {
+      throw UsageException('--knob takes id=option; got "$choice".', '');
+    }
+    knobs[choice.substring(0, eq)] = choice.substring(eq + 1);
+  }
+  return knobs;
 }
 
 /// GET [url]; on failure print a hint mentioning [serverUrl] and return null.

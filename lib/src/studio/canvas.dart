@@ -269,14 +269,42 @@ class StoryCard extends StatelessWidget {
     // tells us how it lays out, and its PNG stands in meanwhile.
     if (live == null) controller.discover(id);
     final png = live == true ? null : controller.png(id);
-    final Widget body;
+    Widget body;
     if (live == true) {
       body = _LiveSlot(
         interact: controller.interact,
+        altHeld: controller.altHeld,
         onSelect: () => controller.selectStory(id),
+        onPick: (root, position) => controller.pickAt(id, root, position),
         onSize: (size) => controller.noteSize(id, size),
         child: controller.mount(id),
       );
+      // The Option-clicked widget, outlined where it sits: the card's
+      // origin is the mounted story's, so its bounds apply as they are.
+      final picked = controller.pickStoryId == id
+          ? controller.pickedWidget?.bounds
+          : null;
+      if (picked != null) {
+        body = Stack(
+          clipBehavior: Clip.none,
+          children: [
+            body,
+            Positioned.fromRect(
+              rect: picked,
+              child: const IgnorePointer(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Color(0x227C9CFF),
+                    border: Border.fromBorderSide(
+                      BorderSide(color: StudioColors.accent, width: 1.5),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      }
     } else {
       body = _RenderSlot(
         id: id,
@@ -311,18 +339,26 @@ class StoryCard extends StatelessWidget {
 
 /// A live widget. In select mode a click selects the card and nothing
 /// reaches the widget; in interact mode events go through and a pointer
-/// down still selects.
+/// down still selects. With Option held a click picks the widget under
+/// the pointer in either mode, and reaches nothing.
 class _LiveSlot extends StatefulWidget {
   const _LiveSlot({
     required this.child,
     required this.interact,
+    required this.altHeld,
     required this.onSelect,
+    required this.onPick,
     required this.onSize,
   });
 
   final Widget child;
   final bool interact;
+  final bool altHeld;
   final VoidCallback onSelect;
+
+  /// An Option-click: the mounted story's render object and the pointer
+  /// in its coordinates.
+  final void Function(RenderObject root, Offset position) onPick;
 
   /// Reports the mounted story's size after each layout, so a later
   /// placeholder for it takes the same room.
@@ -333,7 +369,28 @@ class _LiveSlot extends StatefulWidget {
 }
 
 class _LiveSlotState extends State<_LiveSlot> {
+  final _boundary = GlobalKey();
   Size? _reported;
+
+  /// Whether the pointer that is down started a pick: its tap must not
+  /// select the card, which would clear the pick.
+  bool _picking = false;
+
+  void _onPointerDown(PointerDownEvent event) {
+    _picking = widget.altHeld;
+    if (_picking) {
+      final box = _boundary.currentContext?.findRenderObject();
+      if (box is RenderBox) {
+        widget.onPick(box, box.globalToLocal(event.position));
+      }
+    } else if (widget.interact) {
+      widget.onSelect();
+    }
+  }
+
+  void _onTap() {
+    if (!_picking) widget.onSelect();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -346,14 +403,22 @@ class _LiveSlotState extends State<_LiveSlot> {
       }
     });
     // Its own layer: an animating story repaints itself, not the canvas.
-    final isolated = RepaintBoundary(child: widget.child);
-    if (widget.interact) {
-      return Listener(onPointerDown: (_) => widget.onSelect(), child: isolated);
-    }
-    return GestureDetector(
-      onTap: widget.onSelect,
-      behavior: HitTestBehavior.opaque,
-      child: AbsorbPointer(child: isolated),
+    final isolated = RepaintBoundary(key: _boundary, child: widget.child);
+    final absorb = !widget.interact || widget.altHeld;
+    return MouseRegion(
+      cursor: widget.altHeld ? SystemMouseCursors.precise : MouseCursor.defer,
+      child: Listener(
+        onPointerDown: _onPointerDown,
+        // The tap recognizer keeps the canvas's own (which deselects)
+        // from winning the click.
+        child: absorb
+            ? GestureDetector(
+                onTap: _onTap,
+                behavior: HitTestBehavior.opaque,
+                child: AbsorbPointer(child: isolated),
+              )
+            : isolated,
+      ),
     );
   }
 }

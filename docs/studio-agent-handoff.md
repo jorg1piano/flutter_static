@@ -36,6 +36,11 @@ In flutter_static:
   terminal (xterm, flutter_pty) with the user's login shell in the
   project; selection types story ids into it, a button launches Claude
   Code with `--append-system-prompt` from `controller.agentContext`.
+- `lib/src/widget_pick.dart`: a point on a render tree to the widgets
+  that made it, with source lines (the debug build's creation stamps
+  read through the inspector's JSON). Option-click on the canvas, the
+  chain in the inspector, the location typed into the terminal,
+  `GET /story/<id>/at.json|tree.json` and `flutter_static inspect`.
 - `lib/studio_main.dart`: dogfood entry for this package's demo story.
 - `macos/Runner/*.entitlements`: sandbox off; `MainFlutterWindow.swift`
   opens larger. The `studio` command makes the same two edits in a
@@ -84,9 +89,10 @@ streaming or pointer forwarding when they are in the same tree.
 
 ## Next
 
-1. A story's source location in `/index.json` (the `Story` could carry
-   it, or the CLI's `add story` could register it), so the inspector
-   can open the file and an agent can be pointed at it.
+1. A story's source location in `/index.json`, for listing without a
+   render. Option-click and `inspect` already give the line of the
+   outermost widget inside the `Story(...)`; a grep for the id literal
+   in `story/` would give the `Story` line itself.
 2. Token references in components ("this button uses `Radii.md`") for
    a Figma-like "where is this used" panel. A grep over `lib/` for
    `Group.name` is enough for a first version.

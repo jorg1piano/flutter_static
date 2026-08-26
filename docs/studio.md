@@ -97,6 +97,46 @@ pointer down still selects). The canvas is a render target: nothing on
 it is draggable. Arrangement is the storyline's rows and cells in Dart,
 which is what the agent reads.
 
+## Finding a widget in the source
+
+Option-click a widget on a live card and the inspector lists the
+project's widgets from that one outward, each with the file, line and
+column it is constructed at: `Text "Primary"` at
+`packages/app_ui/lib/src/button.dart:57:9`, inside `AppButton` at
+`story/stories/buttons.dart:13:11`, inside `HStack` at `:10:7`. The
+outermost story-file entry is inside the `Story(...)` that defines the
+story. The nearest one is selected and outlined on the card; a row
+selects another. "Copy location" copies `file:line:column`; "Open in
+editor" runs `code -g file:line:column`, or whatever
+`FLUTTER_STATIC_EDITOR` names, with `{file}`, `{line}` and `{column}`
+placeholders. The click reaches nothing, in interact mode too. With a
+shell running in the terminal, the pick also types its location at the
+cursor in backticks, the way a click types the story id, and the Claude
+launch context says what such a token means.
+
+The lines come from the widgets themselves. Every debug build compiles
+with `--track-widget-creation`, which stamps each widget constructor
+call with its source position for the widget inspector; Studio hit
+tests the mounted render tree the way the inspector does, walks up the
+element chain, and reads the stamps back through the inspector's JSON
+(`lib/src/widget_pick.dart`). Nothing in the project has to change, and
+the stamps follow hot reload. Widgets built by a helper function land in
+the helper's file, which is what the chain shows.
+
+The same walk runs on the offscreen render tree for agents, which see a
+PNG and measure pixels on it:
+
+```text
+flutter_static inspect buttons/kinds --at 240,80    # widgets under a PNG pixel, nearest first
+flutter_static inspect buttons/kinds                # the project's widgets in the render, nested
+GET /story/<id>/at.json?x=240&y=80                  # same, as JSON
+GET /story/<id>/tree.json
+```
+
+Coordinates and bounds are pixels of the 2x PNG `render` writes.
+Both take `device`, `status` and `k.<knob>` like the PNG, and wait for
+the latest save the same way.
+
 A save that does not compile shows the compiler's message in a drawer
 under the canvas and leaves the last good code running.
 
@@ -165,12 +205,17 @@ nothing anywhere; it types into that terminal:
 - A click on a story on the canvas types its id at the cursor, in
   backticks: `` `flows/onboarding/welcome/default` ``. Finish the
   sentence and press Enter.
+- An Option-click on a widget types its source position the same way:
+  `` `story/stories/buttons.dart:13:11` ``, the file, line and column
+  that construct it (see "Finding a widget in the source"). Picking
+  another row in the inspector's chain types that one.
 - The sparkle button types and runs `claude --append-system-prompt
   '<context>'`: where the project is, that the catalog is this live
   process (so never `up`, `run`, `down` or `studio`), how to check work
   (`dart run flutter_static render`, then read the PNG), where tokens
   live and how to edit them, and that backticked ids in the prompt are
-  stories.
+  stories and backticked `file:line:column` tokens are widgets the user
+  Option-clicked.
 
 Because the shell is a login shell, PATH is your terminal's. The
 "new shell" button restarts it; a shell that exits says so.
@@ -204,6 +249,10 @@ step, the buttons, badges and screens follow within half a second.
 - A story whose live layout fails (an `Expanded` under unbounded
   height, say) shows Flutter's error box in its slot; the render
   pipeline's shell detection covers the common cases, not all.
-- The inspector does not show a story's source file: `/index.json` has
-  no source locations.
+- `/index.json` has no source locations; a story's line is found by
+  Option-clicking it (or `inspect`), not listed.
+- Option-click works on live cards only; a story shown as its render
+  (a window story, "Render" mode) answers through `inspect` instead.
+- A pick names the constructor call, not the argument: the line of
+  `AppButton(`, not of its `label:`.
 - Editing a text token's colour, or tokens declared outside a class.
