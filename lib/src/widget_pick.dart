@@ -4,7 +4,7 @@
 /// each widget constructor call with its file, line and column. The
 /// inspector's JSON is the public way to read that stamp back, so a hit
 /// test on a live render tree plus a walk up the element chain answers
-/// "where was this written". Studio uses it for Option-click; the catalog
+/// "where was this written". Studio uses it for canvas inspection; the catalog
 /// serves it over HTTP so an agent can ask the same about a point in a
 /// render it is looking at.
 ///

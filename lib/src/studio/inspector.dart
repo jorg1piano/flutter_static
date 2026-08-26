@@ -131,7 +131,7 @@ class _StoryInspector extends StatelessWidget {
             const SectionLabel('Widget'),
             if (controller.pick == null || controller.pickStoryId != story)
               Text(
-                'Option-click a widget on the card to find it in the source.',
+                'Click a widget on the card to find it in the source.',
                 style: StudioText.muted,
               )
             else
@@ -157,7 +157,7 @@ class _StoryInspector extends StatelessWidget {
   }
 }
 
-/// The Option-clicked widget and the project's widgets around it,
+/// The clicked widget and the project's widgets around it,
 /// nearest first; a row selects that widget. Framework and package
 /// widgets in between are counted, not listed.
 class _WidgetChain extends StatelessWidget {

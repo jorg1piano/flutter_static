@@ -36,9 +36,8 @@ void runFlutterStudio(Stories stories, {int? port}) {
     project: controller.project,
     context: () => controller.agentContext(withSelection: false),
   );
-  // A click on the canvas types the story it selected into the terminal,
-  // at the agent's cursor; an Option-click types the picked widget's
-  // source position after it (and again when a chain row picks another).
+  // A click on the canvas types the picked widget's source position into
+  // the terminal; render-only cards type the story they selected.
   String? mentioned;
   String? mentionedLocation;
   controller.addListener(() {

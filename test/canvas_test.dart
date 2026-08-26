@@ -30,6 +30,35 @@ class _ButtonStories extends Stories {
   ];
 }
 
+class _LineStories extends Stories {
+  const _LineStories();
+
+  @override
+  List<Story> build() => const [];
+
+  @override
+  List<Storyline> storylines() => [
+    Storyline(
+      'flows/onboarding',
+      rows: [
+        StorylineRow(
+          'Top',
+          cells: [
+            Cell('welcome', variants: [Story('base', () => const Text('A'))]),
+            Cell('signin', variants: [Story('base', () => const Text('B'))]),
+          ],
+        ),
+        StorylineRow(
+          'Bottom',
+          cells: [
+            Cell('home', variants: [Story('base', () => const Text('C'))]),
+          ],
+        ),
+      ],
+    ),
+  ];
+}
+
 void main() {
   late StudioController controller;
 
@@ -55,46 +84,15 @@ void main() {
     ),
   );
 
-  testWidgets('interact mode: a click reaches the widget and selects', (
+  testWidgets('a plain click picks the widget under the pointer', (
     tester,
   ) async {
     controller.interact = true;
     await tester.pumpWidget(canvas());
     await tester.pumpAndSettle();
     expect(find.text('Press me'), findsOneWidget);
-    await tester.tap(find.text('Press me'));
-    await tester.pumpAndSettle();
-    expect(taps, 1);
-    expect(controller.selectedStoryId, 'buttons/one');
-    await tester.pump(const Duration(seconds: 1)); // the sizes-save timer
-  });
-
-  testWidgets('select mode: a click only selects', (tester) async {
-    controller.interact = false;
-    await tester.pumpWidget(canvas());
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Press me'));
-    await tester.pumpAndSettle();
-    expect(taps, 0);
-    expect(controller.selectedStoryId, 'buttons/one');
-    await tester.pump(const Duration(seconds: 1)); // the sizes-save timer
-  });
-
-  testWidgets('option-click picks the widget under the pointer, in interact '
-      'mode too, and reaches nothing', (tester) async {
-    controller.interact = true;
-    await tester.pumpWidget(canvas());
-    await tester.pumpAndSettle();
-
-    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
-    await tester.pump();
-    expect(controller.altHeld, isTrue);
-    // The card absorbs the click by design; the Listener above it picks.
     await tester.tap(find.text('Press me'), warnIfMissed: false);
     await tester.pumpAndSettle();
-    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
-    await tester.pump();
-
     expect(taps, 0);
     expect(controller.selectedStoryId, 'buttons/one');
     expect(controller.pickStoryId, 'buttons/one');
@@ -105,13 +103,120 @@ void main() {
     // The story's widgets and nothing of Studio's above the mount.
     expect(pick.chain.map((w) => w.type), contains('GestureDetector'));
     expect(pick.chain.map((w) => w.type), isNot(contains('StoryCard')));
+    await tester.pump(const Duration(seconds: 1)); // the sizes-save timer
+  });
 
-    // A plain click afterwards reaches the widget and clears the pick.
+  testWidgets('plain click inspects in select mode too', (tester) async {
+    controller.interact = false;
+    await tester.pumpWidget(canvas());
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Press me'), warnIfMissed: false);
+    await tester.pumpAndSettle();
+    expect(taps, 0);
+    expect(controller.selectedStoryId, 'buttons/one');
+    expect(controller.pick, isNotNull);
+    await tester.pump(const Duration(seconds: 1)); // the sizes-save timer
+  });
+
+  testWidgets('option-click reaches the widget inside the mockup', (
+    tester,
+  ) async {
+    controller.interact = true;
+    await tester.pumpWidget(canvas());
+    await tester.pumpAndSettle();
+
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+    await tester.pump();
+    expect(controller.altHeld, isTrue);
     await tester.tap(find.text('Press me'));
     await tester.pumpAndSettle();
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+    await tester.pump();
+
     expect(taps, 1);
+    expect(controller.selectedStoryId, 'buttons/one');
     expect(controller.pick, isNull);
     await tester.pump(const Duration(seconds: 1)); // the sizes-save timer
+  });
+
+  testWidgets('dragging pans the canvas only while Space is held', (
+    tester,
+  ) async {
+    await tester.pumpWidget(canvas());
+    await tester.pumpAndSettle();
+    final viewer = tester.widget<InteractiveViewer>(
+      find.byType(InteractiveViewer),
+    );
+    final transform = viewer.transformationController!;
+    final before = transform.value.clone();
+
+    await tester.drag(find.byType(InteractiveViewer), const Offset(80, 40));
+    await tester.pumpAndSettle();
+    expect(transform.value, before);
+
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.space);
+    await tester.pump();
+    expect(controller.spaceHeld, isTrue);
+    final canvasCursor = find.byKey(const Key('canvas-pan-cursor'));
+    expect(
+      tester.widget<MouseRegion>(canvasCursor).cursor,
+      SystemMouseCursors.grab,
+    );
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byType(InteractiveViewer)),
+    );
+    await tester.pump();
+    expect(
+      tester.widget<MouseRegion>(canvasCursor).cursor,
+      SystemMouseCursors.grabbing,
+    );
+    await gesture.up();
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<MouseRegion>(canvasCursor).cursor,
+      SystemMouseCursors.grab,
+    );
+
+    await tester.drag(find.byType(InteractiveViewer), const Offset(80, 40));
+    await tester.pumpAndSettle();
+    expect(transform.value, isNot(before));
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.space);
+    await tester.pump();
+    expect(controller.spaceHeld, isFalse);
+    await tester.pump(const Duration(seconds: 1)); // the sizes-save timer
+  });
+
+  test('moveCell rearranges screens between rows', () {
+    controller.dispose();
+    controller = StudioController(
+      stories: const _LineStories(),
+      project: Directory.current.path,
+      port: 1,
+    );
+
+    List<String?> slots(int row) => [
+      for (final cell in controller.slotsFor(controller.selectedPage!, row))
+        cell?.cellId,
+    ];
+
+    expect(slots(0).whereType<String>(), ['welcome', 'signin']);
+    expect(slots(1).whereType<String>(), ['home']);
+
+    controller.moveCell(
+      pageId: 'flows/onboarding',
+      cellId: 'home',
+      rowIndex: 0,
+    );
+
+    expect(slots(0).whereType<String>(), ['welcome', 'signin', 'home']);
+    expect(slots(1).whereType<String>(), isEmpty);
+    expect(slots(1), contains(null));
+
+    controller.undoLayout();
+
+    expect(slots(0).whereType<String>(), ['welcome', 'signin']);
+    expect(slots(1).whereType<String>(), ['home']);
   });
 
   testWidgets('after a pick the arrows walk the chain and Escape clears it', (
@@ -127,12 +232,8 @@ void main() {
     );
     await tester.pumpWidget(canvas());
     await tester.pumpAndSettle();
-    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
-    await tester.pump();
     await tester.tap(find.text('Press me'), warnIfMissed: false);
     await tester.pumpAndSettle();
-    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
-    await tester.pump();
     expect(controller.pickedWidget!.type, 'Text');
 
     // Up: the parent; the outline and the row follow the same index.

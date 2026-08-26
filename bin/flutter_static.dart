@@ -56,6 +56,14 @@ class _RunCommand extends Command<int> {
             'Catalog server port. Default: the port registered for this '
             'directory in ~/.flutter_static/ports.jsonl, allocating the next '
             'free one on first use.',
+      )
+      ..addOption(
+        'snapshots',
+        allowed: const ['off', 'jj'],
+        defaultsTo: Platform.environment['FLUTTER_STATIC_SNAPSHOTS'] ?? 'off',
+        help:
+            'Snapshot successful reloads. "jj" commits the current change '
+            'after each save-triggered hot reload.',
       );
   }
 
@@ -97,6 +105,7 @@ class _RunCommand extends Command<int> {
       target: target,
       device: argResults!['device'] as String,
       port: port,
+      snapshots: _Snapshots.from(argResults!['snapshots'] as String),
     ).run();
   }
 }
@@ -439,6 +448,72 @@ Future<String?> _renderStory(
   return out;
 }
 
+/// Optional source checkpointing after a save-triggered reload succeeds.
+class _Snapshots {
+  _Snapshots._(this.mode);
+
+  factory _Snapshots.from(String mode) => _Snapshots._(mode);
+
+  final String mode;
+  bool _checked = false;
+  bool _available = false;
+  bool _running = false;
+
+  Future<void> afterSuccessfulReload({required bool full}) async {
+    if (mode == 'off') return;
+    if (_running) return;
+    _running = true;
+    try {
+      if (!await _isAvailable()) return;
+      final diff = await Process.run('jj', [
+        '--no-pager',
+        'diff',
+        '--stat',
+      ]).timeout(const Duration(seconds: 5));
+      if (diff.exitCode != 0 || '${diff.stdout}'.trim().isEmpty) return;
+      final now = DateTime.now().toIso8601String().split('.').first;
+      final result = await Process.run('jj', [
+        '--no-pager',
+        'commit',
+        '-m',
+        'flutter_static: hot ${full ? 'restart' : 'reload'} $now',
+      ]).timeout(const Duration(seconds: 10));
+      if (result.exitCode == 0) {
+        stdout.writeln('flutter_static: jj snapshot saved');
+      } else {
+        stderr.writeln('flutter_static: jj snapshot failed: ${result.stderr}');
+      }
+    } on Object catch (e) {
+      stderr.writeln('flutter_static: jj snapshot failed: $e');
+    } finally {
+      _running = false;
+    }
+  }
+
+  Future<bool> _isAvailable() async {
+    if (_checked) return _available;
+    _checked = true;
+    if (mode != 'jj') return false;
+    try {
+      final result = await Process.run('jj', [
+        '--no-pager',
+        'root',
+      ]).timeout(const Duration(seconds: 3));
+      _available = result.exitCode == 0;
+      if (_available) {
+        stdout.writeln('flutter_static: jj snapshots on');
+      } else {
+        stderr.writeln(
+          'flutter_static: jj snapshots requested, but this is not a jj repo',
+        );
+      }
+    } on Object catch (e) {
+      stderr.writeln('flutter_static: jj snapshots unavailable: $e');
+    }
+    return _available;
+  }
+}
+
 /// Owns the `flutter run --machine` process, the source watcher and the
 /// reload state machine between them.
 ///
@@ -449,11 +524,17 @@ Future<String?> _renderStory(
 /// own pid goes to `.dart_tool/flutter_static.pid`, and SIGUSR1/SIGUSR2 to
 /// it still mean reload/restart.
 class _Runner {
-  _Runner({required this.target, required this.device, required this.port});
+  _Runner({
+    required this.target,
+    required this.device,
+    required this.port,
+    required this.snapshots,
+  });
 
   final String target;
   final String device;
   final int port;
+  final _Snapshots snapshots;
 
   static final pidFile = File('.dart_tool/flutter_static.pid');
   static final packageConfig = File('.dart_tool/package_config.json');
@@ -661,6 +742,7 @@ class _Runner {
         full: fullNow,
       );
       if (_lastSaveAt != null) {
+        unawaited(snapshots.afterSuccessfulReload(full: fullNow));
         stdout.writeln(
           'flutter_static: renders are current '
           '(${DateTime.now().difference(_lastSaveAt!).inMilliseconds}ms '
@@ -1107,6 +1189,14 @@ class _StudioCommand extends Command<int> {
         help:
             'Catalog port (default: the port registered for this '
             'directory, see `flutter_static port`).',
+      )
+      ..addOption(
+        'snapshots',
+        allowed: const ['off', 'jj'],
+        defaultsTo: Platform.environment['FLUTTER_STATIC_SNAPSHOTS'] ?? 'off',
+        help:
+            'Snapshot successful reloads. "jj" commits the current change '
+            'after each save-triggered hot reload.',
       );
   }
 
@@ -1162,6 +1252,7 @@ class _StudioCommand extends Command<int> {
       target: target,
       device: argResults!['device'] as String,
       port: port,
+      snapshots: _Snapshots.from(argResults!['snapshots'] as String),
     ).run();
   }
 

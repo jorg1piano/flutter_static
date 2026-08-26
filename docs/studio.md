@@ -91,17 +91,17 @@ story while its first capture is pending, and any story switched to
 "Render" in the inspector or with the live switch off. Renders keep the
 last image while a new one captures, so the canvas never blanks.
 
-Two pointer modes in the sidebar footer: select (a click selects the
-card, nothing reaches the widget) and interact (events go through; a
-pointer down still selects). The canvas is a render target: nothing on
-it is draggable. Arrangement is the storyline's rows and cells in Dart,
-which is what the agent reads.
+Plain clicks on a live card inspect the widget under the pointer and
+select it in the widget tree. Hold Option while clicking to interact
+with the live widget inside the mockup. The canvas is a render target:
+nothing on it is draggable. Arrangement is the storyline's rows and
+cells in Dart, which is what the agent reads.
 
 ## Finding a widget in the source
 
-Option-click a widget on a live card and the inspector lists the
-project's widgets from that one outward, each with the file, line and
-column it is constructed at: `Text "Primary"` at
+Click a widget on a live card and the inspector lists the project's
+widgets from that one outward, each with the file, line and column it is
+constructed at: `Text "Primary"` at
 `packages/app_ui/lib/src/button.dart:57:9`, inside `AppButton` at
 `story/stories/buttons.dart:13:11`, inside `HStack` at `:10:7`. The
 outermost story-file entry is inside the `Story(...)` that defines the
@@ -111,10 +111,11 @@ pick, Up moves to the parent, Down to the child, Escape clears it.
 "Copy location" copies `file:line:column`; "Open in
 editor" runs `code -g file:line:column`, or whatever
 `FLUTTER_STATIC_EDITOR` names, with `{file}`, `{line}` and `{column}`
-placeholders. The click reaches nothing, in interact mode too. With a
-shell running in the terminal, the pick also types its location at the
-cursor in backticks, the way a click types the story id, and the Claude
-launch context says what such a token means.
+placeholders. Hold Option while clicking when you want the click to
+reach the live widget instead. With a shell running in the terminal, the
+pick also types its location at the cursor in backticks, the way a
+render-only card click types the story id, and the Claude launch context
+says what such a token means.
 
 The lines come from the widgets themselves. Every debug build compiles
 with `--track-widget-creation`, which stamps each widget constructor
@@ -141,6 +142,12 @@ the latest save the same way.
 
 A save that does not compile shows the compiler's message in a drawer
 under the canvas and leaves the last good code running.
+
+If you want automatic checkpoints while you work, run Studio with
+`--snapshots jj` or set `FLUTTER_STATIC_SNAPSHOTS=jj`. After each
+save-triggered hot reload or restart succeeds, Studio checks for a JJ
+working-copy diff and runs `jj commit -m "flutter_static: hot reload ..."`.
+Failed reloads are not snapshotted, and snapshots are off by default.
 
 ## Tokens
 

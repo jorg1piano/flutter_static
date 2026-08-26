@@ -31,6 +31,22 @@ class StoryPng {
   final String key;
 }
 
+class StudioSlot {
+  const StudioSlot({
+    required this.id,
+    required this.cellId,
+    required this.title,
+    required this.storyId,
+    this.variantLabel,
+  });
+
+  final String id;
+  final String cellId;
+  final String title;
+  final String storyId;
+  final String? variantLabel;
+}
+
 class StudioController extends ChangeNotifier {
   StudioController({
     required this.stories,
@@ -63,6 +79,12 @@ class StudioController extends ChangeNotifier {
   bool showLogs = false;
 
   List<StudioPage> pages = const [];
+
+  /// Studio-only freeform slots on each row. Null means an intentional
+  /// gap; hot reload rebuilds [pages] and this arrangement starts fresh.
+  final _storySlots = <String, List<List<StudioSlot?>>>{};
+  final _slotUndo = <Map<String, List<List<StudioSlot?>>>>[];
+
   int version = 0;
   String? selectedPageId;
   String? selectedStoryId;
@@ -79,8 +101,8 @@ class StudioController extends ChangeNotifier {
   /// Live mounts on the canvas, or the PNG renders the catalog serves.
   bool live = true;
 
-  /// Whether pointer events reach the mounted widgets, which a pointer
-  /// down also selects; off, a click only selects the card.
+  /// Whether an Option-click that reaches the mounted widget also selects
+  /// its story. Plain clicks always inspect the widget tree.
   bool interact = true;
 
   /// Stories shown as renders even while [live] is on.
@@ -130,7 +152,7 @@ class StudioController extends ChangeNotifier {
         'When the user clicks a story on the canvas its id is typed into '
             'this terminal in backticks, like `buttons/kinds`; a request '
             'after such an id is about that story.',
-        'When the user Option-clicks a widget on the canvas its source '
+        'When the user clicks a widget on the canvas its source '
             'position is typed in backticks, like '
             '`story/stories/buttons.dart:13:11`: the file, line and column '
             'where that widget is constructed. A request after one is '
@@ -150,8 +172,8 @@ class StudioController extends ChangeNotifier {
     ].join('\n');
   }
 
-  /// The Option-clicked widget, for the agent: the project's widgets from
-  /// the clicked one outward, each with its source line.
+  /// The clicked widget, for the agent: the project's widgets from the
+  /// clicked one outward, each with its source line.
   String? _pickContext() {
     final pick = this.pick;
     final picked = pickedWidget;
@@ -171,7 +193,7 @@ class StudioController extends ChangeNotifier {
         if (w != picked) line(w),
     ];
     return [
-      'The user Option-clicked a widget on the canvas and selected '
+      'The user clicked a widget on the canvas and selected '
           '${line(picked)}. Requests about "this", "it" or "the selected '
           'widget" mean that one; the line is where it is constructed, so '
           'edit that call to change what it shows and its own class to '
@@ -200,6 +222,8 @@ class StudioController extends ChangeNotifier {
   // --- stories ------------------------------------------------------------
 
   void refreshIndex() {
+    _storySlots.clear();
+    _slotUndo.clear();
     try {
       pages = pagesFromIndex(storiesIndex(stories));
     } catch (e) {
@@ -234,11 +258,286 @@ class StudioController extends ChangeNotifier {
     notifyListeners();
   }
 
+  static const _emptySlotsLeft = 8;
+  static const _emptySlotsRight = 8;
+  static const _extraEmptyRows = 4;
+
+  int slotRowCount(StudioPage page) =>
+      page.isLine ? _pageSlots(page).length : page.rows.length;
+
+  String? rowTitle(StudioPage page, int rowIndex) =>
+      rowIndex < page.rows.length ? page.rows[rowIndex].title : null;
+
+  List<StudioSlot?> slotsFor(StudioPage page, int rowIndex) => page.isLine
+      ? _pageSlots(page)[rowIndex]
+      : [
+          for (final cell in page.rows[rowIndex].cells)
+            _slotFor(cell, cell.variants.first, showVariant: false),
+        ];
+
+  List<List<StudioSlot?>> _pageSlots(StudioPage page) {
+    final pageSlots = _storySlots.putIfAbsent(page.id, () {
+      final rowSlots = [
+        for (final row in page.rows)
+          [
+            for (var i = 0; i < _emptySlotsLeft; i++) null,
+            for (final cell in row.cells)
+              for (final (i, storyId) in cell.variants.indexed)
+                _slotFor(cell, storyId, showVariant: i > 0),
+          ],
+      ];
+      final widest = rowSlots.fold<int>(
+        0,
+        (max, row) => row.length > max ? row.length : max,
+      );
+      final width = widest + _emptySlotsRight;
+      for (final row in rowSlots) {
+        while (row.length < width) {
+          row.add(null);
+        }
+      }
+      return [
+        ...rowSlots,
+        for (var i = 0; i < _extraEmptyRows; i++)
+          [for (var j = 0; j < width; j++) null],
+      ];
+    });
+    final width = pageSlots.fold<int>(
+      0,
+      (max, row) => row.length > max ? row.length : max,
+    );
+    while (pageSlots.length < page.rows.length + _extraEmptyRows) {
+      pageSlots.add([for (var i = 0; i < width; i++) null]);
+    }
+    for (final row in pageSlots) {
+      while (row.length < width) {
+        row.add(null);
+      }
+    }
+    return pageSlots;
+  }
+
+  static StudioSlot _slotFor(
+    PageCell cell,
+    String storyId, {
+    required bool showVariant,
+  }) => StudioSlot(
+    id: storyId,
+    cellId: cell.id,
+    title: cell.title,
+    storyId: storyId,
+    variantLabel: showVariant ? storyId.split('/').last : null,
+  );
+
+  Map<String, List<List<StudioSlot?>>> _copySlots() => {
+    for (final entry in _storySlots.entries)
+      entry.key: [
+        for (final row in entry.value) [...row],
+      ],
+  };
+
+  void undoLayout() {
+    if (_slotUndo.isEmpty) return;
+    _storySlots
+      ..clear()
+      ..addAll(_slotUndo.removeLast());
+    notifyListeners();
+  }
+
+  /// Moves a canvas cell into a concrete slot. Empty slots are preserved,
+  /// so a screen can leave a gap behind it. This is a Studio-only layout
+  /// tweak; a catalog hot reload rebuilds pages from the stories again.
+  void moveCellToSlot({
+    required String pageId,
+    required String cellId,
+    required int rowIndex,
+    required int slotIndex,
+  }) {
+    final page = pages.where((p) => p.id == pageId).firstOrNull;
+    if (page == null || rowIndex < 0) return;
+    final pageSlots = [
+      for (final row in _pageSlots(page)) [...row],
+    ];
+    final width = pageSlots.fold<int>(
+      0,
+      (max, row) => row.length > max ? row.length : max,
+    );
+    while (rowIndex >= pageSlots.length) {
+      pageSlots.add([for (var i = 0; i < width; i++) null]);
+    }
+    if (slotIndex < 0) return;
+    while (slotIndex >= pageSlots[rowIndex].length) {
+      for (final row in pageSlots) {
+        row.add(null);
+      }
+    }
+
+    StudioSlot? moved;
+    int? sourceRow;
+    int? sourceSlot;
+    for (final (r, row) in pageSlots.indexed) {
+      final index = row.indexWhere(
+        (c) => c?.id == cellId || c?.cellId == cellId,
+      );
+      if (index >= 0) {
+        moved = row[index];
+        sourceRow = r;
+        sourceSlot = index;
+        break;
+      }
+    }
+    if (moved == null || sourceRow == null || sourceSlot == null) return;
+    if (sourceRow == rowIndex && sourceSlot == slotIndex) return;
+
+    _slotUndo.add(_copySlots());
+    if (_slotUndo.length > 100) _slotUndo.removeAt(0);
+
+    final displaced = pageSlots[rowIndex][slotIndex];
+    pageSlots[rowIndex][slotIndex] = moved;
+    pageSlots[sourceRow][sourceSlot] = displaced;
+    _storySlots[pageId] = pageSlots;
+    notifyListeners();
+  }
+
+  /// Inserts an empty slot before [slotIndex], shifting only that row's
+  /// content to the right until the next gap. This is what the plus
+  /// button between screens does.
+  void insertEmptySlot({
+    required String pageId,
+    required int rowIndex,
+    required int slotIndex,
+  }) {
+    final page = pages.where((p) => p.id == pageId).firstOrNull;
+    if (page == null || rowIndex < 0 || slotIndex < 0) return;
+    final pageSlots = [
+      for (final row in _pageSlots(page)) [...row],
+    ];
+    final width = pageSlots.fold<int>(
+      0,
+      (max, row) => row.length > max ? row.length : max,
+    );
+    while (rowIndex >= pageSlots.length) {
+      pageSlots.add([for (var i = 0; i < width; i++) null]);
+    }
+    while (slotIndex >= pageSlots[rowIndex].length) {
+      for (final row in pageSlots) {
+        row.add(null);
+      }
+    }
+
+    _slotUndo.add(_copySlots());
+    if (_slotUndo.length > 100) _slotUndo.removeAt(0);
+
+    final target = pageSlots[rowIndex];
+    var gap = target.indexWhere((slot) => slot == null, slotIndex);
+    if (gap < 0) {
+      target.add(null);
+      gap = target.length - 1;
+    }
+    for (var i = gap; i > slotIndex; i--) {
+      target[i] = target[i - 1];
+    }
+    target[slotIndex] = null;
+    _storySlots[pageId] = pageSlots;
+    notifyListeners();
+  }
+
+  /// Inserts a dragged canvas cell before [slotIndex], shifting only that
+  /// row's content to the right until the next gap. Existing gaps
+  /// elsewhere are left alone.
+  void insertCellAtSlot({
+    required String pageId,
+    required String cellId,
+    required int rowIndex,
+    required int slotIndex,
+  }) {
+    final page = pages.where((p) => p.id == pageId).firstOrNull;
+    if (page == null || rowIndex < 0 || slotIndex < 0) return;
+    final pageSlots = [
+      for (final row in _pageSlots(page)) [...row],
+    ];
+    final width = pageSlots.fold<int>(
+      0,
+      (max, row) => row.length > max ? row.length : max,
+    );
+    while (rowIndex >= pageSlots.length) {
+      pageSlots.add([for (var i = 0; i < width; i++) null]);
+    }
+    while (slotIndex >= pageSlots[rowIndex].length) {
+      for (final row in pageSlots) {
+        row.add(null);
+      }
+    }
+
+    StudioSlot? moved;
+    int? sourceRow;
+    int? sourceSlot;
+    for (final (r, row) in pageSlots.indexed) {
+      final index = row.indexWhere(
+        (c) => c?.id == cellId || c?.cellId == cellId,
+      );
+      if (index >= 0) {
+        moved = row[index];
+        sourceRow = r;
+        sourceSlot = index;
+        row[index] = null;
+        break;
+      }
+    }
+    if (moved == null || sourceRow == null || sourceSlot == null) return;
+    if (sourceRow == rowIndex &&
+        (sourceSlot == slotIndex || sourceSlot + 1 == slotIndex)) {
+      return;
+    }
+
+    _slotUndo.add(_copySlots());
+    if (_slotUndo.length > 100) _slotUndo.removeAt(0);
+
+    final target = pageSlots[rowIndex];
+    var gap = target.indexWhere((slot) => slot == null, slotIndex);
+    if (gap < 0) {
+      target.add(null);
+      gap = target.length - 1;
+    }
+    for (var i = gap; i > slotIndex; i--) {
+      target[i] = target[i - 1];
+    }
+    target[slotIndex] = moved;
+    _storySlots[pageId] = pageSlots;
+    notifyListeners();
+  }
+
+  /// Back-compat for tests and title drop targets: moves to the row's end.
+  void moveCell({
+    required String pageId,
+    required String cellId,
+    required int rowIndex,
+    String? beforeCellId,
+  }) {
+    final page = pages.where((p) => p.id == pageId).firstOrNull;
+    if (page == null || rowIndex < 0 || rowIndex >= slotRowCount(page)) return;
+    final slots = slotsFor(page, rowIndex);
+    final before = beforeCellId == null
+        ? -1
+        : slots.indexWhere(
+            (c) => c?.id == beforeCellId || c?.cellId == beforeCellId,
+          );
+    moveCellToSlot(
+      pageId: pageId,
+      cellId: cellId,
+      rowIndex: rowIndex,
+      slotIndex: before >= 0 ? before : slots.length - 1,
+    );
+  }
+
   // --- picking a widget ---------------------------------------------------
 
-  /// Whether Option is held: a click on a live card then picks the widget
-  /// under the pointer instead of reaching it or selecting the card.
+  /// Whether Option is held: while down, clicks on a live card reach the
+  /// mounted story instead of inspecting the widget under the pointer.
   bool altHeld = false;
+
+  /// Whether Space is held: while down, canvas drags pan the surface.
+  bool spaceHeld = false;
 
   bool _watchingKeyboard = false;
 
@@ -252,17 +551,26 @@ class StudioController extends ChangeNotifier {
   }
 
   bool _onKey(KeyEvent event) {
-    final alt = HardwareKeyboard.instance.isAltPressed;
-    if (alt != altHeld) {
+    final keyboard = HardwareKeyboard.instance;
+    if (event is KeyDownEvent &&
+        event.logicalKey == LogicalKeyboardKey.keyZ &&
+        (keyboard.isControlPressed || keyboard.isMetaPressed)) {
+      undoLayout();
+      return true;
+    }
+    final alt = keyboard.isAltPressed;
+    final space = keyboard.isLogicalKeyPressed(LogicalKeyboardKey.space);
+    if (alt != altHeld || space != spaceHeld) {
       altHeld = alt;
+      spaceHeld = space;
       notifyListeners();
     }
     return false;
   }
 
-  /// The last Option-click: the widgets under it, nearest first, and
-  /// which story's card it landed on. Cleared by a plain click or a
-  /// reload (the tree is rebuilt, and lines move).
+  /// The last inspected click: the widgets under it, nearest first, and
+  /// which story's card it landed on. Cleared by selecting elsewhere or
+  /// a reload (the tree is rebuilt, and lines move).
   WidgetPick? pick;
   String? pickStoryId;
 

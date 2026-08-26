@@ -205,8 +205,8 @@ class _Footer extends StatelessWidget {
         _IconAction(
           icon: Icons.touch_app_outlined,
           tooltip: controller.interact
-              ? 'Interact: clicks reach the widgets'
-              : 'Select: a click selects the card',
+              ? 'Option-clicks reach and select the story'
+              : 'Option-clicks only reach the widget',
           active: controller.interact,
           onTap: controller.toggleInteract,
         ),

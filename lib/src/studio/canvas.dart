@@ -1,8 +1,10 @@
 import 'dart:ui' show PointMode;
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../phone_mockup.dart';
 import '../widget_pick.dart';
 import 'controller.dart';
 import 'model.dart';
@@ -24,7 +26,7 @@ class _StudioCanvasState extends State<StudioCanvas> {
   final _transform = TransformationController();
   String? _pageShown;
 
-  /// Takes focus after an Option-click, so the arrow keys walk the
+  /// Takes focus after an inspected click, so the arrow keys walk the
   /// picked chain instead of going to the terminal.
   final _focus = FocusNode(debugLabel: 'canvas');
   WidgetPick? _focusedPick;
@@ -132,12 +134,14 @@ class _StudioCanvasState extends State<StudioCanvas> {
                     minScale: 0.05,
                     maxScale: 4,
                     boundaryMargin: const EdgeInsets.all(4000),
+                    panEnabled: controller.spaceHeld,
                     child: page == null
                         ? const SizedBox(width: 400, height: 300)
                         : _PageBody(page: page, controller: controller),
                   ),
                 ),
               ),
+              Positioned.fill(child: _PanCursorOverlay(controller: controller)),
               Positioned(
                 left: 16,
                 top: 12,
@@ -157,6 +161,58 @@ class _StudioCanvasState extends State<StudioCanvas> {
         ),
       );
     },
+  );
+}
+
+class _PanCursorOverlay extends StatefulWidget {
+  const _PanCursorOverlay({required this.controller});
+
+  final StudioController controller;
+
+  @override
+  State<_PanCursorOverlay> createState() => _PanCursorOverlayState();
+}
+
+class _PanCursorOverlayState extends State<_PanCursorOverlay> {
+  bool _dragging = false;
+
+  @override
+  void initState() {
+    super.initState();
+    GestureBinding.instance.pointerRouter.addGlobalRoute(_onPointer);
+  }
+
+  @override
+  void dispose() {
+    GestureBinding.instance.pointerRouter.removeGlobalRoute(_onPointer);
+    super.dispose();
+  }
+
+  MouseCursor get _cursor => _dragging && widget.controller.spaceHeld
+      ? SystemMouseCursors.grabbing
+      : widget.controller.spaceHeld
+      ? SystemMouseCursors.grab
+      : SystemMouseCursors.basic;
+
+  void _setDragging(bool dragging) {
+    if (_dragging == dragging) return;
+    setState(() => _dragging = dragging);
+  }
+
+  void _onPointer(PointerEvent event) {
+    if (event is PointerDownEvent && widget.controller.spaceHeld) {
+      _setDragging(true);
+    } else if (event is PointerUpEvent || event is PointerCancelEvent) {
+      _setDragging(false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => MouseRegion(
+    key: const Key('canvas-pan-cursor'),
+    cursor: _cursor,
+    opaque: false,
+    child: const SizedBox.expand(),
   );
 }
 
@@ -246,19 +302,61 @@ class _PageBody extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
-        for (final (i, row) in page.rows.indexed) ...[
-          if (i > 0) const SizedBox(height: 96),
-          Text(row.title, style: StudioText.title.copyWith(fontSize: 22)),
-          const SizedBox(height: 24),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              for (final (j, cell) in row.cells.indexed) ...[
-                if (j > 0) const SizedBox(width: 64),
-                _CellColumn(cell: cell, controller: controller),
-              ],
-            ],
+        for (var i = 0; i < controller.slotRowCount(page); i++) ...[
+          if (i > 0) const SizedBox(height: 64),
+          if (controller.rowTitle(page, i) case final title?) ...[
+            Text(title, style: StudioText.title.copyWith(fontSize: 22)),
+            const SizedBox(height: 24),
+          ],
+          DragTarget<_CellDrag>(
+            onWillAcceptWithDetails: (details) =>
+                details.data.pageId == page.id,
+            onAcceptWithDetails: (details) => controller.moveCell(
+              pageId: page.id,
+              cellId: details.data.cellId,
+              rowIndex: i,
+            ),
+            builder: (context, candidates, _) => AnimatedContainer(
+              duration: const Duration(milliseconds: 120),
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: candidates.isEmpty
+                    ? Colors.transparent
+                    : StudioColors.hover,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  for (final (j, cell)
+                      in controller.slotsFor(page, i).indexed) ...[
+                    if (j > 0)
+                      _CellInsertTarget(
+                        pageId: page.id,
+                        rowIndex: i,
+                        slotIndex: j,
+                        controller: controller,
+                      ),
+                    if (cell == null)
+                      _CellSlot(
+                        pageId: page.id,
+                        rowIndex: i,
+                        slotIndex: j,
+                        controller: controller,
+                      )
+                    else
+                      _CellColumn(
+                        pageId: page.id,
+                        rowIndex: i,
+                        slotIndex: j,
+                        slot: cell,
+                        controller: controller,
+                      ),
+                  ],
+                ],
+              ),
+            ),
           ),
         ],
       ],
@@ -266,10 +364,205 @@ class _PageBody extends StatelessWidget {
   );
 }
 
-class _CellColumn extends StatelessWidget {
-  const _CellColumn({required this.cell, required this.controller});
+class _CellDrag {
+  const _CellDrag({required this.pageId, required this.cellId});
 
-  final PageCell cell;
+  final String pageId;
+  final String cellId;
+}
+
+class _CellInsertTarget extends StatefulWidget {
+  const _CellInsertTarget({
+    required this.pageId,
+    required this.rowIndex,
+    required this.slotIndex,
+    required this.controller,
+  });
+
+  final String pageId;
+  final int rowIndex;
+  final int slotIndex;
+  final StudioController controller;
+
+  @override
+  State<_CellInsertTarget> createState() => _CellInsertTargetState();
+}
+
+class _CellInsertTargetState extends State<_CellInsertTarget> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) => DragTarget<_CellDrag>(
+    onWillAcceptWithDetails: (details) => details.data.pageId == widget.pageId,
+    onAcceptWithDetails: (details) => widget.controller.insertCellAtSlot(
+      pageId: widget.pageId,
+      cellId: details.data.cellId,
+      rowIndex: widget.rowIndex,
+      slotIndex: widget.slotIndex,
+    ),
+    builder: (context, candidates, _) {
+      final hot = candidates.isNotEmpty;
+      return MouseRegion(
+        onEnter: (_) => setState(() => _hover = true),
+        onExit: (_) => setState(() => _hover = false),
+        cursor: SystemMouseCursors.click,
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => widget.controller.insertEmptySlot(
+            pageId: widget.pageId,
+            rowIndex: widget.rowIndex,
+            slotIndex: widget.slotIndex,
+          ),
+          child: SizedBox(
+            width: 24,
+            height: 44,
+            child: Center(
+              child: AnimatedOpacity(
+                duration: const Duration(milliseconds: 100),
+                opacity: hot || _hover ? 1 : 0,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: StudioColors.panel,
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: hot ? StudioColors.accent : StudioColors.faint,
+                    ),
+                  ),
+                  child: Icon(
+                    Icons.add,
+                    size: 16,
+                    color: hot ? StudioColors.accent : StudioColors.muted,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    },
+  );
+}
+
+class _CellSlot extends StatelessWidget {
+  const _CellSlot({
+    required this.pageId,
+    required this.rowIndex,
+    required this.slotIndex,
+    required this.controller,
+  });
+
+  final String pageId;
+  final int rowIndex;
+  final int slotIndex;
+  final StudioController controller;
+
+  @override
+  Widget build(BuildContext context) => DragTarget<_CellDrag>(
+    onWillAcceptWithDetails: (details) => details.data.pageId == pageId,
+    onAcceptWithDetails: (details) => controller.moveCellToSlot(
+      pageId: pageId,
+      cellId: details.data.cellId,
+      rowIndex: rowIndex,
+      slotIndex: slotIndex,
+    ),
+    builder: (context, candidates, _) {
+      final hot = candidates.isNotEmpty;
+      final size = controller.selectedPage?.isLine == true
+          ? PhoneMockup(
+              spec: controller.deviceSpec ?? PhoneSpec.fallback,
+              child: const SizedBox.shrink(),
+            ).size
+          : const Size(260, 220);
+      return AnimatedContainer(
+        duration: const Duration(milliseconds: 120),
+        width: size.width,
+        height: size.height,
+        decoration: BoxDecoration(
+          color: hot ? StudioColors.hover : Colors.transparent,
+          border: Border.all(
+            color: hot ? StudioColors.accent : StudioColors.faint,
+            width: hot ? 2 : 1,
+          ),
+          borderRadius: BorderRadius.circular(12),
+        ),
+      );
+    },
+  );
+}
+
+class _CellEdgeDraggable extends StatelessWidget {
+  const _CellEdgeDraggable({
+    required this.pageId,
+    required this.cellId,
+    required this.title,
+    required this.child,
+  });
+
+  final String pageId;
+  final String cellId;
+  final String title;
+  final Widget child;
+
+  static const _edge = 18.0;
+
+  @override
+  Widget build(BuildContext context) => Stack(
+    clipBehavior: Clip.none,
+    children: [
+      child,
+      Positioned(left: 0, top: 0, right: 0, height: _edge, child: _handle()),
+      Positioned(left: 0, bottom: 0, right: 0, height: _edge, child: _handle()),
+      Positioned(left: 0, top: 0, bottom: 0, width: _edge, child: _handle()),
+      Positioned(right: 0, top: 0, bottom: 0, width: _edge, child: _handle()),
+    ],
+  );
+
+  Widget _handle() => Draggable<_CellDrag>(
+    data: _CellDrag(pageId: pageId, cellId: cellId),
+    feedback: _CellDragFeedback(title),
+    childWhenDragging: const SizedBox.expand(),
+    child: MouseRegion(
+      cursor: SystemMouseCursors.move,
+      child: Container(color: Colors.transparent),
+    ),
+  );
+}
+
+class _CellDragFeedback extends StatelessWidget {
+  const _CellDragFeedback(this.title);
+
+  final String title;
+
+  @override
+  Widget build(BuildContext context) => Material(
+    color: Colors.transparent,
+    child: DecoratedBox(
+      decoration: BoxDecoration(
+        color: StudioColors.panel,
+        border: Border.all(color: StudioColors.accent),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        child: Text(title, style: StudioText.muted),
+      ),
+    ),
+  );
+}
+
+class _CellColumn extends StatelessWidget {
+  const _CellColumn({
+    required this.pageId,
+    required this.rowIndex,
+    required this.slotIndex,
+    required this.slot,
+    required this.controller,
+  });
+
+  final String pageId;
+  final int rowIndex;
+  final int slotIndex;
+  final StudioSlot slot;
   final StudioController controller;
 
   @override
@@ -277,18 +570,46 @@ class _CellColumn extends StatelessWidget {
     crossAxisAlignment: CrossAxisAlignment.start,
     mainAxisSize: MainAxisSize.min,
     children: [
-      Text(cell.title, style: StudioText.muted.copyWith(fontSize: 15)),
+      DragTarget<_CellDrag>(
+        onWillAcceptWithDetails: (details) =>
+            details.data.pageId == pageId && details.data.cellId != slot.id,
+        onAcceptWithDetails: (details) => controller.moveCellToSlot(
+          pageId: pageId,
+          cellId: details.data.cellId,
+          rowIndex: rowIndex,
+          slotIndex: slotIndex,
+        ),
+        builder: (context, candidates, _) {
+          final title = Text(
+            slot.title,
+            style: StudioText.muted.copyWith(
+              fontSize: 15,
+              color: candidates.isEmpty
+                  ? StudioColors.muted
+                  : StudioColors.accent,
+            ),
+          );
+          return Draggable<_CellDrag>(
+            data: _CellDrag(pageId: pageId, cellId: slot.id),
+            feedback: _CellDragFeedback(slot.title),
+            childWhenDragging: Opacity(opacity: 0.35, child: title),
+            child: MouseRegion(cursor: SystemMouseCursors.move, child: title),
+          );
+        },
+      ),
       const SizedBox(height: 12),
-      for (final (k, id) in cell.variants.indexed) ...[
-        if (k > 0) const SizedBox(height: 32),
-        StoryCard(id: id, controller: controller),
-        if (cell.variants.length > 1) ...[
-          const SizedBox(height: 8),
-          Text(
-            id.split('/').last,
-            style: StudioText.monoMuted.copyWith(fontSize: 13),
-          ),
-        ],
+      _CellEdgeDraggable(
+        pageId: pageId,
+        cellId: slot.id,
+        title: slot.title,
+        child: StoryCard(id: slot.storyId, controller: controller),
+      ),
+      if (slot.variantLabel != null) ...[
+        const SizedBox(height: 8),
+        Text(
+          slot.variantLabel!,
+          style: StudioText.monoMuted.copyWith(fontSize: 13),
+        ),
       ],
     ],
   );
@@ -322,8 +643,8 @@ class StoryCard extends StatelessWidget {
         onSize: (size) => controller.noteSize(id, size),
         child: controller.mount(id),
       );
-      // The Option-clicked widget, outlined where it sits: the card's
-      // origin is the mounted story's, so its bounds apply as they are.
+      // The inspected widget, outlined where it sits: the card's origin
+      // is the mounted story's, so its bounds apply as they are.
       final picked = controller.pickStoryId == id
           ? controller.pickedWidget?.bounds
           : null;
@@ -380,10 +701,9 @@ class StoryCard extends StatelessWidget {
   }
 }
 
-/// A live widget. In select mode a click selects the card and nothing
-/// reaches the widget; in interact mode events go through and a pointer
-/// down still selects. With Option held a click picks the widget under
-/// the pointer in either mode, and reaches nothing.
+/// A live widget. Plain clicks inspect the widget under the pointer and
+/// select it in the widget tree. With Option held events go through to
+/// the mounted story, so controls inside a mockup can be clicked.
 class _LiveSlot extends StatefulWidget {
   const _LiveSlot({
     required this.child,
@@ -399,8 +719,8 @@ class _LiveSlot extends StatefulWidget {
   final bool altHeld;
   final VoidCallback onSelect;
 
-  /// An Option-click: the mounted story's render object and the pointer
-  /// in its coordinates.
+  /// An inspected click: the mounted story's render object and the
+  /// pointer in its coordinates.
   final void Function(RenderObject root, Offset position) onPick;
 
   /// Reports the mounted story's size after each layout, so a later
@@ -415,24 +735,28 @@ class _LiveSlotState extends State<_LiveSlot> {
   final _boundary = GlobalKey();
   Size? _reported;
 
-  /// Whether the pointer that is down started a pick: its tap must not
-  /// select the card, which would clear the pick.
-  bool _picking = false;
+  Offset? _inspectAt;
 
   void _onPointerDown(PointerDownEvent event) {
-    _picking = widget.altHeld;
-    if (_picking) {
-      final box = _boundary.currentContext?.findRenderObject();
-      if (box is RenderBox) {
-        widget.onPick(box, box.globalToLocal(event.position));
-      }
-    } else if (widget.interact) {
-      widget.onSelect();
-    }
+    if (widget.altHeld && widget.interact) widget.onSelect();
+  }
+
+  void _onTapDown(TapDownDetails details) {
+    final box = _boundary.currentContext?.findRenderObject();
+    _inspectAt = box is RenderBox
+        ? box.globalToLocal(details.globalPosition)
+        : null;
   }
 
   void _onTap() {
-    if (!_picking) widget.onSelect();
+    final box = _boundary.currentContext?.findRenderObject();
+    final position = _inspectAt;
+    _inspectAt = null;
+    if (box is RenderBox && position != null) widget.onPick(box, position);
+  }
+
+  void _onTapCancel() {
+    _inspectAt = null;
   }
 
   @override
@@ -447,16 +771,20 @@ class _LiveSlotState extends State<_LiveSlot> {
     });
     // Its own layer: an animating story repaints itself, not the canvas.
     final isolated = RepaintBoundary(key: _boundary, child: widget.child);
-    final absorb = !widget.interact || widget.altHeld;
+    final inspect = !widget.altHeld;
     return MouseRegion(
-      cursor: widget.altHeld ? SystemMouseCursors.precise : MouseCursor.defer,
+      cursor: inspect ? SystemMouseCursors.precise : MouseCursor.defer,
       child: Listener(
         onPointerDown: _onPointerDown,
         // The tap recognizer keeps the canvas's own (which deselects)
-        // from winning the click.
-        child: absorb
+        // from winning inspected clicks. Pick on tap, not down, so the
+        // rebuild that adds the outline cannot reset this recognizer and
+        // let mouse-up clear the pick.
+        child: inspect
             ? GestureDetector(
+                onTapDown: _onTapDown,
                 onTap: _onTap,
+                onTapCancel: _onTapCancel,
                 behavior: HitTestBehavior.opaque,
                 child: AbsorbPointer(child: isolated),
               )
