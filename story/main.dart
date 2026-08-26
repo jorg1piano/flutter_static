@@ -1,6 +1,8 @@
 import 'package:flutter_static/flutter_static.dart';
 
 import 'stories/example.dart' as example;
+import 'stories/studio_page.dart' as studio_page;
+import 'stories/studio_page_2.dart' as studio_page_2;
 
 import 'lines/knobs.dart' as line_knobs;
 

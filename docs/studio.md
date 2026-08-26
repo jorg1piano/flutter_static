@@ -143,6 +143,29 @@ the latest save the same way.
 A save that does not compile shows the compiler's message in a drawer
 under the canvas and leaves the last good code running.
 
+## Sending the selection to Herdr
+
+Studio is not the only terminal in the room. With Herdr running, the
+inspector's "Herdr" section lists its panes and sends the selection into
+one. The list is `herdr pane list` filtered to panes with an agent plus
+shells in the project, agents in the project first; the refresh icon
+re-reads it, and the chosen pane is remembered in
+`.dart_tool/flutter_static_studio.json`.
+
+"Type into pane" runs `herdr pane send-text` with one line that stands
+on its own, since that terminal has none of Studio's launch context: the
+project path, the story, the selected widget with its text and source
+line, the project widgets around it, and the render command to check
+with. It ends in a space and no Enter, so the request gets typed after
+it in the pane. "Prompt agent" runs `herdr agent prompt` instead, which
+submits: the same line, with the prompt panel's text appended as
+"User request: ..." when there is any. With no widget picked, the line
+names the story alone.
+
+The `herdr` binary is `FLUTTER_STATIC_HERDR` when set, else the one on
+the PATH, else `~/.local/bin/herdr`. The section reports the CLI's error
+when the server is down.
+
 If you want automatic checkpoints while you work, run Studio with
 `--snapshots jj` or set `FLUTTER_STATIC_SNAPSHOTS=jj`. After each
 save-triggered hot reload or restart succeeds, Studio checks for a JJ

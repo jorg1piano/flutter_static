@@ -17,6 +17,7 @@ import '../server_io.dart';
 import '../story.dart';
 import '../tokens.dart';
 import '../widget_pick.dart';
+import 'herdr.dart';
 import 'model.dart';
 
 enum CatalogStatus { ready, reloading, error }
@@ -134,6 +135,151 @@ class StudioController extends ChangeNotifier {
     promptText = promptText.trim().isEmpty
         ? trimmed
         : '${promptText.trim()}\n\n$trimmed';
+    notifyListeners();
+  }
+
+  // --- herdr --------------------------------------------------------------
+
+  /// Herdr panes the selection can be sent to, and which one is chosen.
+  /// The chosen pane id is persisted with the panel state, so the second
+  /// send goes straight through after a restart.
+  final herdr = Herdr();
+  List<HerdrPane> herdrPanes = const [];
+  String? herdrPaneId;
+  bool herdrBusy = false;
+
+  /// What the last Herdr action did, for the inspector: "Sent to ...",
+  /// or the error. Cleared by the next action.
+  String? herdrStatus;
+  bool _herdrListed = false;
+
+  HerdrPane? get herdrPane {
+    for (final p in herdrPanes) {
+      if (p.id == herdrPaneId) return p;
+    }
+    return null;
+  }
+
+  /// Lists panes the first time the inspector shows the Herdr section;
+  /// later refreshes are explicit.
+  void ensureHerdrPanes() {
+    if (_herdrListed) return;
+    _herdrListed = true;
+    refreshHerdrPanes();
+  }
+
+  /// Re-reads the pane list. Agent panes come first, those in the
+  /// project before the rest; shells outside the project are left out,
+  /// or the list would be every terminal on the machine.
+  Future<void> refreshHerdrPanes() async {
+    _herdrListed = true;
+    herdrBusy = true;
+    notifyListeners();
+    try {
+      final all = await herdr.panes();
+      int rank(HerdrPane p) => switch ((p.hasAgent, p.inProject(project))) {
+        (true, true) => 0,
+        (true, false) => 1,
+        (false, true) => 2,
+        (false, false) => 3,
+      };
+      herdrPanes = [
+        for (final p in all)
+          if (p.hasAgent || p.inProject(project)) p,
+      ]..sort((a, b) => rank(a).compareTo(rank(b)));
+      if (herdrPane == null && herdrPaneId != null) {
+        // The remembered pane is gone; pick the best remaining one.
+        herdrPaneId = herdrPanes.firstOrNull?.id;
+        _saveStudioState();
+      }
+      herdrPaneId ??= herdrPanes.firstOrNull?.id;
+      herdrStatus = null;
+    } on HerdrException catch (e) {
+      herdrPanes = const [];
+      herdrStatus = e.message;
+      log('herdr: ${e.message}');
+    }
+    herdrBusy = false;
+    notifyListeners();
+  }
+
+  void setHerdrPane(String? id) {
+    if (herdrPaneId == id) return;
+    herdrPaneId = id;
+    herdrStatus = null;
+    _saveStudioState();
+    notifyListeners();
+  }
+
+  /// The selection as one line for an agent in another terminal, which
+  /// has none of Studio's launch context: where the project is, which
+  /// story, which widget and its source line, and how to check a change.
+  /// Ends in a space so a request can be typed straight after it. Null
+  /// when nothing is selected.
+  String? herdrMessage() {
+    final story = selectedStoryId;
+    if (story == null) return null;
+    final knobArgs = knobs.entries.map((e) => ' -k ${e.key}=${e.value}').join();
+    final png = '/tmp/${story.replaceAll('/', '-')}.png';
+    final render =
+        'Check by running `dart run flutter_static render $story$knobArgs '
+        '-o $png` from the project and reading the PNG.';
+    final pick = this.pick;
+    final picked = pickedWidget;
+    if (pick == null || picked == null || pickStoryId != story) {
+      return 'In Flutter Static Studio (project $project) I am looking at '
+          'story `$story`. $render ';
+    }
+    String line(PickedWidget w) {
+      final where = w.location == null
+          ? 'no source location'
+          : scopes.describe(w.location!);
+      final text = w.text == null ? '' : ' with text "${w.text}"';
+      return '`${w.type}`$text at $where';
+    }
+
+    final outward = [
+      for (final w in pick.local)
+        if (w != picked) line(w),
+    ];
+    return [
+      'In Flutter Static Studio (project $project, story `$story`) I '
+          'selected ${line(picked)}',
+      if (outward.isNotEmpty) ', inside ${outward.join(', inside ')}',
+      '; the line is where it is constructed, so edit that call to change '
+          'what it shows and its own class to change how it looks. $render ',
+    ].join();
+  }
+
+  /// Types the selection into the chosen Herdr pane. With [submit] the
+  /// prompt panel's request goes with it and the whole thing is sent as
+  /// a prompt to the pane's agent; without, it lands at the cursor for
+  /// the user to finish.
+  Future<void> sendToHerdr({bool submit = false}) async {
+    final paneId = herdrPaneId;
+    final message = herdrMessage();
+    if (paneId == null || message == null) return;
+    herdrBusy = true;
+    herdrStatus = null;
+    notifyListeners();
+    final target = herdrPane?.name ?? paneId;
+    try {
+      if (submit) {
+        final request = promptText.trim();
+        await herdr.prompt(
+          paneId,
+          request.isEmpty ? message.trim() : '$message\nUser request: $request',
+        );
+        herdrStatus = 'Prompted $target';
+      } else {
+        await herdr.sendText(paneId, message);
+        herdrStatus = 'Typed into $target';
+      }
+    } on HerdrException catch (e) {
+      herdrStatus = e.message;
+      log('herdr: ${e.message}');
+    }
+    herdrBusy = false;
     notifyListeners();
   }
 
@@ -1177,6 +1323,8 @@ class $name extends StatelessWidget {
         inspectorPanelOpen = panels['inspector'] as bool? ?? inspectorPanelOpen;
         showLogs = panels['logs'] as bool? ?? showLogs;
       }
+      final herdr = json['herdr'];
+      if (herdr is Map) herdrPaneId = herdr['pane'] as String?;
     } catch (e) {
       log('studio state: $e');
     }
@@ -1198,6 +1346,7 @@ class $name extends StatelessWidget {
             'inspector': inspectorPanelOpen,
             'logs': showLogs,
           },
+          if (herdrPaneId != null) 'herdr': {'pane': herdrPaneId},
         }),
       );
     } catch (e) {

@@ -36,6 +36,10 @@ In flutter_static:
   terminal (xterm, flutter_pty) with the user's login shell in the
   project; selection types story ids into it, a button launches Claude
   Code with `--append-system-prompt` from `controller.agentContext`.
+- `lib/src/studio/herdr.dart`: the `herdr` CLI as a client (`pane
+  list`, `pane send-text`, `agent prompt`); the inspector's "Herdr"
+  section sends the selected story and widget into a chosen pane, and
+  the pane id persists with the panel state.
 - `lib/src/widget_pick.dart`: a point on a render tree to the widgets
   that made it, with source lines (the debug build's creation stamps
   read through the inspector's JSON). Canvas inspection clicks, the
