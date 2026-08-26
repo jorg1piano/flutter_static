@@ -106,7 +106,9 @@ column it is constructed at: `Text "Primary"` at
 `story/stories/buttons.dart:13:11`, inside `HStack` at `:10:7`. The
 outermost story-file entry is inside the `Story(...)` that defines the
 story. The nearest one is selected and outlined on the card; a row
-selects another. "Copy location" copies `file:line:column`; "Open in
+selects another, and so do the arrow keys: the canvas takes focus on a
+pick, Up moves to the parent, Down to the child, Escape clears it.
+"Copy location" copies `file:line:column`; "Open in
 editor" runs `code -g file:line:column`, or whatever
 `FLUTTER_STATIC_EDITOR` names, with `{file}`, `{line}` and `{column}`
 placeholders. The click reaches nothing, in interact mode too. With a

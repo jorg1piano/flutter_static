@@ -1,7 +1,9 @@
 import 'dart:ui' show PointMode;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
+import '../widget_pick.dart';
 import 'controller.dart';
 import 'model.dart';
 import 'theme.dart';
@@ -22,6 +24,11 @@ class _StudioCanvasState extends State<StudioCanvas> {
   final _transform = TransformationController();
   String? _pageShown;
 
+  /// Takes focus after an Option-click, so the arrow keys walk the
+  /// picked chain instead of going to the terminal.
+  final _focus = FocusNode(debugLabel: 'canvas');
+  WidgetPick? _focusedPick;
+
   @override
   void initState() {
     super.initState();
@@ -31,9 +38,17 @@ class _StudioCanvasState extends State<StudioCanvas> {
   }
 
   @override
+  void reassemble() {
+    super.reassemble();
+    // A hot reload keeps the controller instance; make sure it listens.
+    widget.controller.watchKeyboard();
+  }
+
+  @override
   void dispose() {
     widget.controller.removeListener(_onController);
     _transform.dispose();
+    _focus.dispose();
     super.dispose();
   }
 
@@ -43,6 +58,9 @@ class _StudioCanvasState extends State<StudioCanvas> {
     ..scaleByDouble(0.5, 0.5, 1, 1);
 
   void _onController() {
+    final pick = widget.controller.pick;
+    if (pick != null && pick != _focusedPick) _focus.requestFocus();
+    _focusedPick = pick;
     final id = widget.controller.selectedPage?.id;
     if (id == _pageShown) return;
     _pageShown = id;
@@ -51,6 +69,25 @@ class _StudioCanvasState extends State<StudioCanvas> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _transform.value = _home;
     });
+  }
+
+  /// With a pick: Up to its parent, Down to its child, Escape to clear.
+  KeyEventResult _onKey(FocusNode node, KeyEvent event) {
+    final controller = widget.controller;
+    if (controller.pick == null || event is KeyUpEvent) {
+      return KeyEventResult.ignored;
+    }
+    switch (event.logicalKey) {
+      case LogicalKeyboardKey.arrowUp:
+        controller.pickParent();
+      case LogicalKeyboardKey.arrowDown:
+        controller.pickChild();
+      case LogicalKeyboardKey.escape:
+        controller.clearPick();
+      default:
+        return KeyEventResult.ignored;
+    }
+    return KeyEventResult.handled;
   }
 
   /// The canvas zoom: the x axis's scale (there is no rotation).
@@ -76,41 +113,47 @@ class _StudioCanvasState extends State<StudioCanvas> {
     builder: (context, _) {
       final controller = widget.controller;
       final page = controller.selectedPage;
-      return Container(
-        color: StudioColors.canvas,
-        child: Stack(
-          children: [
-            Positioned.fill(child: CustomPaint(painter: _DotGrid(_transform))),
-            Positioned.fill(
-              child: GestureDetector(
-                onTap: () => controller.selectStory(null),
-                child: InteractiveViewer(
-                  transformationController: _transform,
-                  constrained: false,
-                  minScale: 0.05,
-                  maxScale: 4,
-                  boundaryMargin: const EdgeInsets.all(4000),
-                  child: page == null
-                      ? const SizedBox(width: 400, height: 300)
-                      : _PageBody(page: page, controller: controller),
+      return Focus(
+        focusNode: _focus,
+        onKeyEvent: _onKey,
+        child: Container(
+          color: StudioColors.canvas,
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: CustomPaint(painter: _DotGrid(_transform)),
+              ),
+              Positioned.fill(
+                child: GestureDetector(
+                  onTap: () => controller.selectStory(null),
+                  child: InteractiveViewer(
+                    transformationController: _transform,
+                    constrained: false,
+                    minScale: 0.05,
+                    maxScale: 4,
+                    boundaryMargin: const EdgeInsets.all(4000),
+                    child: page == null
+                        ? const SizedBox(width: 400, height: 300)
+                        : _PageBody(page: page, controller: controller),
+                  ),
                 ),
               ),
-            ),
-            Positioned(
-              left: 16,
-              top: 12,
-              child: _PageTitle(page: page, controller: controller),
-            ),
-            Positioned(
-              right: 16,
-              top: 12,
-              child: ListenableBuilder(
-                listenable: _transform,
-                builder: (context, _) =>
-                    _ZoomControls(scale: _scale, onZoom: _zoomTo),
+              Positioned(
+                left: 16,
+                top: 12,
+                child: _PageTitle(page: page, controller: controller),
               ),
-            ),
-          ],
+              Positioned(
+                right: 16,
+                top: 12,
+                child: ListenableBuilder(
+                  listenable: _transform,
+                  builder: (context, _) =>
+                      _ZoomControls(scale: _scale, onZoom: _zoomTo),
+                ),
+              ),
+            ],
+          ),
         ),
       );
     },

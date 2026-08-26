@@ -194,6 +194,14 @@ class _WidgetChain extends StatelessWidget {
               style: StudioText.muted,
             ),
           ),
+        if (chain.any((w) => w.isLocal))
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(
+              '↑ parent   ↓ child   esc clear',
+              style: StudioText.monoMuted,
+            ),
+          ),
         if (picked?.location != null) ...[
           const SizedBox(height: 10),
           Wrap(

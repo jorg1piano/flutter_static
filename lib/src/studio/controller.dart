@@ -39,7 +39,7 @@ class StudioController extends ChangeNotifier {
   }) {
     catalogVersion.addListener(_onVersion);
     catalogReloadTick.addListener(notifyListeners);
-    HardwareKeyboard.instance.addHandler(_onKey);
+    watchKeyboard();
     _loadSizes();
     refreshIndex();
     loadTokens();
@@ -240,6 +240,17 @@ class StudioController extends ChangeNotifier {
   /// under the pointer instead of reaching it or selecting the card.
   bool altHeld = false;
 
+  bool _watchingKeyboard = false;
+
+  /// Starts tracking Option. Idempotent: the constructor calls it, and
+  /// so does the canvas on hot reload, which never re-runs a constructor
+  /// (Studio's own code reloads when it is a path dependency).
+  void watchKeyboard() {
+    if (_watchingKeyboard) return;
+    _watchingKeyboard = true;
+    HardwareKeyboard.instance.addHandler(_onKey);
+  }
+
   bool _onKey(KeyEvent event) {
     final alt = HardwareKeyboard.instance.isAltPressed;
     if (alt != altHeld) {
@@ -285,6 +296,31 @@ class StudioController extends ChangeNotifier {
 
   void setPickIndex(int index) {
     pickIndex = index;
+    notifyListeners();
+  }
+
+  /// Moves the selection one project widget outward in the chain: the
+  /// row above in the inspector. Stays put at the outermost.
+  void pickParent() => _movePick(1);
+
+  /// The row below: one project widget inward, towards what was clicked.
+  void pickChild() => _movePick(-1);
+
+  void _movePick(int step) {
+    final chain = pick?.chain;
+    if (chain == null) return;
+    for (var i = pickIndex + step; i >= 0 && i < chain.length; i += step) {
+      if (chain[i].isLocal) {
+        pickIndex = i;
+        notifyListeners();
+        return;
+      }
+    }
+  }
+
+  void clearPick() {
+    if (pick == null) return;
+    pick = null;
     notifyListeners();
   }
 

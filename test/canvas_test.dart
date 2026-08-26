@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_static/src/server_io.dart';
@@ -109,6 +111,51 @@ void main() {
     await tester.pumpAndSettle();
     expect(taps, 1);
     expect(controller.pick, isNull);
+    await tester.pump(const Duration(seconds: 1)); // the sizes-save timer
+  });
+
+  testWidgets('after a pick the arrows walk the chain and Escape clears it', (
+    tester,
+  ) async {
+    // Rooted at the package, so this file's widgets count as the
+    // project's and the chain has rows to walk.
+    controller.dispose();
+    controller = StudioController(
+      stories: const _ButtonStories(),
+      project: Directory.current.path,
+      port: 1,
+    );
+    await tester.pumpWidget(canvas());
+    await tester.pumpAndSettle();
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+    await tester.pump();
+    await tester.tap(find.text('Press me'), warnIfMissed: false);
+    await tester.pumpAndSettle();
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+    await tester.pump();
+    expect(controller.pickedWidget!.type, 'Text');
+
+    // Up: the parent; the outline and the row follow the same index.
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+    await tester.pump();
+    expect(controller.pickedWidget!.type, 'Container');
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+    await tester.pump();
+    expect(controller.pickedWidget!.type, 'GestureDetector');
+    // Down: back in.
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+    await tester.pump();
+    expect(controller.pickedWidget!.type, 'Container');
+    // Down past the clicked widget stays there.
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+    await tester.pump();
+    expect(controller.pickedWidget!.type, 'Text');
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pump();
+    expect(controller.pick, isNull);
+    expect(controller.selectedStoryId, 'buttons/one');
     await tester.pump(const Duration(seconds: 1)); // the sizes-save timer
   });
 }
