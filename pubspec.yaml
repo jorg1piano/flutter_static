@@ -17,6 +17,7 @@ dependencies:
   watcher: ^1.1.0
   xterm: ^4.0.0
   flutter_pty: ^0.4.2
+  speech_to_text: ^7.4.0
 
 dev_dependencies:
   flutter_test:

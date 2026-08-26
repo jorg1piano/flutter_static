@@ -1,7 +1,9 @@
-import 'dart:ui' show PointMode;
+import 'dart:io';
+import 'dart:ui' as ui show ImageByteFormat, PointMode;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 
 import '../phone_mockup.dart';
@@ -9,6 +11,7 @@ import '../widget_pick.dart';
 import 'controller.dart';
 import 'model.dart';
 import 'theme.dart';
+import 'voice.dart';
 
 /// The page on an infinite pan/zoom surface: rows of cells, each cell a
 /// stack of variant renders. Nothing here is editable; the canvas is a
@@ -23,6 +26,8 @@ class StudioCanvas extends StatefulWidget {
 }
 
 class _StudioCanvasState extends State<StudioCanvas> {
+  final _captureBoundary = GlobalKey();
+  final _contentKey = GlobalKey();
   final _transform = TransformationController();
   String? _pageShown;
 
@@ -30,6 +35,9 @@ class _StudioCanvasState extends State<StudioCanvas> {
   /// picked chain instead of going to the terminal.
   final _focus = FocusNode(debugLabel: 'canvas');
   WidgetPick? _focusedPick;
+  Offset? _boxStart;
+  Offset? _boxCurrent;
+  Rect? _promptForBox;
 
   @override
   void initState() {
@@ -73,12 +81,17 @@ class _StudioCanvasState extends State<StudioCanvas> {
     });
   }
 
-  /// With a pick: Up to its parent, Down to its child, Escape to clear.
+  /// Figma-ish canvas keys: Shift+1 fits the page; with a pick, Up moves
+  /// to its parent, Down to its child, Escape clears it.
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     final controller = widget.controller;
-    if (controller.pick == null || event is KeyUpEvent) {
-      return KeyEventResult.ignored;
+    if (event is KeyUpEvent) return KeyEventResult.ignored;
+    if (HardwareKeyboard.instance.isShiftPressed &&
+        event.logicalKey == LogicalKeyboardKey.digit1) {
+      _fitToScreen();
+      return KeyEventResult.handled;
     }
+    if (controller.pick == null) return KeyEventResult.ignored;
     switch (event.logicalKey) {
       case LogicalKeyboardKey.arrowUp:
         controller.pickParent();
@@ -96,17 +109,111 @@ class _StudioCanvasState extends State<StudioCanvas> {
   /// `getMaxScaleOnAxis` would include z, which stays at 1.
   double get _scale => _transform.value.storage[0];
 
+  Offset _scenePosition(Offset global) {
+    final box = context.findRenderObject() as RenderBox;
+    return _transform.toScene(box.globalToLocal(global));
+  }
+
+  void _startBox(PointerDownEvent event) {
+    if (!widget.controller.metaHeld) return;
+    setState(() {
+      _boxStart = _scenePosition(event.position);
+      _boxCurrent = _boxStart;
+    });
+  }
+
+  void _updateBox(PointerMoveEvent event) {
+    if (_boxStart == null) return;
+    setState(() => _boxCurrent = _scenePosition(event.position));
+  }
+
+  void _finishBox(PointerEvent event) {
+    final start = _boxStart;
+    final current = _boxCurrent;
+    Rect? rect;
+    if (start != null && current != null) {
+      rect = Rect.fromPoints(start, current);
+      widget.controller.addLooseBox(rect);
+    }
+    if (_boxStart != null) {
+      setState(() {
+        _boxStart = null;
+        _boxCurrent = null;
+        if (rect != null && rect.width.abs() >= 4 && rect.height.abs() >= 4) {
+          _promptForBox = rect;
+        }
+      });
+    }
+  }
+
+  Future<String?> _captureAiImage() async {
+    final boundary = _captureBoundary.currentContext?.findRenderObject();
+    if (boundary is! RenderRepaintBoundary) return null;
+    final image = await boundary.toImage(pixelRatio: 2);
+    final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
+    if (bytes == null) return null;
+    final file = File(
+      '${Directory.systemTemp.path}/flutter_static_ai_${DateTime.now().microsecondsSinceEpoch}.png',
+    );
+    await file.writeAsBytes(bytes.buffer.asUint8List());
+    return file.path;
+  }
+
+  Rect _viewportRect(Rect sceneRect) {
+    final normalized = Rect.fromLTRB(
+      sceneRect.left < sceneRect.right ? sceneRect.left : sceneRect.right,
+      sceneRect.top < sceneRect.bottom ? sceneRect.top : sceneRect.bottom,
+      sceneRect.left > sceneRect.right ? sceneRect.left : sceneRect.right,
+      sceneRect.top > sceneRect.bottom ? sceneRect.top : sceneRect.bottom,
+    );
+    return MatrixUtils.transformRect(_transform.value, normalized);
+  }
+
   void _zoomTo(double scale) {
     final size = context.size ?? const Size(800, 600);
-    final centre = Offset(size.width / 2, size.height / 2);
-    final current = _transform.value;
-    final factor = scale / _scale;
+    _zoomAround(scale, Offset(size.width / 2, size.height / 2));
+  }
+
+  void _fitToScreen() {
+    final viewport = context.size ?? const Size(800, 600);
+    final content = _contentKey.currentContext?.findRenderObject();
+    if (content is! RenderBox || content.size.isEmpty) return;
+    const padding = 48.0;
+    final sx = (viewport.width - padding * 2) / content.size.width;
+    final sy = (viewport.height - padding * 2) / content.size.height;
+    final scale = (sx < sy ? sx : sy).clamp(0.05, 4.0);
+    final dx = (viewport.width - content.size.width * scale) / 2;
+    final dy = (viewport.height - content.size.height * scale) / 2;
     _transform.value = Matrix4.identity()
-      ..translateByDouble(centre.dx, centre.dy, 0, 1)
+      ..translateByDouble(dx, dy, 0, 1)
+      ..scaleByDouble(scale, scale, 1, 1);
+    setState(() {});
+  }
+
+  void _zoomAround(double scale, Offset viewportPoint) {
+    final target = scale.clamp(0.05, 4.0);
+    final factor = target / _scale;
+    if (factor == 1) return;
+    final current = _transform.value;
+    _transform.value = Matrix4.identity()
+      ..translateByDouble(viewportPoint.dx, viewportPoint.dy, 0, 1)
       ..scaleByDouble(factor, factor, 1, 1)
-      ..translateByDouble(-centre.dx, -centre.dy, 0, 1)
+      ..translateByDouble(-viewportPoint.dx, -viewportPoint.dy, 0, 1)
       ..multiply(current);
     setState(() {});
+  }
+
+  void _onPointerSignal(PointerSignalEvent event) {
+    if (event is! PointerScrollEvent) return;
+    if (!HardwareKeyboard.instance.isMetaPressed) return;
+    GestureBinding.instance.pointerSignalResolver.register(event, (event) {
+      if (event is! PointerScrollEvent) return;
+      final box = context.findRenderObject();
+      if (box is! RenderBox) return;
+      final point = box.globalToLocal(event.position);
+      final factor = 1 - event.scrollDelta.dy / 300;
+      _zoomAround(_scale * factor.clamp(0.7, 1.3), point);
+    });
   }
 
   @override
@@ -117,31 +224,83 @@ class _StudioCanvasState extends State<StudioCanvas> {
       final page = controller.selectedPage;
       return Focus(
         focusNode: _focus,
+        autofocus: true,
         onKeyEvent: _onKey,
         child: Container(
           color: StudioColors.canvas,
           child: Stack(
             children: [
               Positioned.fill(
-                child: CustomPaint(painter: _DotGrid(_transform)),
-              ),
-              Positioned.fill(
-                child: GestureDetector(
-                  onTap: () => controller.selectStory(null),
-                  child: InteractiveViewer(
-                    transformationController: _transform,
-                    constrained: false,
-                    minScale: 0.05,
-                    maxScale: 4,
-                    boundaryMargin: const EdgeInsets.all(4000),
-                    panEnabled: controller.spaceHeld,
-                    child: page == null
-                        ? const SizedBox(width: 400, height: 300)
-                        : _PageBody(page: page, controller: controller),
+                child: RepaintBoundary(
+                  key: _captureBoundary,
+                  child: Stack(
+                    children: [
+                      Positioned.fill(
+                        child: CustomPaint(painter: _DotGrid(_transform)),
+                      ),
+                      Positioned.fill(
+                        child: Listener(
+                          onPointerSignal: _onPointerSignal,
+                          child: GestureDetector(
+                            onTap: () => controller.selectStory(null),
+                            child: InteractiveViewer(
+                              transformationController: _transform,
+                              constrained: false,
+                              minScale: 0.05,
+                              maxScale: 4,
+                              boundaryMargin: const EdgeInsets.all(4000),
+                              panEnabled: controller.spaceHeld,
+                              child: page == null
+                                  ? SizedBox(
+                                      key: _contentKey,
+                                      width: 400,
+                                      height: 300,
+                                    )
+                                  : _PageBody(
+                                      key: _contentKey,
+                                      page: page,
+                                      controller: controller,
+                                    ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      Positioned.fill(
+                        child: IgnorePointer(
+                          child: CustomPaint(
+                            painter: _LooseBoxPainter(
+                              transform: _transform,
+                              boxes: controller.looseBoxes,
+                              draft: _boxStart == null || _boxCurrent == null
+                                  ? null
+                                  : Rect.fromPoints(_boxStart!, _boxCurrent!),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
+              if (controller.metaHeld)
+                Positioned.fill(
+                  child: Listener(
+                    behavior: HitTestBehavior.opaque,
+                    onPointerDown: _startBox,
+                    onPointerMove: _updateBox,
+                    onPointerUp: _finishBox,
+                    onPointerCancel: _finishBox,
+                  ),
+                ),
               Positioned.fill(child: _PanCursorOverlay(controller: controller)),
+              if (_promptForBox case final Rect rect)
+                _AiComponentPrompt(
+                  box: rect,
+                  anchor: _viewportRect(rect),
+                  controller: controller,
+                  captureImage: _captureAiImage,
+                  onClose: () => setState(() => _promptForBox = null),
+                ),
               Positioned(
                 left: 16,
                 top: 12,
@@ -188,7 +347,9 @@ class _PanCursorOverlayState extends State<_PanCursorOverlay> {
     super.dispose();
   }
 
-  MouseCursor get _cursor => _dragging && widget.controller.spaceHeld
+  MouseCursor get _cursor => widget.controller.metaHeld
+      ? SystemMouseCursors.precise
+      : _dragging && widget.controller.spaceHeld
       ? SystemMouseCursors.grabbing
       : widget.controller.spaceHeld
       ? SystemMouseCursors.grab
@@ -214,6 +375,264 @@ class _PanCursorOverlayState extends State<_PanCursorOverlay> {
     opaque: false,
     child: const SizedBox.expand(),
   );
+}
+
+class _AiComponentPrompt extends StatefulWidget {
+  const _AiComponentPrompt({
+    required this.box,
+    required this.anchor,
+    required this.controller,
+    required this.captureImage,
+    required this.onClose,
+  });
+
+  final Rect box;
+  final Rect anchor;
+  final StudioController controller;
+  final Future<String?> Function() captureImage;
+  final VoidCallback onClose;
+
+  @override
+  State<_AiComponentPrompt> createState() => _AiComponentPromptState();
+}
+
+class _AiComponentPromptState extends State<_AiComponentPrompt> {
+  final _controller = TextEditingController();
+  late final MacVoiceInput _voice;
+  bool _startedForThisPrompt = false;
+  bool _stoppedOnCommandUp = false;
+  bool _autoSubmitOnCommandUp = false;
+  bool _submitting = false;
+  String _lastPanelDraft = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _voice = MacVoiceInput()..addListener(_onVoice);
+    _autoSubmitOnCommandUp = widget.controller.metaHeld;
+    _startedForThisPrompt = true;
+    _voice.start();
+  }
+
+  @override
+  void dispose() {
+    _voice
+      ..removeListener(_onVoice)
+      ..dispose();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _onVoice() {
+    if (!mounted) return;
+    final text = _voice.transcript.trim();
+    if (text.isNotEmpty) {
+      _controller.value = _controller.value.copyWith(
+        text: text,
+        selection: TextSelection.collapsed(offset: text.length),
+        composing: TextRange.empty,
+      );
+      _pushDraftToPanel(text);
+    }
+    setState(() {});
+  }
+
+  void _pushDraftToPanel(String text) {
+    final current = widget.controller.promptText;
+    if (_lastPanelDraft.isNotEmpty && current.endsWith(_lastPanelDraft)) {
+      widget.controller.setPromptText(
+        '${current.substring(0, current.length - _lastPanelDraft.length)}$text',
+      );
+    } else {
+      widget.controller.appendPromptText(text);
+    }
+    _lastPanelDraft = text;
+  }
+
+  void _syncVoiceWithCommand() {
+    if (_autoSubmitOnCommandUp &&
+        !widget.controller.metaHeld &&
+        _startedForThisPrompt &&
+        !_stoppedOnCommandUp) {
+      _stoppedOnCommandUp = true;
+      _stopVoiceThenSubmit();
+    }
+  }
+
+  Future<void> _stopVoiceThenSubmit() async {
+    final text = await _voice.stop();
+    if (!mounted) return;
+    if (text.isNotEmpty) {
+      final current = _controller.text.trim();
+      if (current.isEmpty || current != text) {
+        _controller.text = current.isEmpty ? text : '$current\n$text';
+      }
+    }
+    await _submit();
+  }
+
+  Future<void> _submit() async {
+    if (_submitting) return;
+    _submitting = true;
+    final imagePath = await widget.captureImage();
+    final text = _controller.text.trim();
+    if (text.isNotEmpty && text != _lastPanelDraft) _pushDraftToPanel(text);
+    final box = widget.box;
+    widget.controller.appendPromptText(
+      [
+        'Use the highlighted canvas rectangle: '
+            'x=${box.left.toStringAsFixed(1)}, y=${box.top.toStringAsFixed(1)}, '
+            'w=${box.width.abs().toStringAsFixed(1)}, h=${box.height.abs().toStringAsFixed(1)}.',
+        if (imagePath != null) 'Screenshot with the rectangle: $imagePath',
+      ].join('\n'),
+    );
+    widget.onClose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    _syncVoiceWithCommand();
+    final canvas = MediaQuery.sizeOf(context);
+    const width = 320.0;
+    final left = (widget.anchor.right + 16).clamp(
+      16.0,
+      (canvas.width - width - 16).clamp(16.0, double.infinity),
+    );
+    final top = widget.anchor.top.clamp(16.0, canvas.height - 220);
+    return Positioned(
+      left: left,
+      top: top,
+      width: width,
+      child: Material(
+        color: StudioColors.panel,
+        elevation: 12,
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            border: Border.all(color: StudioColors.border),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text('Add to Codex prompt', style: StudioText.title),
+                  ),
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    onPressed: widget.onClose,
+                    icon: const Icon(Icons.close, size: 16),
+                    color: StudioColors.muted,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _controller,
+                minLines: 4,
+                maxLines: 6,
+                autofocus: true,
+                style: StudioText.body,
+                decoration: InputDecoration(
+                  hintText: 'say what to change in this selection',
+                  hintStyle: StudioText.muted,
+                  filled: true,
+                  fillColor: StudioColors.raised,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: const BorderSide(color: StudioColors.border),
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: const BorderSide(color: StudioColors.border),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: const BorderSide(color: StudioColors.accent),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Icon(
+                    _voice.listening ? Icons.mic : Icons.mic_none,
+                    size: 14,
+                    color: _voice.listening
+                        ? StudioColors.accent
+                        : StudioColors.muted,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      _voice.error ??
+                          (_voice.listening
+                              ? 'Listening… release Command to send to Codex panel'
+                              : _voice.transcript.isEmpty
+                              ? 'Hold Command while drawing to dictate into the panel'
+                              : _voice.transcript),
+                      style: StudioText.monoMuted,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Align(
+                alignment: Alignment.centerRight,
+                child: FilledButton(
+                  onPressed: _submit,
+                  child: const Text('Send to panel'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _LooseBoxPainter extends CustomPainter {
+  const _LooseBoxPainter({
+    required this.transform,
+    required this.boxes,
+    required this.draft,
+  }) : super(repaint: transform);
+
+  final TransformationController transform;
+  final List<Rect> boxes;
+  final Rect? draft;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.save();
+    canvas.transform(transform.value.storage);
+    final fill = Paint()..color = const Color(0x227C9CFF);
+    final stroke = Paint()
+      ..color = StudioColors.accent
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2 / transform.value.storage[0];
+    for (final rect in [...boxes, ?draft]) {
+      final normalized = Rect.fromLTRB(
+        rect.left < rect.right ? rect.left : rect.right,
+        rect.top < rect.bottom ? rect.top : rect.bottom,
+        rect.left > rect.right ? rect.left : rect.right,
+        rect.top > rect.bottom ? rect.top : rect.bottom,
+      );
+      canvas.drawRect(normalized, fill);
+      canvas.drawRect(normalized, stroke);
+    }
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(_LooseBoxPainter old) =>
+      old.boxes != boxes || old.draft != draft || old.transform != transform;
 }
 
 class _PageTitle extends StatelessWidget {
@@ -290,7 +709,7 @@ class _ZoomButton extends StatelessWidget {
 }
 
 class _PageBody extends StatelessWidget {
-  const _PageBody({required this.page, required this.controller});
+  const _PageBody({super.key, required this.page, required this.controller});
 
   final StudioPage page;
   final StudioController controller;
@@ -414,27 +833,21 @@ class _CellInsertTargetState extends State<_CellInsertTarget> {
             slotIndex: widget.slotIndex,
           ),
           child: SizedBox(
-            width: 24,
-            height: 44,
-            child: Center(
-              child: AnimatedOpacity(
-                duration: const Duration(milliseconds: 100),
-                opacity: hot || _hover ? 1 : 0,
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: StudioColors.panel,
-                    shape: BoxShape.circle,
-                    border: Border.all(
-                      color: hot ? StudioColors.accent : StudioColors.faint,
+            width: 32,
+            height: _slotSize(widget.controller).height,
+            child: Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Positioned.fill(
+                  child: Center(
+                    child: AnimatedOpacity(
+                      duration: const Duration(milliseconds: 100),
+                      opacity: hot || _hover ? 1 : 0,
+                      child: const _InsertPlus(),
                     ),
                   ),
-                  child: Icon(
-                    Icons.add,
-                    size: 16,
-                    color: hot ? StudioColors.accent : StudioColors.muted,
-                  ),
                 ),
-              ),
+              ],
             ),
           ),
         ),
@@ -442,6 +855,32 @@ class _CellInsertTargetState extends State<_CellInsertTarget> {
     },
   );
 }
+
+class _InsertPlus extends StatelessWidget {
+  const _InsertPlus();
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+    width: 56,
+    height: 56,
+    child: DecoratedBox(
+      decoration: BoxDecoration(
+        color: StudioColors.panel,
+        shape: BoxShape.circle,
+        border: Border.all(color: StudioColors.faint),
+      ),
+      child: const Icon(Icons.add, size: 40, color: StudioColors.muted),
+    ),
+  );
+}
+
+Size _slotSize(StudioController controller) =>
+    controller.selectedPage?.isLine == true
+    ? PhoneMockup(
+        spec: controller.deviceSpec ?? PhoneSpec.fallback,
+        child: const SizedBox.shrink(),
+      ).size
+    : const Size(260, 220);
 
 class _CellSlot extends StatelessWidget {
   const _CellSlot({
@@ -467,23 +906,30 @@ class _CellSlot extends StatelessWidget {
     ),
     builder: (context, candidates, _) {
       final hot = candidates.isNotEmpty;
-      final size = controller.selectedPage?.isLine == true
-          ? PhoneMockup(
-              spec: controller.deviceSpec ?? PhoneSpec.fallback,
-              child: const SizedBox.shrink(),
-            ).size
-          : const Size(260, 220);
-      return AnimatedContainer(
-        duration: const Duration(milliseconds: 120),
-        width: size.width,
-        height: size.height,
-        decoration: BoxDecoration(
-          color: hot ? StudioColors.hover : Colors.transparent,
-          border: Border.all(
-            color: hot ? StudioColors.accent : StudioColors.faint,
-            width: hot ? 2 : 1,
+      final size = _slotSize(controller);
+      return GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => controller.createMockAtSlot(
+          pageId: pageId,
+          rowIndex: rowIndex,
+          slotIndex: slotIndex,
+        ),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 120),
+          width: size.width,
+          height: size.height,
+          decoration: BoxDecoration(
+            color: hot ? StudioColors.hover : Colors.transparent,
+            border: Border.all(
+              color: hot ? StudioColors.accent : StudioColors.faint,
+              width: hot ? 2 : 1,
+            ),
+            borderRadius: BorderRadius.circular(12),
           ),
-          borderRadius: BorderRadius.circular(12),
+          child: const Padding(
+            padding: EdgeInsets.all(12),
+            child: Align(alignment: Alignment.topLeft, child: _InsertPlus()),
+          ),
         ),
       );
     },
@@ -602,7 +1048,9 @@ class _CellColumn extends StatelessWidget {
         pageId: pageId,
         cellId: slot.id,
         title: slot.title,
-        child: StoryCard(id: slot.storyId, controller: controller),
+        child: slot.mockFile == null
+            ? StoryCard(id: slot.storyId, controller: controller)
+            : _MockCard(file: slot.mockFile!, controller: controller),
       ),
       if (slot.variantLabel != null) ...[
         const SizedBox(height: 8),
@@ -613,6 +1061,44 @@ class _CellColumn extends StatelessWidget {
       ],
     ],
   );
+}
+
+class _MockCard extends StatelessWidget {
+  const _MockCard({required this.file, required this.controller});
+
+  final String file;
+  final StudioController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final size = _slotSize(controller);
+    return SizedBox(
+      width: size.width,
+      height: size.height,
+      child: PhoneMockup(
+        spec: controller.deviceSpec ?? PhoneSpec.fallback,
+        statusBar: controller.statusBar,
+        child: Container(
+          color: const Color(0xFFF8F4ED),
+          alignment: Alignment.center,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.dashboard_customize_outlined,
+                color: StudioColors.accent,
+                size: 40,
+              ),
+              const SizedBox(height: 12),
+              Text('Mock', style: StudioText.title.copyWith(fontSize: 22)),
+              const SizedBox(height: 6),
+              Text(file.split('/').last, style: StudioText.monoMuted),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 /// One story on the canvas: mounted live when the catalog knows a shell
@@ -874,7 +1360,7 @@ class _DotGrid extends CustomPainter {
         for (var y = dy; y < size.height; y += step) Offset(x, y),
     ];
     canvas.drawPoints(
-      PointMode.points,
+      ui.PointMode.points,
       points,
       Paint()
         ..color = StudioColors.canvasDot

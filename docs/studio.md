@@ -229,10 +229,11 @@ nothing anywhere; it types into that terminal:
 Because the shell is a login shell, PATH is your terminal's. The
 "new shell" button restarts it; a shell that exits says so.
 
-An earlier version ran Claude Code headless (`claude -p`) from a chat
-box. It worked, but it was a second, thinner harness around the same
-tool, and whether a subscription covers a third-party app spawning it
-was unclear from the docs. The terminal is the user's own session.
+The canvas AI rectangle prompt runs a one-shot edit command. By default
+it uses `codex exec --sandbox workspace-write --approve-for-me {image}
+{prompt}`; override it with `FLUTTER_STATIC_ONESHOT`. The
+template may contain `{prompt}`, `{promptFile}` or `{image}`. Without
+any of them, Studio pipes the prompt file to the command's stdin.
 
 ## Storyline rows in the index
 

@@ -26,6 +26,10 @@
 	<string>$(PRODUCT_COPYRIGHT)</string>
 	<key>NSMainNibFile</key>
 	<string>MainMenu</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Flutter Static Studio uses the microphone to dictate AI edit prompts.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Flutter Static Studio uses speech recognition to dictate AI edit prompts.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>

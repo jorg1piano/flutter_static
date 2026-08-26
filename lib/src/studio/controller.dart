@@ -38,6 +38,7 @@ class StudioSlot {
     required this.title,
     required this.storyId,
     this.variantLabel,
+    this.mockFile,
   });
 
   final String id;
@@ -45,6 +46,7 @@ class StudioSlot {
   final String title;
   final String storyId;
   final String? variantLabel;
+  final String? mockFile;
 }
 
 class StudioController extends ChangeNotifier {
@@ -81,7 +83,8 @@ class StudioController extends ChangeNotifier {
   List<StudioPage> pages = const [];
 
   /// Studio-only freeform slots on each row. Null means an intentional
-  /// gap; hot reload rebuilds [pages] and this arrangement starts fresh.
+  /// gap. Kept across hot reloads so creating a mock file does not make
+  /// the just-inserted slot flash away.
   final _storySlots = <String, List<List<StudioSlot?>>>{};
   final _slotUndo = <Map<String, List<List<StudioSlot?>>>>[];
 
@@ -107,6 +110,27 @@ class StudioController extends ChangeNotifier {
 
   /// Stories shown as renders even while [live] is on.
   final renderOnly = <String>{};
+
+  final looseBoxes = <Rect>[];
+
+  /// Text in the Codex prompt panel. Canvas voice/selection tools append to
+  /// this, and the panel edits it directly.
+  String promptText = '';
+
+  void setPromptText(String text) {
+    if (promptText == text) return;
+    promptText = text;
+    notifyListeners();
+  }
+
+  void appendPromptText(String text) {
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return;
+    promptText = promptText.trim().isEmpty
+        ? trimmed
+        : '${promptText.trim()}\n\n$trimmed';
+    notifyListeners();
+  }
 
   final _pngs = <String, StoryPng>{};
   final _inflight = <String>{};
@@ -222,8 +246,6 @@ class StudioController extends ChangeNotifier {
   // --- stories ------------------------------------------------------------
 
   void refreshIndex() {
-    _storySlots.clear();
-    _slotUndo.clear();
     try {
       pages = pagesFromIndex(storiesIndex(stories));
     } catch (e) {
@@ -258,9 +280,9 @@ class StudioController extends ChangeNotifier {
     notifyListeners();
   }
 
-  static const _emptySlotsLeft = 8;
-  static const _emptySlotsRight = 8;
-  static const _extraEmptyRows = 4;
+  static const _emptySlotsLeft = 1;
+  static const _emptySlotsRight = 1;
+  static const _extraEmptyRows = 1;
 
   int slotRowCount(StudioPage page) =>
       page.isLine ? _pageSlots(page).length : page.rows.length;
@@ -336,6 +358,15 @@ class StudioController extends ChangeNotifier {
       ],
   };
 
+  void undoCanvas() {
+    if (looseBoxes.isNotEmpty) {
+      looseBoxes.removeLast();
+      notifyListeners();
+      return;
+    }
+    undoLayout();
+  }
+
   void undoLayout() {
     if (_slotUndo.isEmpty) return;
     _storySlots
@@ -343,6 +374,73 @@ class StudioController extends ChangeNotifier {
       ..addAll(_slotUndo.removeLast());
     notifyListeners();
   }
+
+  void addLooseBox(Rect rect) {
+    if (rect.width.abs() < 4 || rect.height.abs() < 4) return;
+    looseBoxes.add(rect);
+    notifyListeners();
+  }
+
+  void removeLooseBox(Rect rect) {
+    if (looseBoxes.remove(rect)) notifyListeners();
+  }
+
+  Future<void> runOneShotEdit({
+    required String prompt,
+    required Rect box,
+    String? imagePath,
+  }) async {
+    final page = selectedPage;
+    final story = selectedStoryId;
+    final text = [
+      'You are editing the Flutter project at $project.',
+      if (page != null) 'The current Studio page is ${page.id}.',
+      if (story != null) 'The selected story is `$story`.',
+      'The user drew a rectangle at canvas coordinates '
+          '${box.left.toStringAsFixed(1)},${box.top.toStringAsFixed(1)} '
+          '${box.width.toStringAsFixed(1)}x${box.height.toStringAsFixed(1)}.',
+      if (imagePath != null)
+        'A screenshot of the full mockup/canvas with the rectangle is at '
+            '$imagePath. Use it because the rectangle may point to whitespace.',
+      'User request: $prompt',
+    ].join('\n');
+    final promptFile = File('$project/.dart_tool/flutter_static_ai_prompt.txt');
+    promptFile.parent.createSync(recursive: true);
+    promptFile.writeAsStringSync(text);
+    final template =
+        Platform.environment['FLUTTER_STATIC_ONESHOT'] ??
+        'codex exec --sandbox workspace-write --approve-for-me {image} {prompt}';
+    final command = template
+        .replaceAll('{prompt}', _shellQuote(text))
+        .replaceAll('{promptFile}', _shellQuote(promptFile.path))
+        .replaceAll(
+          '{image}',
+          imagePath == null ? '' : '-i ${_shellQuote(imagePath)}',
+        );
+    final shellCommand =
+        template.contains('{prompt}') ||
+            template.contains('{promptFile}') ||
+            template.contains('{image}')
+        ? command
+        : '$command < ${_shellQuote(promptFile.path)}';
+    log('AI edit: $shellCommand');
+    try {
+      final result = await Process.run('/bin/sh', [
+        '-lc',
+        shellCommand,
+      ], workingDirectory: project);
+      if ('${result.stdout}'.trim().isNotEmpty) log('${result.stdout}'.trim());
+      if (result.exitCode != 0) {
+        log('AI edit failed (${result.exitCode}): ${result.stderr}'.trim());
+      } else if ('${result.stderr}'.trim().isNotEmpty) {
+        log('${result.stderr}'.trim());
+      }
+    } on Object catch (e) {
+      log('AI edit failed: $e');
+    }
+  }
+
+  static String _shellQuote(String s) => "'${s.replaceAll("'", r"'\''")}'";
 
   /// Moves a canvas cell into a concrete slot. Empty slots are preserved,
   /// so a screen can leave a gap behind it. This is a Studio-only layout
@@ -399,9 +497,45 @@ class StudioController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Inserts an empty slot before [slotIndex], shifting only that row's
-  /// content to the right until the next gap. This is what the plus
-  /// button between screens does.
+  void createMockAtSlot({
+    required String pageId,
+    required int rowIndex,
+    required int slotIndex,
+  }) {
+    final page = pages.where((p) => p.id == pageId).firstOrNull;
+    if (page == null || rowIndex < 0 || slotIndex < 0) return;
+    final pageSlots = [
+      for (final row in _pageSlots(page)) [...row],
+    ];
+    final width = pageSlots.fold<int>(
+      0,
+      (max, row) => row.length > max ? row.length : max,
+    );
+    while (rowIndex >= pageSlots.length) {
+      pageSlots.add([for (var i = 0; i < width; i++) null]);
+    }
+    while (slotIndex >= pageSlots[rowIndex].length) {
+      for (final row in pageSlots) {
+        row.add(null);
+      }
+    }
+    if (pageSlots[rowIndex][slotIndex] != null) return;
+    final mock = _createMockFile(
+      pageId: pageId,
+      rowIndex: rowIndex,
+      slotIndex: slotIndex,
+    );
+    if (mock == null) return;
+    _slotUndo.add(_copySlots());
+    if (_slotUndo.length > 100) _slotUndo.removeAt(0);
+    pageSlots[rowIndex][slotIndex] = mock;
+    _storySlots[pageId] = pageSlots;
+    notifyListeners();
+  }
+
+  /// Inserts a mock before [slotIndex], shifting only that row's content
+  /// to the right until the next gap. This is what the plus button
+  /// between screens does.
   void insertEmptySlot({
     required String pageId,
     required int rowIndex,
@@ -437,9 +571,70 @@ class StudioController extends ChangeNotifier {
     for (var i = gap; i > slotIndex; i--) {
       target[i] = target[i - 1];
     }
-    target[slotIndex] = null;
+    final mock = _createMockFile(
+      pageId: pageId,
+      rowIndex: rowIndex,
+      slotIndex: slotIndex,
+    );
+    target[slotIndex] = mock;
     _storySlots[pageId] = pageSlots;
     notifyListeners();
+  }
+
+  StudioSlot? _createMockFile({
+    required String pageId,
+    required int rowIndex,
+    required int slotIndex,
+  }) {
+    try {
+      final dir = Directory('$project/story/mocks');
+      dir.createSync(recursive: true);
+      final base = _slug('${pageId}_r${rowIndex + 1}_c${slotIndex + 1}');
+      var file = File('${dir.path}/$base.dart');
+      var n = 2;
+      while (file.existsSync()) {
+        file = File('${dir.path}/${base}_$n.dart');
+        n++;
+      }
+      final name = _mockName(
+        file.uri.pathSegments.last.replaceAll('.dart', ''),
+      );
+      file.writeAsStringSync('''
+import 'package:flutter/material.dart';
+
+/// Mock created from Flutter Static Studio.
+class $name extends StatelessWidget {
+  const $name({super.key});
+
+  @override
+  Widget build(BuildContext context) => const Placeholder();
+}
+''');
+      log('Created ${file.path}');
+      return StudioSlot(
+        id: 'mock:${file.path}',
+        cellId: 'mock:${file.path}',
+        title: 'Mock',
+        storyId: '',
+        mockFile: file.path,
+      );
+    } on Object catch (e) {
+      log('mock file: $e');
+      return null;
+    }
+  }
+
+  static String _slug(String input) => input
+      .toLowerCase()
+      .replaceAll(RegExp(r'[^a-z0-9]+'), '_')
+      .replaceAll(RegExp(r'^_+|_+$'), '');
+
+  static String _mockName(String slug) {
+    final parts = slug.split('_').where((p) => p.isNotEmpty);
+    final name = parts
+        .map((p) => p[0].toUpperCase() + (p.length == 1 ? '' : p.substring(1)))
+        .join();
+    return name.isEmpty ? 'StudioMock' : '${name}Mock';
   }
 
   /// Inserts a dragged canvas cell before [slotIndex], shifting only that
@@ -539,6 +734,9 @@ class StudioController extends ChangeNotifier {
   /// Whether Space is held: while down, canvas drags pan the surface.
   bool spaceHeld = false;
 
+  /// Whether Command is held: while down, drags draw loose boxes.
+  bool metaHeld = false;
+
   bool _watchingKeyboard = false;
 
   /// Starts tracking Option. Idempotent: the constructor calls it, and
@@ -555,14 +753,16 @@ class StudioController extends ChangeNotifier {
     if (event is KeyDownEvent &&
         event.logicalKey == LogicalKeyboardKey.keyZ &&
         (keyboard.isControlPressed || keyboard.isMetaPressed)) {
-      undoLayout();
+      undoCanvas();
       return true;
     }
     final alt = keyboard.isAltPressed;
     final space = keyboard.isLogicalKeyPressed(LogicalKeyboardKey.space);
-    if (alt != altHeld || space != spaceHeld) {
+    final meta = keyboard.isMetaPressed;
+    if (alt != altHeld || space != spaceHeld || meta != metaHeld) {
       altHeld = alt;
       spaceHeld = space;
+      metaHeld = meta;
       notifyListeners();
     }
     return false;
