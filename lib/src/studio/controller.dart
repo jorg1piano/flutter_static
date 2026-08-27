@@ -19,10 +19,9 @@ import '../tokens.dart';
 import '../widget_pick.dart';
 import 'herdr.dart';
 import 'model.dart';
+import 'source_edit.dart';
 
 enum CatalogStatus { ready, reloading, error }
-
-typedef StudioMockBuilder = Widget? Function(String file);
 
 /// One fetched render, with the version and options it was captured at.
 class StoryPng {
@@ -41,7 +40,6 @@ class StudioSlot {
     required this.title,
     required this.storyId,
     this.variantLabel,
-    this.mockFile,
   });
 
   final String id;
@@ -49,7 +47,6 @@ class StudioSlot {
   final String title;
   final String storyId;
   final String? variantLabel;
-  final String? mockFile;
 }
 
 class StudioController extends ChangeNotifier {
@@ -57,7 +54,6 @@ class StudioController extends ChangeNotifier {
     required this.stories,
     required this.project,
     required this.port,
-    this.mockBuilder,
   }) {
     catalogVersion.addListener(_onVersion);
     catalogReloadTick.addListener(notifyListeners);
@@ -70,7 +66,6 @@ class StudioController extends ChangeNotifier {
   final Stories stories;
   final String project;
   final int port;
-  final StudioMockBuilder? mockBuilder;
 
   String get url => 'http://localhost:$port';
   String get projectName => project.split('/').last;
@@ -93,8 +88,8 @@ class StudioController extends ChangeNotifier {
   List<StudioPage> pages = const [];
 
   /// Studio-only freeform slots on each row. Null means an intentional
-  /// gap. Kept across hot reloads so creating a mock file does not make
-  /// the just-inserted slot flash away.
+  /// gap. Kept across hot reloads so a cell just written to the storyline
+  /// file stays in its slot while the reload catches up.
   final _storySlots = <String, List<List<StudioSlot?>>>{};
   final _slotUndo = <Map<String, List<List<StudioSlot?>>>>[];
 
@@ -304,55 +299,48 @@ class StudioController extends ChangeNotifier {
     WidgetsBinding.instance.scheduleFrame();
   }
 
-  /// What the agent should know before a turn: where it is, what the
-  /// user is looking at, and how to check its work without touching the
-  /// process it is talking to.
+  /// What the agent needs before a turn: where it is, how to check its
+  /// work without touching this process, and what the user is looking
+  /// at. Facts, one per line; the agent reads it, nobody else should
+  /// have to.
   String agentContext({bool withSelection = true}) {
     final page = withSelection ? selectedPage : null;
     final story = withSelection ? selectedStoryId : null;
     final knobArgs = knobs.entries.map((e) => ' -k ${e.key}=${e.value}').join();
     return [
-      'You are working inside Flutter Static Studio on the Flutter project '
-          'at $project. Its story catalog is this very process, live at '
-          '$url, and it hot reloads every save under lib/, story/ and the '
-          'path packages. Never run `flutter_static up`, `run`, `down` or '
-          '`studio`; the catalog is already running.',
-      'Check your work by rendering: `dart run flutter_static render '
-          '<story id> -o /tmp/<name>.png` (run from the project), then read '
-          'the PNG. `dart run flutter_static list` lists story ids; '
-          '`dart run flutter_static tokens list` lists design tokens '
-          '(static consts in lib/**/tokens/*.dart), and `dart run '
-          'flutter_static tokens set <Group.name> <value>` edits one.',
-      'Prefer changing tokens and components over one-off values: the '
-          'design system lives in the path packages under packages/, the '
-          'stories in story/. Keep answers to a few sentences; the user '
-          'sees the result on the canvas.',
+      'Flutter Static Studio. Project: $project. The story catalog is '
+          'already running at $url and hot reloads saves under lib/, story/ '
+          'and packages/. Do not run `flutter_static up`, `run`, `down` or '
+          '`studio`.',
+      'Verify with `dart run flutter_static render <story id> -o '
+          '/tmp/<name>.png` (from the project), then read the PNG. `dart run '
+          'flutter_static list` lists story ids. `dart run flutter_static '
+          'tokens list` lists design tokens; `dart run flutter_static tokens '
+          'set <Group.name> <value>` edits one.',
+      'Change tokens and components in packages/ before one-off values. '
+          'Stories live in story/. Reply in a few sentences; the canvas '
+          'shows the result.',
       if (!withSelection) ...[
-        'When the user clicks a story on the canvas its id is typed into '
-            'this terminal in backticks, like `buttons/kinds`; a request '
-            'after such an id is about that story.',
-        'When the user clicks a widget on the canvas its source '
-            'position is typed in backticks, like '
-            '`story/stories/buttons.dart:13:11`: the file, line and column '
-            'where that widget is constructed. A request after one is '
-            'about that widget; edit that call to change what it shows, '
-            'and its class to change how it looks. '
-            '`dart run flutter_static inspect <story id> --at X,Y` (PNG '
-            'pixels) tells which widgets and lines made a point in a '
-            'render you are looking at.',
+        'A story id in backticks typed into this terminal, like '
+            '`buttons/kinds`, is what the user clicked; a request after it '
+            'is about that story.',
+        'A source position in backticks, like '
+            '`story/stories/buttons.dart:13:11`, is where the clicked widget '
+            'is constructed; a request after it is about that widget. Edit '
+            'the call to change what it shows, its class to change how it '
+            'looks. `dart run flutter_static inspect <story id> --at X,Y` '
+            'names the widgets and lines at a pixel of a render.',
       ],
-      if (page != null)
-        'The user is looking at the page "${page.title}" (${page.id}).',
+      if (page != null) 'Page: ${page.title} (${page.id}).',
       if (story != null)
-        'The selected story is `$story`; its render command is '
-            '`dart run flutter_static render $story$knobArgs`. Requests '
-            'that do not name a story are about this one.',
+        'Story: `$story`. Render it with `dart run flutter_static render '
+            '$story$knobArgs`. A request that names no story is about it.',
       ?_pickContext(),
     ].join('\n');
   }
 
-  /// The clicked widget, for the agent: the project's widgets from the
-  /// clicked one outward, each with its source line.
+  /// The clicked widget, for the agent: it and the project's widgets
+  /// around it, each with its source line.
   String? _pickContext() {
     final pick = this.pick;
     final picked = pickedWidget;
@@ -372,15 +360,11 @@ class StudioController extends ChangeNotifier {
         if (w != picked) line(w),
     ];
     return [
-      'The user clicked a widget on the canvas and selected '
-          '${line(picked)}. Requests about "this", "it" or "the selected '
-          'widget" mean that one; the line is where it is constructed, so '
-          'edit that call to change what it shows and its own class to '
-          'change how it looks.',
-      if (outward.isNotEmpty)
-        'The project\'s widgets around it, from the selection outward: '
-            '${outward.join('; ')}.',
-    ].join(' ');
+      'Selected widget: ${line(picked)}. "This" or "it" means that widget; '
+          'the line is where it is constructed. Edit the call to change '
+          'what it shows, its class to change how it looks.',
+      if (outward.isNotEmpty) 'Around it, outward: ${outward.join('; ')}.',
+    ].join('\n');
   }
 
   StudioPage? get selectedPage {
@@ -490,6 +474,43 @@ class StudioController extends ChangeNotifier {
     selectedStoryId = id;
     selectedTokenGroup = null;
     pick = null;
+    notifyListeners();
+  }
+
+  /// The slot the canvas should scroll to, and a tick that changes each
+  /// time it is asked to; set by [revealStory].
+  String? revealSlotId;
+  int revealTick = 0;
+
+  /// Selects [id] on its page and asks the canvas to scroll to it. On a
+  /// plain page every variant of a cell shares one slot, the first
+  /// variant's.
+  void revealStory(String id) {
+    StudioPage? owner;
+    PageCell? cell;
+    for (final page in pages) {
+      for (final row in page.rows) {
+        for (final c in row.cells) {
+          if (c.variants.contains(id)) {
+            owner = page;
+            cell = c;
+            break;
+          }
+        }
+        if (cell != null) break;
+      }
+      if (cell != null) break;
+    }
+    if (owner == null || cell == null) {
+      log('reveal: no page shows $id');
+      return;
+    }
+    selectedPageId = owner.id;
+    selectedStoryId = id;
+    selectedTokenGroup = null;
+    pick = null;
+    revealSlotId = owner.isLine ? id : cell.variants.first;
+    revealTick++;
     notifyListeners();
   }
 
@@ -863,71 +884,52 @@ class $className extends StatelessWidget {
     notifyListeners();
   }
 
-  void createMockAtSlot({
+  /// Click on an empty slot: a new placeholder cell in the storyline
+  /// file, at that spot in the row, and the slot filled with it while
+  /// hot reload catches up. On a plain page, a new story in the page
+  /// file instead.
+  void newCellAtSlot({
     required String pageId,
     required int rowIndex,
     required int slotIndex,
   }) {
     final page = pages.where((p) => p.id == pageId).firstOrNull;
     if (page == null || rowIndex < 0 || slotIndex < 0) return;
+    if (!page.isLine) {
+      _writePageStory(page);
+      return;
+    }
     final pageSlots = [
       for (final row in _pageSlots(page)) [...row],
     ];
-    final width = pageSlots.fold<int>(
-      0,
-      (max, row) => row.length > max ? row.length : max,
-    );
-    while (rowIndex >= pageSlots.length) {
-      pageSlots.add([for (var i = 0; i < width; i++) null]);
-    }
-    while (slotIndex >= pageSlots[rowIndex].length) {
-      for (final row in pageSlots) {
-        row.add(null);
-      }
-    }
+    _growSlots(pageSlots, rowIndex, slotIndex);
     if (pageSlots[rowIndex][slotIndex] != null) return;
-    final mock = _createMockFile(
-      pageId: pageId,
-      rowIndex: rowIndex,
-      slotIndex: slotIndex,
-    );
-    if (mock == null) return;
+    final slot = _writeStorylineCell(page, pageSlots, rowIndex, slotIndex);
+    if (slot == null) return;
     _slotUndo.add(_copySlots());
     if (_slotUndo.length > 100) _slotUndo.removeAt(0);
-    pageSlots[rowIndex][slotIndex] = mock;
+    pageSlots[rowIndex][slotIndex] = slot;
     _storySlots[pageId] = pageSlots;
     notifyListeners();
   }
 
-  /// Inserts a mock before [slotIndex], shifting only that row's content
-  /// to the right until the next gap. This is what the plus button
-  /// between screens does.
-  void insertEmptySlot({
+  /// The plus between screens: a new cell before [slotIndex], the row's
+  /// content shifted right until the next gap.
+  void newCellBefore({
     required String pageId,
     required int rowIndex,
     required int slotIndex,
   }) {
     final page = pages.where((p) => p.id == pageId).firstOrNull;
     if (page == null || rowIndex < 0 || slotIndex < 0) return;
+    if (!page.isLine) {
+      _writePageStory(page);
+      return;
+    }
     final pageSlots = [
       for (final row in _pageSlots(page)) [...row],
     ];
-    final width = pageSlots.fold<int>(
-      0,
-      (max, row) => row.length > max ? row.length : max,
-    );
-    while (rowIndex >= pageSlots.length) {
-      pageSlots.add([for (var i = 0; i < width; i++) null]);
-    }
-    while (slotIndex >= pageSlots[rowIndex].length) {
-      for (final row in pageSlots) {
-        row.add(null);
-      }
-    }
-
-    _slotUndo.add(_copySlots());
-    if (_slotUndo.length > 100) _slotUndo.removeAt(0);
-
+    _growSlots(pageSlots, rowIndex, slotIndex);
     final target = pageSlots[rowIndex];
     var gap = target.indexWhere((slot) => slot == null, slotIndex);
     if (gap < 0) {
@@ -937,107 +939,154 @@ class $className extends StatelessWidget {
     for (var i = gap; i > slotIndex; i--) {
       target[i] = target[i - 1];
     }
-    final mock = _createMockFile(
-      pageId: pageId,
-      rowIndex: rowIndex,
-      slotIndex: slotIndex,
-    );
-    target[slotIndex] = mock;
+    target[slotIndex] = null;
+    final slot = _writeStorylineCell(page, pageSlots, rowIndex, slotIndex);
+    if (slot == null) return;
+    _slotUndo.add(_copySlots());
+    if (_slotUndo.length > 100) _slotUndo.removeAt(0);
+    target[slotIndex] = slot;
     _storySlots[pageId] = pageSlots;
     notifyListeners();
   }
 
-  StudioSlot? _createMockFile({
-    required String pageId,
-    required int rowIndex,
-    required int slotIndex,
-  }) {
+  static void _growSlots(
+    List<List<StudioSlot?>> pageSlots,
+    int rowIndex,
+    int slotIndex,
+  ) {
+    final width = pageSlots.fold<int>(
+      0,
+      (max, row) => row.length > max ? row.length : max,
+    );
+    while (rowIndex >= pageSlots.length) {
+      pageSlots.add([for (var i = 0; i < width; i++) null]);
+    }
+    while (slotIndex >= pageSlots[rowIndex].length) {
+      for (final row in pageSlots) {
+        row.add(null);
+      }
+    }
+  }
+
+  /// Writes a placeholder cell into the storyline's source, before the
+  /// cell in the next occupied slot of the row (or at the row's end),
+  /// and returns the slot that shows it. Undo on the canvas does not
+  /// undo the file.
+  StudioSlot? _writeStorylineCell(
+    StudioPage page,
+    List<List<StudioSlot?>> pageSlots,
+    int rowIndex,
+    int slotIndex,
+  ) {
     try {
-      final dir = Directory('$project/story/mocks');
-      dir.createSync(recursive: true);
-      final base = _slug('${pageId}_r${rowIndex + 1}_c${slotIndex + 1}');
-      var file = File('${dir.path}/$base.dart');
-      var n = 2;
-      while (file.existsSync()) {
-        file = File('${dir.path}/${base}_$n.dart');
+      final file = _storylineFile(page.id);
+      if (file == null) {
+        log("add screen: no file under story/ defines Storyline('${page.id}')");
+        return null;
+      }
+      final row = rowIndex < page.rows.length ? page.rows[rowIndex] : null;
+      int? before;
+      if (row != null) {
+        for (final slot in pageSlots[rowIndex].skip(slotIndex + 1)) {
+          if (slot == null) continue;
+          final index = row.cells.indexWhere((c) => c.id == slot.cellId);
+          if (index >= 0) {
+            before = index;
+            break;
+          }
+        }
+      }
+      final taken = {
+        for (final r in page.rows)
+          for (final c in r.cells) c.id,
+      };
+      var n = taken.length + 1;
+      while (taken.contains('screen-$n')) {
         n++;
       }
-      final name = _mockName(
-        file.uri.pathSegments.last.replaceAll('.dart', ''),
+      final cellId = 'screen-$n';
+      final title = 'Screen $n';
+      final text = addStorylineCell(
+        file.readAsStringSync(),
+        lineId: page.id,
+        rowIndex: rowIndex,
+        cellId: cellId,
+        title: title,
+        beforeCell: before,
+        cellCount: row?.cells.length ?? 0,
+        rowTitle: 'Row ${rowIndex + 1}',
       );
-      file.writeAsStringSync('''
-import 'package:flutter/material.dart';
-
-/// Mock created from Flutter Static Studio.
-class $name extends StatelessWidget {
-  const $name({super.key});
-
-  @override
-  Widget build(BuildContext context) => const Placeholder();
-}
-''');
-      _writeMockRegistry();
-      log('Created ${file.path}');
+      file.writeAsStringSync(ensureWidgetsImport(text));
+      log('Added $cellId to ${file.path}');
+      final storyId = '${page.id}/$cellId/default';
       return StudioSlot(
-        id: 'mock:${file.path}',
-        cellId: 'mock:${file.path}',
-        title: 'Mock',
-        storyId: '',
-        mockFile: file.path,
+        id: storyId,
+        cellId: cellId,
+        title: title,
+        storyId: storyId,
       );
     } on Object catch (e) {
-      log('mock file: $e');
+      log('add screen: $e');
       return null;
     }
   }
 
-  void _writeMockRegistry() {
-    final dir = Directory('$project/story/mocks');
-    if (!dir.existsSync()) return;
+  /// A placeholder story appended to a plain page's file. It shows once
+  /// hot reload lands, in the row its id puts it in.
+  void _writePageStory(StudioPage page) {
+    try {
+      final file = File('$project/story/stories/${page.id}.dart');
+      if (!file.existsSync()) {
+        log('add story: ${file.path} not found');
+        return;
+      }
+      final taken = {
+        for (final r in page.rows)
+          for (final c in r.cells) ...c.variants,
+      };
+      var n = taken.length + 1;
+      while (taken.contains('${page.id}/screen-$n')) {
+        n++;
+      }
+      final storyId = '${page.id}/screen-$n';
+      final text = addPageStory(file.readAsStringSync(), storyId: storyId);
+      file.writeAsStringSync(ensureWidgetsImport(text));
+      log('Added $storyId to ${file.path}');
+    } on Object catch (e) {
+      log('add story: $e');
+    }
+  }
+
+  /// The first Dart file under story/ that declares the storyline,
+  /// lines/ first.
+  File? _storylineFile(String lineId) {
+    final dir = Directory('$project/story');
+    if (!dir.existsSync()) return null;
+    final pattern = RegExp(
+      "Storyline\\(\\s*(['\"])${RegExp.escape(lineId)}\\1",
+    );
     final files =
         dir
-            .listSync()
+            .listSync(recursive: true)
             .whereType<File>()
             .where((f) => f.path.endsWith('.dart'))
-            .where((f) => !f.path.endsWith('/_studio_mocks.dart'))
+            .where((f) => !f.path.contains('/.dart_tool/'))
             .toList()
-          ..sort((a, b) => a.path.compareTo(b.path));
-    final imports = <String>[];
-    final cases = <String>[];
+          ..sort((a, b) {
+            final al = a.path.contains('/story/lines/') ? 0 : 1;
+            final bl = b.path.contains('/story/lines/') ? 0 : 1;
+            return al != bl ? al - bl : a.path.compareTo(b.path);
+          });
     for (final file in files) {
-      final name = _mockName(
-        file.uri.pathSegments.last.replaceAll('.dart', ''),
-      );
-      imports.add("import '${file.uri}';");
-      cases.add("    case '${file.path}': return const $name();");
+      if (pattern.hasMatch(file.readAsStringSync())) return file;
     }
-    File('${dir.path}/_studio_mocks.dart').writeAsStringSync('''
-// Generated by Flutter Static Studio. Do not edit by hand.
-import 'package:flutter/widgets.dart';
-
-${imports.join('\n')}
-
-Widget? buildStudioMock(String file) {
-  switch (file) {
-${cases.join('\n')}
-    default: return null;
-  }
-}
-''');
+    return null;
   }
 
   static String _slug(String input) => input
       .toLowerCase()
       .replaceAll(RegExp(r'[^a-z0-9]+'), '_')
       .replaceAll(RegExp(r'^_+|_+$'), '');
-
-  static String _mockName(String slug) {
-    final parts = slug.split('_').where((p) => p.isNotEmpty);
-    final name = parts
-        .map((p) => p[0].toUpperCase() + (p.length == 1 ? '' : p.substring(1)))
-        .join();
-    return name.isEmpty ? 'StudioMock' : '${name}Mock';
-  }
 
   /// Inserts a dragged canvas cell before [slotIndex], shifting only that
   /// row's content to the right until the next gap. Existing gaps

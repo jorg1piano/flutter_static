@@ -93,9 +93,31 @@ last image while a new one captures, so the canvas never blanks.
 
 Plain clicks on a live card inspect the widget under the pointer and
 select it in the widget tree. Hold Option while clicking to interact
-with the live widget inside the mockup. The canvas is a render target:
-nothing on it is draggable. Arrangement is the storyline's rows and
-cells in Dart, which is what the agent reads.
+with the live widget inside the mockup. Arrangement is the storyline's
+rows and cells in Dart, which is what the agent reads; dragging cells
+around on the canvas is a Studio-only layout that is not written back.
+
+A storyline page shows an empty slot at each end of every row and an
+empty row under the last. Clicking one, or the plus between two
+screens, writes a placeholder cell into the storyline's source
+(`story/lines/*.dart`, whichever file declares `Storyline('<id>')`):
+`Cell('screen-N', title: 'Screen N', variants: [Story('default', () =>
+const Placeholder())])`, before the cell in the next occupied slot or
+at the row's end, in a new `StorylineRow` for the empty row. The slot
+shows the new story once hot reload lands; from there it is a story
+like any other, for the agent to fill in. Rows built by a helper
+instead of a `StorylineRow(...)` literal are left alone with a note in
+the logs. On a plain page the plus appends a `Story('<page>/screen-N',
+...)` to `story/stories/<page>.dart`.
+
+## Search
+
+Cmd+K opens a search over pages, screens (storyline cells), stories,
+token groups and tokens; the magnifier in the sidebar header does the
+same. Type words in any order, arrows move, Enter opens: a page shows,
+a story is selected and scrolled to the centre of the canvas, a token
+or its group opens in the inspector. Words matching the title rank
+above words matching only the id or the location.
 
 ## Finding a widget in the source
 

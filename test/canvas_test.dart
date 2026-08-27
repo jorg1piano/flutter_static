@@ -219,6 +219,106 @@ void main() {
     expect(slots(1).whereType<String>(), ['home']);
   });
 
+  testWidgets('revealStory scrolls the card to the centre', (tester) async {
+    controller.dispose();
+    controller = StudioController(
+      stories: const _LineStories(),
+      project: Directory.current.path,
+      port: 1,
+    );
+    await tester.pumpWidget(canvas());
+    await tester.pumpAndSettle();
+    final home = find.byWidgetPredicate(
+      (w) => w is StoryCard && w.id == 'flows/onboarding/home/base',
+    );
+    final before = tester.getCenter(home);
+
+    controller.revealStory('flows/onboarding/home/base');
+    await tester.pumpAndSettle();
+
+    expect(controller.selectedStoryId, 'flows/onboarding/home/base');
+    // The slot (title, gap, card) is centred, so the card sits a little
+    // below the middle of the 800x600 viewport.
+    final after = tester.getCenter(home);
+    expect(after, isNot(before));
+    expect(after.dx, closeTo(400, 1));
+    expect(after.dy, closeTo(300, 24));
+    await tester.pump(const Duration(seconds: 1)); // the sizes-save timer
+  });
+
+  test('a click on an empty slot writes a cell into the storyline file', () {
+    final project = Directory.systemTemp.createTempSync('studio_line');
+    addTearDown(() => project.deleteSync(recursive: true));
+    final file = File('${project.path}/story/lines/onboarding.dart')
+      ..createSync(recursive: true)
+      ..writeAsStringSync('''
+import 'package:flutter/material.dart';
+import 'package:flutter_static_story/flutter_static_story.dart';
+
+Storyline storyline() => Storyline(
+  'flows/onboarding',
+  rows: [
+    StorylineRow(
+      'Top',
+      cells: [
+        Cell('welcome', variants: [Story('base', () => const Text('A'))]),
+        Cell('signin', variants: [Story('base', () => const Text('B'))]),
+      ],
+    ),
+    StorylineRow(
+      'Bottom',
+      cells: [
+        Cell('home', variants: [Story('base', () => const Text('C'))]),
+      ],
+    ),
+  ],
+);
+''');
+    controller.dispose();
+    controller = StudioController(
+      stories: const _LineStories(),
+      project: project.path,
+      port: 1,
+    );
+
+    List<String?> slots(int row) => [
+      for (final cell in controller.slotsFor(controller.selectedPage!, row))
+        cell?.cellId,
+    ];
+
+    // The plus between welcome and signin: before signin in the file.
+    controller.newCellBefore(
+      pageId: 'flows/onboarding',
+      rowIndex: 0,
+      slotIndex: 2,
+    );
+    expect(slots(0).whereType<String>(), ['welcome', 'screen-4', 'signin']);
+    var text = file.readAsStringSync();
+    expect(
+      text,
+      contains('''
+        Cell('welcome', variants: [Story('base', () => const Text('A'))]),
+        Cell(
+          'screen-4',
+          title: 'Screen 4',
+          variants: [Story('default', () => const Placeholder())],
+        ),
+        Cell('signin', variants: [Story('base', () => const Text('B'))]),
+'''),
+    );
+
+    // The empty row under the last one: a new row in the file.
+    controller.newCellAtSlot(
+      pageId: 'flows/onboarding',
+      rowIndex: 2,
+      slotIndex: 1,
+    );
+    expect(slots(2).whereType<String>(), ['screen-4']);
+    text = file.readAsStringSync();
+    expect(text, contains("    StorylineRow(\n      'Row 3',\n"));
+    expect(controller.logs.last, startsWith('Added screen-4'));
+  });
+
   testWidgets('after a pick the arrows walk the chain and Escape clears it', (
     tester,
   ) async {

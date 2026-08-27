@@ -8,9 +8,12 @@ import 'theme.dart';
 
 /// Project, status, pages, token groups, and the process controls.
 class Sidebar extends StatelessWidget {
-  const Sidebar({super.key, required this.controller});
+  const Sidebar({super.key, required this.controller, this.onSearch});
 
   final StudioController controller;
+
+  /// Opens the Cmd+K search; the magnifier in the header.
+  final VoidCallback? onSearch;
 
   @override
   Widget build(BuildContext context) => ListenableBuilder(
@@ -31,6 +34,19 @@ class Sidebar extends StatelessWidget {
                   action: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
+                      if (onSearch != null)
+                        IconButton(
+                          tooltip: 'Search (⌘K)',
+                          onPressed: onSearch,
+                          icon: const Icon(Icons.search, size: 15),
+                          color: StudioColors.muted,
+                          visualDensity: VisualDensity.compact,
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints.tightFor(
+                            width: 24,
+                            height: 24,
+                          ),
+                        ),
                       IconButton(
                         tooltip: 'Choose project folder',
                         onPressed: () =>

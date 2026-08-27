@@ -31,6 +31,10 @@ class _StudioCanvasState extends State<StudioCanvas> {
   final _transform = TransformationController();
   String? _pageShown;
 
+  /// One key per slot, so a search hit can be scrolled into view.
+  final _slotKeys = <String, GlobalKey>{};
+  int _revealSeen = 0;
+
   /// Takes focus after an inspected click, so the arrow keys walk the
   /// picked chain instead of going to the terminal.
   final _focus = FocusNode(debugLabel: 'canvas');
@@ -68,17 +72,55 @@ class _StudioCanvasState extends State<StudioCanvas> {
     ..scaleByDouble(0.5, 0.5, 1, 1);
 
   void _onController() {
-    final pick = widget.controller.pick;
+    final controller = widget.controller;
+    final pick = controller.pick;
     if (pick != null && pick != _focusedPick) _focus.requestFocus();
     _focusedPick = pick;
-    final id = widget.controller.selectedPage?.id;
-    if (id == _pageShown) return;
+    final id = controller.selectedPage?.id;
+    final pageChanged = id != _pageShown;
     _pageShown = id;
+    final reveal = controller.revealTick == _revealSeen
+        ? null
+        : controller.revealSlotId;
+    _revealSeen = controller.revealTick;
+    if (!pageChanged && reveal == null) return;
     // Not during the notification's build: InteractiveViewer listens to
-    // the controller and would setState mid-build.
+    // the controller and would setState mid-build. After the frame the
+    // new page's slots have a size, so a reveal can find its card.
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) _transform.value = _home;
+      if (!mounted) return;
+      if (pageChanged) _transform.value = _home;
+      if (reveal != null) _revealSlot(reveal);
     });
+  }
+
+  GlobalKey _slotKey(String slotId) =>
+      _slotKeys.putIfAbsent(slotId, GlobalKey.new);
+
+  /// Centres the slot in the viewport at the current zoom.
+  void _revealSlot(String slotId) {
+    final card = _slotKeys[slotId]?.currentContext?.findRenderObject();
+    final content = _contentKey.currentContext?.findRenderObject();
+    final viewport = context.size;
+    if (card is! RenderBox ||
+        content is! RenderBox ||
+        !card.hasSize ||
+        viewport == null) {
+      return;
+    }
+    final scale = _scale;
+    final centre =
+        card.localToGlobal(Offset.zero, ancestor: content) +
+        Offset(card.size.width / 2, card.size.height / 2);
+    _transform.value = Matrix4.identity()
+      ..translateByDouble(
+        viewport.width / 2 - centre.dx * scale,
+        viewport.height / 2 - centre.dy * scale,
+        0,
+        1,
+      )
+      ..scaleByDouble(scale, scale, 1, 1);
+    setState(() {});
   }
 
   /// Figma-ish canvas keys: Shift+1 fits the page; with a pick, Up moves
@@ -260,6 +302,7 @@ class _StudioCanvasState extends State<StudioCanvas> {
                                       key: _contentKey,
                                       page: page,
                                       controller: controller,
+                                      slotKey: _slotKey,
                                     ),
                             ),
                           ),
@@ -709,10 +752,16 @@ class _ZoomButton extends StatelessWidget {
 }
 
 class _PageBody extends StatelessWidget {
-  const _PageBody({super.key, required this.page, required this.controller});
+  const _PageBody({
+    super.key,
+    required this.page,
+    required this.controller,
+    required this.slotKey,
+  });
 
   final StudioPage page;
   final StudioController controller;
+  final GlobalKey Function(String slotId) slotKey;
 
   @override
   Widget build(BuildContext context) => Padding(
@@ -766,6 +815,7 @@ class _PageBody extends StatelessWidget {
                       )
                     else
                       _CellColumn(
+                        key: slotKey(cell.id),
                         pageId: page.id,
                         rowIndex: i,
                         slotIndex: j,
@@ -827,7 +877,7 @@ class _CellInsertTargetState extends State<_CellInsertTarget> {
         cursor: SystemMouseCursors.click,
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
-          onTap: () => widget.controller.insertEmptySlot(
+          onTap: () => widget.controller.newCellBefore(
             pageId: widget.pageId,
             rowIndex: widget.rowIndex,
             slotIndex: widget.slotIndex,
@@ -909,7 +959,7 @@ class _CellSlot extends StatelessWidget {
       final size = _slotSize(controller);
       return GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onTap: () => controller.createMockAtSlot(
+        onTap: () => controller.newCellAtSlot(
           pageId: pageId,
           rowIndex: rowIndex,
           slotIndex: slotIndex,
@@ -998,6 +1048,7 @@ class _CellDragFeedback extends StatelessWidget {
 
 class _CellColumn extends StatelessWidget {
   const _CellColumn({
+    super.key,
     required this.pageId,
     required this.rowIndex,
     required this.slotIndex,
@@ -1048,9 +1099,7 @@ class _CellColumn extends StatelessWidget {
         pageId: pageId,
         cellId: slot.id,
         title: slot.title,
-        child: slot.mockFile == null
-            ? StoryCard(id: slot.storyId, controller: controller)
-            : _MockCard(file: slot.mockFile!, controller: controller),
+        child: StoryCard(id: slot.storyId, controller: controller),
       ),
       if (slot.variantLabel != null) ...[
         const SizedBox(height: 8),
@@ -1061,46 +1110,6 @@ class _CellColumn extends StatelessWidget {
       ],
     ],
   );
-}
-
-class _MockCard extends StatelessWidget {
-  const _MockCard({required this.file, required this.controller});
-
-  final String file;
-  final StudioController controller;
-
-  @override
-  Widget build(BuildContext context) {
-    final size = _slotSize(controller);
-    return SizedBox(
-      width: size.width,
-      height: size.height,
-      child: PhoneMockup(
-        spec: controller.deviceSpec ?? PhoneSpec.fallback,
-        statusBar: controller.statusBar,
-        child:
-            controller.mockBuilder?.call(file) ??
-            Container(
-              color: const Color(0xFFF8F4ED),
-              alignment: Alignment.center,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(
-                    Icons.dashboard_customize_outlined,
-                    color: StudioColors.accent,
-                    size: 40,
-                  ),
-                  const SizedBox(height: 12),
-                  Text('Mock', style: StudioText.title.copyWith(fontSize: 22)),
-                  const SizedBox(height: 6),
-                  Text(file.split('/').last, style: StudioText.monoMuted),
-                ],
-              ),
-            ),
-      ),
-    );
-  }
 }
 
 /// One story on the canvas: mounted live when the catalog knows a shell

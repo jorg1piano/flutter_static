@@ -5,6 +5,7 @@ import 'canvas.dart';
 import 'controller.dart';
 import 'inspector.dart';
 import 'prompt_panel.dart';
+import 'search.dart';
 import 'sidebar.dart';
 import 'terminal.dart';
 import 'terminal_panel.dart';
@@ -82,11 +83,16 @@ class _StudioShellState extends State<StudioShell> {
     super.dispose();
   }
 
+  /// Cmd+K: search. Cmd+\: toggle both side panels, Shift for open.
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is KeyUpEvent) return KeyEventResult.ignored;
     final keyboard = HardwareKeyboard.instance;
-    if (!keyboard.isMetaPressed ||
-        event.logicalKey != LogicalKeyboardKey.backslash) {
+    if (!keyboard.isMetaPressed) return KeyEventResult.ignored;
+    if (event.logicalKey == LogicalKeyboardKey.keyK) {
+      _search();
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey != LogicalKeyboardKey.backslash) {
       return KeyEventResult.ignored;
     }
     setState(() {
@@ -105,6 +111,13 @@ class _StudioShellState extends State<StudioShell> {
     return KeyEventResult.handled;
   }
 
+  Future<void> _search() async {
+    await showStudioSearch(context, widget.controller);
+    // A token hit opens the inspector; the panes read the controller
+    // on build.
+    if (mounted) setState(() {});
+  }
+
   @override
   Widget build(BuildContext context) => Focus(
     focusNode: _focus,
@@ -113,7 +126,10 @@ class _StudioShellState extends State<StudioShell> {
     child: Scaffold(
       body: Row(
         children: [
-          SizedBox(width: 224, child: Sidebar(controller: widget.controller)),
+          SizedBox(
+            width: 224,
+            child: Sidebar(controller: widget.controller, onSearch: _search),
+          ),
           const VerticalDivider(width: 1, color: StudioColors.border),
           _CollapsiblePane(
             open: widget.controller.promptPanelOpen,
