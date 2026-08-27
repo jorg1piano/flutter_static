@@ -22,6 +22,8 @@ import 'model.dart';
 
 enum CatalogStatus { ready, reloading, error }
 
+typedef StudioMockBuilder = Widget? Function(String file);
+
 /// One fetched render, with the version and options it was captured at.
 class StoryPng {
   const StoryPng(this.bytes, this.key);
@@ -55,6 +57,7 @@ class StudioController extends ChangeNotifier {
     required this.stories,
     required this.project,
     required this.port,
+    this.mockBuilder,
   }) {
     catalogVersion.addListener(_onVersion);
     catalogReloadTick.addListener(notifyListeners);
@@ -67,6 +70,7 @@ class StudioController extends ChangeNotifier {
   final Stories stories;
   final String project;
   final int port;
+  final StudioMockBuilder? mockBuilder;
 
   String get url => 'http://localhost:$port';
   String get projectName => project.split('/').last;
@@ -394,6 +398,64 @@ class StudioController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> chooseProjectFolder() async {
+    final result = await Process.run('/usr/bin/osascript', const [
+      '-e',
+      'POSIX path of (choose folder with prompt "Choose the Flutter project to open in Studio")',
+    ]);
+    if (result.exitCode != 0) return;
+    await openProjectPath('${result.stdout}');
+  }
+
+  Future<void> openProjectPath(String input) async {
+    final selected = input.trim().replaceFirst(RegExp(r'/$'), '');
+    if (selected.isEmpty) return;
+    if (!Directory(selected).existsSync()) {
+      log('open project: $selected does not exist');
+      return;
+    }
+    if (!File('$selected/pubspec.yaml').existsSync()) {
+      log('open project: $selected has no pubspec.yaml');
+      return;
+    }
+    if (!File('$selected/story/main.dart').existsSync()) {
+      log('open project: $selected has no story/main.dart');
+      return;
+    }
+
+    final command = _studioCommand;
+    final quoted = command
+        .map((a) => "'${a.replaceAll("'", r"'\''")}'")
+        .join(' ');
+    log('Opening Studio for $selected...');
+    await Process.start('/bin/sh', [
+      '-lc',
+      'sleep 1; exec $quoted studio-host --project ${_shQuote(selected)}',
+    ], mode: ProcessStartMode.detached);
+    unawaited(
+      Future<void>.delayed(const Duration(milliseconds: 250), () {
+        exit(0);
+      }),
+    );
+  }
+
+  static String _shQuote(String value) => "'${value.replaceAll("'", r"'\''")}'";
+
+  static List<String> get _studioCommand {
+    final exe = Platform.resolvedExecutable;
+    final name = exe.split(Platform.pathSeparator).last;
+    if (name != 'dart' && name != 'dartvm') return [exe];
+
+    final found = Process.runSync('/usr/bin/which', ['flutter_static']);
+    final path = '${found.stdout}'.trim();
+    if (found.exitCode == 0 && path.isNotEmpty) return [path];
+
+    final local = '${Platform.environment['HOME']}/.local/bin/flutter_static';
+    if (File(local).existsSync()) return [local];
+
+    return [exe, 'run', 'flutter_static'];
+  }
+
   // --- stories ------------------------------------------------------------
 
   void refreshIndex() {
@@ -431,14 +493,17 @@ class StudioController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> addPage() async {
+  Future<void> addPage({String? name}) async {
     try {
       final storiesDir = Directory('$project/story/stories');
       storiesDir.createSync(recursive: true);
-      var slug = 'studio_page';
+      var slug = name == null || name.trim().isEmpty
+          ? 'studio_page'
+          : _slug(name.trim().replaceFirst(RegExp(r'\.dart$'), ''));
       var n = 2;
+      final base = slug;
       while (File('${storiesDir.path}/$slug.dart').existsSync()) {
-        slug = 'studio_page_$n';
+        slug = '${base}_$n';
         n++;
       }
       final title = slug.replaceAll('_', ' ');
@@ -480,6 +545,54 @@ class $className extends StatelessWidget {
     } on Object catch (e) {
       log('add page: $e');
     }
+  }
+
+  Future<void> renamePageFile(String pageId, String input) async {
+    try {
+      final newSlug = _slug(input.trim().replaceFirst(RegExp(r'\.dart$'), ''));
+      if (newSlug.isEmpty || newSlug == pageId) return;
+      final dir = Directory('$project/story/stories');
+      final oldFile = File('${dir.path}/$pageId.dart');
+      final newFile = File('${dir.path}/$newSlug.dart');
+      if (!oldFile.existsSync()) {
+        log('rename page: ${oldFile.path} does not exist');
+        return;
+      }
+      if (newFile.existsSync()) {
+        log('rename page: ${newFile.path} already exists');
+        return;
+      }
+
+      var text = oldFile.readAsStringSync();
+      text = text
+          .replaceAll(_pageClassName(pageId), _pageClassName(newSlug))
+          .replaceAll("Story('$pageId/", "Story('$newSlug/")
+          .replaceAll('Story("$pageId/', 'Story("$newSlug/');
+      newFile.writeAsStringSync(text);
+      oldFile.deleteSync();
+      _renameStoryImport(pageId, newSlug);
+      if (_storySlots.remove(pageId) case final slots?) {
+        _storySlots[newSlug] = slots;
+      }
+      selectedPageId = newSlug;
+      log('Renamed page story ${oldFile.path} -> ${newFile.path}');
+      refreshIndex();
+    } on Object catch (e) {
+      log('rename page: $e');
+    }
+  }
+
+  void _renameStoryImport(String oldSlug, String newSlug) {
+    final main = File('$project/story/main.dart');
+    if (!main.existsSync()) return;
+    var text = main.readAsStringSync();
+    text = text
+        .replaceAll(
+          "import 'stories/$oldSlug.dart' as $oldSlug;",
+          "import 'stories/$newSlug.dart' as $newSlug;",
+        )
+        .replaceAll('...$oldSlug.stories(),', '...$newSlug.stories(),');
+    main.writeAsStringSync(text);
   }
 
   void _wireStoryFile(String slug) {
@@ -863,6 +976,7 @@ class $name extends StatelessWidget {
   Widget build(BuildContext context) => const Placeholder();
 }
 ''');
+      _writeMockRegistry();
       log('Created ${file.path}');
       return StudioSlot(
         id: 'mock:${file.path}',
@@ -875,6 +989,41 @@ class $name extends StatelessWidget {
       log('mock file: $e');
       return null;
     }
+  }
+
+  void _writeMockRegistry() {
+    final dir = Directory('$project/story/mocks');
+    if (!dir.existsSync()) return;
+    final files =
+        dir
+            .listSync()
+            .whereType<File>()
+            .where((f) => f.path.endsWith('.dart'))
+            .where((f) => !f.path.endsWith('/_studio_mocks.dart'))
+            .toList()
+          ..sort((a, b) => a.path.compareTo(b.path));
+    final imports = <String>[];
+    final cases = <String>[];
+    for (final file in files) {
+      final name = _mockName(
+        file.uri.pathSegments.last.replaceAll('.dart', ''),
+      );
+      imports.add("import '${file.uri}';");
+      cases.add("    case '${file.path}': return const $name();");
+    }
+    File('${dir.path}/_studio_mocks.dart').writeAsStringSync('''
+// Generated by Flutter Static Studio. Do not edit by hand.
+import 'package:flutter/widgets.dart';
+
+${imports.join('\n')}
+
+Widget? buildStudioMock(String file) {
+  switch (file) {
+${cases.join('\n')}
+    default: return null;
+  }
+}
+''');
   }
 
   static String _slug(String input) => input

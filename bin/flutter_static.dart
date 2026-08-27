@@ -13,6 +13,11 @@ import 'package:watcher/watcher.dart';
 String _defaultUrl() =>
     'http://localhost:${_PortRegistry.lookup() ?? _PortRegistry.basePort}';
 
+Directory _flutterStaticHome() => Directory(
+  Platform.environment['FLUTTER_STATIC_HOME'] ??
+      p.join(Platform.environment['HOME'] ?? '.', '.flutter_static'),
+);
+
 Future<void> main(List<String> arguments) async {
   final runner =
       CommandRunner<int>(
@@ -23,6 +28,7 @@ Future<void> main(List<String> arguments) async {
         ..addCommand(_DownCommand())
         ..addCommand(_RunCommand())
         ..addCommand(_StudioCommand())
+        ..addCommand(_StudioHostCommand())
         ..addCommand(_InitCommand())
         ..addCommand(_BuildWebCommand())
         ..addCommand(_SetupCommand())
@@ -529,12 +535,14 @@ class _Runner {
     required this.device,
     required this.port,
     required this.snapshots,
+    this.projectRoot,
   });
 
   final String target;
   final String device;
   final int port;
   final _Snapshots snapshots;
+  final String? projectRoot;
 
   static final pidFile = File('.dart_tool/flutter_static.pid');
   static final packageConfig = File('.dart_tool/package_config.json');
@@ -570,6 +578,8 @@ class _Runner {
       '-t',
       target,
       '--dart-define=FLUTTER_STATIC_PORT=$port',
+      if (projectRoot != null)
+        '--dart-define=FLUTTER_STATIC_PROJECT_ROOT=$projectRoot',
     ]);
     pidFile.writeAsStringSync('$pid');
     _process.stdout
@@ -971,13 +981,20 @@ List<String> _localPackageRoots() {
     for (final package
         in (json['packages'] as List).cast<Map<String, dynamic>>()) {
       final rootUri = package['rootUri'] as String;
-      if (rootUri.startsWith('file://')) continue;
       try {
-        roots.add(
-          Directory.fromUri(
-            packageConfig.absolute.parent.uri.resolveUri(Uri.parse(rootUri)),
-          ).resolveSymbolicLinksSync(),
-        );
+        final dir = Directory.fromUri(
+          packageConfig.absolute.parent.uri.resolveUri(Uri.parse(rootUri)),
+        ).resolveSymbolicLinksSync();
+        // Hosted packages and the Flutter SDK are immutable for this run.
+        // Absolute file:// roots outside those caches are path dependencies,
+        // including generated Studio hosts that point at a real project.
+        if (rootUri.startsWith('file://') &&
+            (dir.contains('/.pub-cache/') ||
+                dir.contains('/flutter/packages/') ||
+                dir.contains('/flutter/bin/cache/'))) {
+          continue;
+        }
+        roots.add(dir);
       } on FileSystemException {
         // Stale entry; skip.
       }
@@ -1180,6 +1197,233 @@ Future<String?> _packageRoot() async {
 /// the project's `story/studio_main.dart` (scaffolded here if missing)
 /// the way `run` runs `story/main.dart`: same runner, same watcher, same
 /// HTTP API, plus a canvas of live widgets and the token editors.
+class _StudioHostCommand extends Command<int> {
+  _StudioHostCommand() {
+    argParser
+      ..addOption(
+        'project',
+        abbr: 'p',
+        defaultsTo: Directory.current.path,
+        help: 'Flutter project whose story/main.dart should run in the host.',
+      )
+      ..addOption('device', abbr: 'd', defaultsTo: 'macos')
+      ..addOption('port')
+      ..addOption(
+        'host-dir',
+        help:
+            'Generated host directory (default: ~/.flutter_static/hosts/<project>).',
+      )
+      ..addOption(
+        'flutter-static-path',
+        defaultsTo: _findFlutterStaticRoot(),
+        help:
+            'Path dependency for the flutter_static package under development.',
+      )
+      ..addOption(
+        'snapshots',
+        allowed: const ['off', 'jj'],
+        defaultsTo: Platform.environment['FLUTTER_STATIC_SNAPSHOTS'] ?? 'off',
+      );
+  }
+
+  @override
+  String get name => 'studio-host';
+
+  @override
+  String get description =>
+      'Experimental: run Studio from a generated macOS host that references '
+      'the real project as a path dependency.';
+
+  @override
+  Future<int> run() async {
+    final project = Directory(
+      argResults!['project'] as String,
+    ).absolute.resolveSymbolicLinksSync();
+    final pubspec = File('$project/pubspec.yaml');
+    final storyMain = File('$project/story/main.dart');
+    if (!pubspec.existsSync()) {
+      stderr.writeln('No pubspec.yaml in $project');
+      return 1;
+    }
+    if (!storyMain.existsSync()) {
+      stderr.writeln('No story/main.dart in $project');
+      return 1;
+    }
+    final packageName = _pubspecName(pubspec) ?? p.basename(project);
+    final storiesClass = RegExp(
+      r'class\s+(\w+)\s+extends\s+Stories',
+    ).firstMatch(storyMain.readAsStringSync())?.group(1);
+    if (storiesClass == null) {
+      stderr.writeln('Could not find `class X extends Stories` in $storyMain');
+      return 1;
+    }
+
+    final hostDir = Directory(
+      argResults!['host-dir'] as String? ??
+          p.join(_flutterStaticHome().path, 'hosts', _slug(project)),
+    ).absolute;
+    await _ensureHost(hostDir, project, packageName, storiesClass);
+
+    final requested = argResults!['port'] as String?;
+    Directory.current = hostDir.path;
+    final port = await _PortRegistry.claim(
+      requested: requested == null ? null : int.tryParse(requested),
+    );
+    if (port == null) {
+      stderr.writeln('Invalid port: $requested');
+      return 64;
+    }
+    stdout.writeln('flutter_static: Studio host ${hostDir.path}');
+    stdout.writeln('flutter_static: project $project');
+    stdout.writeln('flutter_static: Studio, catalog on port $port');
+    return _Runner(
+      target: 'lib/main.dart',
+      device: argResults!['device'] as String,
+      port: port,
+      snapshots: _Snapshots.from(argResults!['snapshots'] as String),
+      projectRoot: project,
+    ).run();
+  }
+
+  Future<void> _ensureHost(
+    Directory hostDir,
+    String project,
+    String packageName,
+    String storiesClass,
+  ) async {
+    if (!Directory('${hostDir.path}/macos').existsSync()) {
+      hostDir.createSync(recursive: true);
+      final create = await Process.start(
+        'flutter',
+        [
+          'create',
+          '--platforms=macos',
+          '--project-name=${p.basename(hostDir.path).replaceAll('-', '_')}',
+          '.',
+        ],
+        workingDirectory: hostDir.path,
+        mode: ProcessStartMode.inheritStdio,
+      );
+      final code = await create.exitCode;
+      if (code != 0) throw StateError('flutter create failed');
+    }
+    Directory('${hostDir.path}/lib').createSync(recursive: true);
+    File('${hostDir.path}/pubspec.yaml').writeAsStringSync('''
+name: ${p.basename(hostDir.path).replaceAll('-', '_')}
+description: Generated Flutter Static Studio host for $project.
+publish_to: 'none'
+version: 0.0.0+1
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_static:
+    path: ${argResults!['flutter-static-path']}
+  $packageName:
+    path: $project
+
+flutter:
+  uses-material-design: true
+''');
+    _writeMockRegistry(project);
+    final mocks = File('$project/story/mocks/_studio_mocks.dart');
+    File('${hostDir.path}/lib/main.dart').writeAsStringSync('''
+import 'dart:io';
+
+import 'package:flutter_static/flutter_static.dart';
+
+import '${storyMainUri(project)}';
+${mocks.existsSync() ? "import '${mocks.uri}';" : ''}
+
+void main() {
+  Directory.current = '$project';
+  runFlutterStudio(
+    const $storiesClass(),
+    ${mocks.existsSync() ? 'mockBuilder: buildStudioMock,' : ''}
+  );
+}
+''');
+    _StudioCommand._prepareRunnerIn(hostDir.path);
+    final get = await Process.start(
+      'flutter',
+      ['pub', 'get'],
+      workingDirectory: hostDir.path,
+      mode: ProcessStartMode.inheritStdio,
+    );
+    final code = await get.exitCode;
+    if (code != 0) throw StateError('flutter pub get failed');
+  }
+
+  static void _writeMockRegistry(String project) {
+    final dir = Directory('$project/story/mocks');
+    dir.createSync(recursive: true);
+    final files =
+        dir
+            .listSync()
+            .whereType<File>()
+            .where((f) => f.path.endsWith('.dart'))
+            .where((f) => !f.path.endsWith('/_studio_mocks.dart'))
+            .toList()
+          ..sort((a, b) => a.path.compareTo(b.path));
+    final imports = <String>[];
+    final cases = <String>[];
+    for (final file in files) {
+      final name = _mockName(
+        file.uri.pathSegments.last.replaceAll('.dart', ''),
+      );
+      imports.add("import '${file.uri}';");
+      cases.add("    case '${file.path}': return const $name();");
+    }
+    File('${dir.path}/_studio_mocks.dart').writeAsStringSync('''
+// Generated by Flutter Static Studio. Do not edit by hand.
+import 'package:flutter/widgets.dart';
+
+${imports.join('\n')}
+
+Widget? buildStudioMock(String file) {
+  switch (file) {
+${cases.join('\n')}
+    default: return null;
+  }
+}
+''');
+  }
+
+  static String _mockName(String slug) {
+    final parts = slug.split('_').where((p) => p.isNotEmpty);
+    final name = parts
+        .map((p) => p[0].toUpperCase() + (p.length == 1 ? '' : p.substring(1)))
+        .join();
+    return name.isEmpty ? 'StudioMock' : '${name}Mock';
+  }
+
+  static String storyMainUri(String project) =>
+      File('$project/story/main.dart').absolute.uri.toString();
+
+  static String _slug(String project) =>
+      p.basename(project).replaceAll(RegExp(r'[^A-Za-z0-9_]+'), '_');
+
+  static String? _pubspecName(File pubspec) => RegExp(
+    r'^name:\s*([^\s#]+)',
+    multiLine: true,
+  ).firstMatch(pubspec.readAsStringSync())?.group(1);
+
+  static String _findFlutterStaticRoot() {
+    var dir = Directory.current.absolute;
+    while (dir.path != dir.parent.path) {
+      final pubspec = File('${dir.path}/pubspec.yaml');
+      if (pubspec.existsSync() && _pubspecName(pubspec) == 'flutter_static') {
+        return dir.path;
+      }
+      dir = dir.parent;
+    }
+    return Directory.current.absolute.path;
+  }
+}
+
 class _StudioCommand extends Command<int> {
   _StudioCommand() {
     argParser
@@ -1197,6 +1441,13 @@ class _StudioCommand extends Command<int> {
         help:
             'Snapshot successful reloads. "jj" commits the current change '
             'after each save-triggered hot reload.',
+      )
+      ..addFlag(
+        'prepare-runner',
+        defaultsTo: false,
+        help:
+            'Apply one-time macOS runner edits for Studio. Off by default so '
+            'Studio does not leave artifacts in the app being designed.',
       );
   }
 
@@ -1225,8 +1476,14 @@ class _StudioCommand extends Command<int> {
     }
     final scaffolded = _scaffoldStudioMain();
     if (scaffolded != null) stdout.writeln(scaffolded);
-    for (final line in _prepareRunner()) {
-      stdout.writeln(line);
+    if (argResults!['prepare-runner'] as bool) {
+      for (final line in _prepareRunner()) {
+        stdout.writeln(line);
+      }
+    } else {
+      for (final line in _runnerPreparationWarnings()) {
+        stdout.writeln(line);
+      }
     }
     // Studio serves the catalog itself; a runner from `up` would fight it
     // for the port.
@@ -1281,13 +1538,43 @@ void main() => runFlutterStudio(const ${cls.group(1)}());
     return 'Created $target.';
   }
 
-  /// Studio reads and writes the project's source and wants a window
-  /// with room for a canvas: sandbox off, template window enlarged. Both
-  /// are one-time edits to the runner, reported when made.
-  static List<String> _prepareRunner() {
-    final done = <String>[];
+  /// Reports runner changes that may help Studio, without mutating the app.
+  static List<String> _runnerPreparationWarnings() {
+    final warnings = <String>[];
     for (final name in ['DebugProfile', 'Release']) {
       final file = File('macos/Runner/$name.entitlements');
+      if (!file.existsSync()) continue;
+      final content = file.readAsStringSync();
+      const key = '<key>com.apple.security.app-sandbox</key>';
+      if (RegExp('$key\\s*<true/>').hasMatch(content)) {
+        warnings.add(
+          'flutter_static: ${file.path} keeps the app sandbox on; Studio may '
+          'not be able to edit files. Run with --prepare-runner if you want '
+          'flutter_static to change it.',
+        );
+      }
+    }
+    final window = File('macos/Runner/MainFlutterWindow.swift');
+    if (window.existsSync() &&
+        window.readAsStringSync().trim() == _templateWindow.trim()) {
+      warnings.add(
+        'flutter_static: ${window.path} is the template 800x600 window. Run '
+        'with --prepare-runner if you want flutter_static to enlarge it.',
+      );
+    }
+    return warnings;
+  }
+
+  /// Studio reads and writes the project's source and wants a window
+  /// with room for a canvas: sandbox off, template window enlarged. Both
+  /// are opt-in edits to the runner, reported when made.
+  static List<String> _prepareRunner() =>
+      _prepareRunnerIn(Directory.current.path);
+
+  static List<String> _prepareRunnerIn(String root) {
+    final done = <String>[];
+    for (final name in ['DebugProfile', 'Release']) {
+      final file = File('$root/macos/Runner/$name.entitlements');
       if (!file.existsSync()) continue;
       final content = file.readAsStringSync();
       const key = '<key>com.apple.security.app-sandbox</key>';
@@ -1299,7 +1586,7 @@ void main() => runFlutterStudio(const ${cls.group(1)}());
         '(Studio edits the project\'s files).',
       );
     }
-    final window = File('macos/Runner/MainFlutterWindow.swift');
+    final window = File('$root/macos/Runner/MainFlutterWindow.swift');
     if (window.existsSync() &&
         window.readAsStringSync().trim() == _templateWindow.trim()) {
       window.writeAsStringSync(_studioWindow);

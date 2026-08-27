@@ -1078,24 +1078,26 @@ class _MockCard extends StatelessWidget {
       child: PhoneMockup(
         spec: controller.deviceSpec ?? PhoneSpec.fallback,
         statusBar: controller.statusBar,
-        child: Container(
-          color: const Color(0xFFF8F4ED),
-          alignment: Alignment.center,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(
-                Icons.dashboard_customize_outlined,
-                color: StudioColors.accent,
-                size: 40,
+        child:
+            controller.mockBuilder?.call(file) ??
+            Container(
+              color: const Color(0xFFF8F4ED),
+              alignment: Alignment.center,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(
+                    Icons.dashboard_customize_outlined,
+                    color: StudioColors.accent,
+                    size: 40,
+                  ),
+                  const SizedBox(height: 12),
+                  Text('Mock', style: StudioText.title.copyWith(fontSize: 22)),
+                  const SizedBox(height: 6),
+                  Text(file.split('/').last, style: StudioText.monoMuted),
+                ],
               ),
-              const SizedBox(height: 12),
-              Text('Mock', style: StudioText.title.copyWith(fontSize: 22)),
-              const SizedBox(height: 6),
-              Text(file.split('/').last, style: StudioText.monoMuted),
-            ],
-          ),
-        ),
+            ),
       ),
     );
   }

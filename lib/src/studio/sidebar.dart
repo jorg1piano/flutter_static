@@ -28,17 +28,36 @@ class Sidebar extends StatelessWidget {
               children: [
                 _Section(
                   'Pages',
-                  action: IconButton(
-                    tooltip: 'Add page',
-                    onPressed: controller.addPage,
-                    icon: const Icon(Icons.add, size: 15),
-                    color: StudioColors.muted,
-                    visualDensity: VisualDensity.compact,
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints.tightFor(
-                      width: 24,
-                      height: 24,
-                    ),
+                  action: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        tooltip: 'Choose project folder',
+                        onPressed: () =>
+                            _showOpenProjectDialog(context, controller),
+                        icon: const Icon(Icons.folder_open_outlined, size: 15),
+                        color: StudioColors.muted,
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints.tightFor(
+                          width: 24,
+                          height: 24,
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: 'Add page',
+                        onPressed: () =>
+                            _showAddPageDialog(context, controller),
+                        icon: const Icon(Icons.add, size: 15),
+                        color: StudioColors.muted,
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints.tightFor(
+                          width: 24,
+                          height: 24,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
                 for (final page in controller.pages)
@@ -54,6 +73,24 @@ class Sidebar extends StatelessWidget {
                       controller.selectTokenGroup(null);
                       controller.selectPage(page.id);
                     },
+                    trailing: page.isLine
+                        ? null
+                        : IconButton(
+                            tooltip: 'Rename page file',
+                            onPressed: () => _showRenamePageDialog(
+                              context,
+                              controller,
+                              page.id,
+                            ),
+                            icon: const Icon(Icons.edit_outlined, size: 13),
+                            color: StudioColors.faint,
+                            visualDensity: VisualDensity.compact,
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints.tightFor(
+                              width: 22,
+                              height: 22,
+                            ),
+                          ),
                   ),
                 if (controller.pages.isEmpty)
                   const Padding(
@@ -132,6 +169,132 @@ class _Header extends StatelessWidget {
   }
 }
 
+Future<void> _showAddPageDialog(
+  BuildContext context,
+  StudioController controller,
+) async {
+  final name = TextEditingController();
+  final selected = await showDialog<String>(
+    context: context,
+    builder: (context) => AlertDialog(
+      backgroundColor: StudioColors.panel,
+      title: const Text('New page story file'),
+      content: SizedBox(
+        width: 420,
+        child: TextField(
+          controller: name,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: 'File / story name',
+            hintText: 'example',
+            helperText: 'Creates story/stories/<name>.dart',
+          ),
+          onSubmitted: (value) => Navigator.of(context).pop(value),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(name.text),
+          child: const Text('Create'),
+        ),
+      ],
+    ),
+  );
+  name.dispose();
+  if (selected != null) await controller.addPage(name: selected);
+}
+
+Future<void> _showRenamePageDialog(
+  BuildContext context,
+  StudioController controller,
+  String pageId,
+) async {
+  final name = TextEditingController(text: pageId);
+  final selected = await showDialog<String>(
+    context: context,
+    builder: (context) => AlertDialog(
+      backgroundColor: StudioColors.panel,
+      title: const Text('Rename page story file'),
+      content: SizedBox(
+        width: 420,
+        child: TextField(
+          controller: name,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: 'File / story name',
+            helperText: 'Renames story/stories/<name>.dart and story id',
+          ),
+          onSubmitted: (value) => Navigator.of(context).pop(value),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(name.text),
+          child: const Text('Rename'),
+        ),
+      ],
+    ),
+  );
+  name.dispose();
+  if (selected != null) await controller.renamePageFile(pageId, selected);
+}
+
+Future<void> _showOpenProjectDialog(
+  BuildContext context,
+  StudioController controller,
+) async {
+  final path = TextEditingController(text: controller.project);
+  final focus = FocusNode();
+  final selected = await showDialog<String>(
+    context: context,
+    builder: (context) => AlertDialog(
+      backgroundColor: StudioColors.panel,
+      title: const Text('Open project in Studio'),
+      content: SizedBox(
+        width: 560,
+        child: TextField(
+          controller: path,
+          focusNode: focus,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: 'Project path',
+            hintText: '/path/to/flutter/project',
+          ),
+          onSubmitted: (value) => Navigator.of(context).pop(value),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () async {
+            await controller.chooseProjectFolder();
+            if (context.mounted) Navigator.of(context).pop();
+          },
+          child: const Text('Browse…'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(path.text),
+          child: const Text('Open'),
+        ),
+      ],
+    ),
+  );
+  focus.dispose();
+  path.dispose();
+  if (selected != null) await controller.openProjectPath(selected);
+}
+
 class _Section extends StatelessWidget {
   const _Section(this.text, {this.action});
 
@@ -157,10 +320,12 @@ class _Item extends StatelessWidget {
     required this.selected,
     required this.onTap,
     this.detail,
+    this.trailing,
   });
 
   final String label;
   final String? detail;
+  final Widget? trailing;
   final IconData icon;
   final bool selected;
   final VoidCallback onTap;
@@ -196,6 +361,7 @@ class _Item extends StatelessWidget {
                 ),
               ),
               if (detail != null) Text(detail!, style: StudioText.monoMuted),
+              ?trailing,
             ],
           ),
         ),

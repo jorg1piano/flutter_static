@@ -23,7 +23,11 @@ import 'studio/app.dart';
 import 'studio/controller.dart';
 import 'studio/terminal.dart';
 
-void runFlutterStudio(Stories stories, {int? port}) {
+void runFlutterStudio(
+  Stories stories, {
+  int? port,
+  StudioMockBuilder? mockBuilder,
+}) {
   // The controller listens to the keyboard from construction.
   WidgetsFlutterBinding.ensureInitialized();
   final resolvedPort = port ?? defaultCatalogPort;
@@ -31,6 +35,7 @@ void runFlutterStudio(Stories stories, {int? port}) {
     stories: stories,
     project: projectRoot() ?? Directory.current.path,
     port: resolvedPort,
+    mockBuilder: mockBuilder,
   );
   final terminal = StudioTerminal(
     project: controller.project,
