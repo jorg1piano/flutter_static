@@ -119,6 +119,65 @@ void main() {
     expect(controller.revealTick, 1);
   });
 
+  testWidgets('the preview follows the highlight after it settles', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1200);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: StudioSearch(controller: controller, onClose: () {}),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    // The first hit previews straight away.
+    var preview = tester.widget<SearchPreview>(find.byType(SearchPreview));
+    expect(preview.item.id, 'flows/onboarding');
+
+    await tester.enterText(find.byType(TextField), 'sign');
+    await tester.pump();
+    // Still the old one: the highlight has not settled.
+    preview = tester.widget<SearchPreview>(find.byType(SearchPreview));
+    expect(preview.item.id, 'flows/onboarding');
+    await tester.pump(const Duration(milliseconds: 200));
+    preview = tester.widget<SearchPreview>(find.byType(SearchPreview));
+    expect(preview.item.id, 'flows/onboarding/signin');
+    expect(preview.item.previewStory, 'flows/onboarding/signin/base');
+
+    // Arrowing past a row does not leave its preview behind.
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+    await tester.pump(const Duration(milliseconds: 50));
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+    await tester.pump(const Duration(milliseconds: 200));
+    preview = tester.widget<SearchPreview>(find.byType(SearchPreview));
+    expect(preview.item.id, 'flows/onboarding/signin/error');
+  });
+
+  testWidgets('a narrow window drops the preview, not the list', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(700, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: StudioSearch(controller: controller, onClose: () {}),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(find.byType(SearchPreview), findsNothing);
+    expect(find.text('Onboarding'), findsWidgets);
+  });
+
   test('revealStory on a plain page targets the cell slot', () {
     controller.revealStory('buttons/ghost');
     expect(controller.selectedPageId, 'buttons');

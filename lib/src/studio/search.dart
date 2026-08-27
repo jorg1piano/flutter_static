@@ -4,6 +4,8 @@
 /// token group in the inspector.
 library;
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -20,6 +22,9 @@ class SearchItem {
     required this.id,
     required this.detail,
     required this.target,
+    this.previewStory,
+    this.token,
+    this.group,
   });
 
   final SearchKind kind;
@@ -35,6 +40,16 @@ class SearchItem {
 
   /// What Enter opens: a page id, a story id or a token group name.
   final String target;
+
+  /// The story the preview renders. A page previews its first story;
+  /// a token has none.
+  final String? previewStory;
+
+  /// The token the preview shows a swatch for.
+  final DesignToken? token;
+
+  /// The group the preview lists, for a token group.
+  final TokenGroup? group;
 
   String get kindLabel => switch (kind) {
     SearchKind.page => 'page',
@@ -56,6 +71,7 @@ List<SearchItem> searchItems(StudioController controller) {
         id: page.id,
         detail: page.isLine ? 'flow' : 'page',
         target: page.id,
+        previewStory: page.storyIds.firstOrNull,
       ),
     );
   }
@@ -71,6 +87,7 @@ List<SearchItem> searchItems(StudioController controller) {
               id: '${page.id}/${cell.id}',
               detail: page.title,
               target: cell.variants.first,
+              previewStory: cell.variants.first,
             ),
           );
           if (cell.variants.length == 1) continue;
@@ -85,6 +102,7 @@ List<SearchItem> searchItems(StudioController controller) {
               id: story,
               detail: page.title,
               target: story,
+              previewStory: story,
             ),
           );
         }
@@ -100,6 +118,7 @@ List<SearchItem> searchItems(StudioController controller) {
         id: group.file.split('/').last,
         detail: '${group.tokens.length} tokens',
         target: group.name,
+        group: group,
       ),
     );
   }
@@ -112,6 +131,8 @@ List<SearchItem> searchItems(StudioController controller) {
           id: token.source,
           detail: group.name,
           target: group.name,
+          token: token,
+          group: group,
         ),
       );
     }
@@ -193,11 +214,38 @@ class _StudioSearchState extends State<StudioSearch> {
   late List<SearchItem> _hits = _all;
   int _index = 0;
 
+  /// What the preview shows. Trails the highlight by [_settle] so
+  /// holding an arrow down does not ask the catalog for a render per
+  /// row it passes.
+  SearchItem? _preview;
+  Timer? _previewTimer;
+  static const _settle = Duration(milliseconds: 120);
+
+  @override
+  void initState() {
+    super.initState();
+    _preview = _hits.isEmpty ? null : _hits.first;
+  }
+
   @override
   void dispose() {
+    _previewTimer?.cancel();
     _query.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  void _schedulePreview() {
+    final next = _index < _hits.length ? _hits[_index] : null;
+    if (identical(next, _preview)) return;
+    _previewTimer?.cancel();
+    if (next == null) {
+      setState(() => _preview = null);
+      return;
+    }
+    _previewTimer = Timer(_settle, () {
+      if (mounted) setState(() => _preview = next);
+    });
   }
 
   void _onQuery(String text) {
@@ -206,12 +254,14 @@ class _StudioSearchState extends State<StudioSearch> {
       _hits = rankSearch(_all, text);
       _index = 0;
     });
+    _schedulePreview();
     if (_scroll.hasClients) _scroll.jumpTo(0);
   }
 
   void _move(int delta) {
     if (_hits.isEmpty) return;
     setState(() => _index = (_index + delta).clamp(0, _hits.length - 1));
+    _schedulePreview();
     if (!_scroll.hasClients) return;
     final top = _index * _rowHeight;
     final bottom = top + _rowHeight;
@@ -263,6 +313,10 @@ class _StudioSearchState extends State<StudioSearch> {
   @override
   Widget build(BuildContext context) {
     final shown = _hits.length > 200 ? _hits.sublist(0, 200) : _hits;
+    // The preview is dropped before the list is squeezed, so the palette
+    // still works in a narrow window.
+    final room = MediaQuery.sizeOf(context).width;
+    final preview = _preview != null && room >= _listWidth + _previewWidth + 48;
     return Focus(
       onKeyEvent: _onKey,
       child: Material(
@@ -270,77 +324,90 @@ class _StudioSearchState extends State<StudioSearch> {
         elevation: 12,
         borderRadius: BorderRadius.circular(10),
         clipBehavior: Clip.antiAlias,
-        child: SizedBox(
-          width: 600,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
-                child: Row(
-                  children: [
-                    const Icon(
-                      Icons.search,
-                      size: 18,
-                      color: StudioColors.muted,
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: TextField(
-                        controller: _query,
-                        autofocus: true,
-                        onChanged: _onQuery,
-                        style: StudioText.body.copyWith(fontSize: 15),
-                        cursorColor: StudioColors.accent,
-                        decoration: const InputDecoration(
-                          isDense: true,
-                          border: InputBorder.none,
-                          hintText: 'Pages, screens, stories, tokens',
-                          hintStyle: TextStyle(
-                            color: StudioColors.faint,
-                            fontSize: 15,
-                          ),
-                        ),
-                      ),
-                    ),
-                    const Text('esc', style: StudioText.monoMuted),
-                  ],
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(width: _listWidth, child: _list(shown)),
+            if (preview)
+              Container(
+                width: _previewWidth,
+                decoration: const BoxDecoration(
+                  border: Border(left: BorderSide(color: StudioColors.border)),
+                ),
+                child: SearchPreview(
+                  controller: widget.controller,
+                  item: _preview!,
                 ),
               ),
-              const Divider(height: 1, color: StudioColors.border),
-              if (shown.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.all(14),
-                  child: Align(
-                    alignment: Alignment.centerLeft,
-                    child: Text('Nothing matches', style: StudioText.muted),
-                  ),
-                )
-              else
-                SizedBox(
-                  height:
-                      _rowHeight *
-                      (shown.length < _maxRows ? shown.length : _maxRows),
-                  child: ListView.builder(
-                    controller: _scroll,
-                    itemExtent: _rowHeight,
-                    itemCount: shown.length,
-                    itemBuilder: (context, i) => _Row(
-                      item: shown[i],
-                      selected: i == _index,
-                      onTap: () => _choose(shown[i]),
-                      onHover: () {
-                        if (_index != i) setState(() => _index = i);
-                      },
-                    ),
-                  ),
-                ),
-            ],
-          ),
+          ],
         ),
       ),
     );
   }
+
+  static const _listWidth = 600.0;
+  static const _previewWidth = 320.0;
+
+  Widget _list(List<SearchItem> shown) => Column(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
+        child: Row(
+          children: [
+            const Icon(Icons.search, size: 18, color: StudioColors.muted),
+            const SizedBox(width: 10),
+            Expanded(
+              child: TextField(
+                controller: _query,
+                autofocus: true,
+                onChanged: _onQuery,
+                style: StudioText.body.copyWith(fontSize: 15),
+                cursorColor: StudioColors.accent,
+                decoration: const InputDecoration(
+                  isDense: true,
+                  border: InputBorder.none,
+                  hintText: 'Pages, screens, stories, tokens',
+                  hintStyle: TextStyle(color: StudioColors.faint, fontSize: 15),
+                ),
+              ),
+            ),
+            const Text('esc', style: StudioText.monoMuted),
+          ],
+        ),
+      ),
+      const Divider(height: 1, color: StudioColors.border),
+      if (shown.isEmpty)
+        const Padding(
+          padding: EdgeInsets.all(14),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: Text('Nothing matches', style: StudioText.muted),
+          ),
+        )
+      else
+        SizedBox(
+          height:
+              _rowHeight * (shown.length < _maxRows ? shown.length : _maxRows),
+          child: ListView.builder(
+            controller: _scroll,
+            itemExtent: _rowHeight,
+            itemCount: shown.length,
+            itemBuilder: (context, i) => _Row(
+              item: shown[i],
+              selected: i == _index,
+              onTap: () => _choose(shown[i]),
+              onHover: () {
+                if (_index == i) return;
+                setState(() => _index = i);
+                _schedulePreview();
+              },
+            ),
+          ),
+        ),
+    ],
+  );
 }
 
 class _Row extends StatelessWidget {
@@ -416,5 +483,185 @@ class _Row extends StatelessWidget {
         ),
       ),
     ),
+  );
+}
+
+/// What the highlighted row is: a story's render, a page's first story,
+/// or a token's value. The render comes from the same cache the canvas
+/// uses, so a story already on screen previews without a new capture.
+class SearchPreview extends StatelessWidget {
+  const SearchPreview({
+    super.key,
+    required this.controller,
+    required this.item,
+  });
+
+  final StudioController controller;
+  final SearchItem item;
+
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: controller,
+    builder: (context, _) => Padding(
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(item.title, style: StudioText.title),
+          const SizedBox(height: 2),
+          Text(
+            item.id,
+            style: StudioText.monoMuted,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(height: 12),
+          _body(),
+        ],
+      ),
+    ),
+  );
+
+  Widget _body() {
+    final token = item.token;
+    if (token != null) return _TokenPreview(token: token);
+    final group = item.group;
+    if (group != null) return _GroupPreview(group: group);
+    final story = item.previewStory;
+    if (story == null) {
+      return const Text('Nothing to preview', style: StudioText.muted);
+    }
+    return _StoryPreview(controller: controller, id: story);
+  }
+}
+
+class _StoryPreview extends StatelessWidget {
+  const _StoryPreview({required this.controller, required this.id});
+
+  final StudioController controller;
+  final String id;
+
+  @override
+  Widget build(BuildContext context) {
+    final png = controller.png(id);
+    if (png == null) {
+      return SizedBox(
+        height: 120,
+        child: Text(
+          controller.isFetching(id) ? 'rendering…' : 'no render yet',
+          style: StudioText.muted,
+        ),
+      );
+    }
+    // Capped so a tall screen does not stretch the palette past the
+    // window; the image keeps its aspect.
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 420),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(6),
+          child: Image.memory(
+            png.bytes,
+            scale: 2,
+            gaplessPlayback: true,
+            filterQuality: FilterQuality.medium,
+            fit: BoxFit.contain,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _TokenPreview extends StatelessWidget {
+  const _TokenPreview({required this.token});
+
+  final DesignToken token;
+
+  @override
+  Widget build(BuildContext context) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      if (token.argb case final argb?)
+        Container(
+          height: 72,
+          decoration: BoxDecoration(
+            color: Color(argb),
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(color: StudioColors.border),
+          ),
+        ),
+      const SizedBox(height: 10),
+      SelectableText(token.source, style: StudioText.mono),
+      if (token.doc case final doc?) ...[
+        const SizedBox(height: 10),
+        Text(doc, style: StudioText.muted),
+      ],
+      const SizedBox(height: 10),
+      Text(
+        '${token.file.split('/').last}:${token.line}',
+        style: StudioText.monoMuted,
+      ),
+    ],
+  );
+}
+
+class _GroupPreview extends StatelessWidget {
+  const _GroupPreview({required this.group});
+
+  final TokenGroup group;
+
+  static const _max = 12;
+
+  @override
+  Widget build(BuildContext context) => Column(
+    mainAxisSize: MainAxisSize.min,
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      for (final token in group.tokens.take(_max))
+        Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: Row(
+            children: [
+              Container(
+                width: 16,
+                height: 16,
+                decoration: BoxDecoration(
+                  color: token.argb == null ? null : Color(token.argb!),
+                  borderRadius: BorderRadius.circular(3),
+                  border: Border.all(color: StudioColors.border),
+                ),
+                alignment: Alignment.center,
+                child: token.argb != null
+                    ? null
+                    : const Text('·', style: StudioText.monoMuted),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  token.name,
+                  style: StudioText.body,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(
+                  token.source,
+                  style: StudioText.monoMuted,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.right,
+                ),
+              ),
+            ],
+          ),
+        ),
+      if (group.tokens.length > _max)
+        Text(
+          '+${group.tokens.length - _max} more',
+          style: StudioText.monoMuted,
+        ),
+    ],
   );
 }

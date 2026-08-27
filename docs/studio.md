@@ -119,6 +119,13 @@ a story is selected and scrolled to the centre of the canvas, a token
 or its group opens in the inspector. Words matching the title rank
 above words matching only the id or the location.
 
+The pane on the right previews the highlighted row: a story's render (a
+page previews its first story), a token's swatch and source, a group's
+tokens. It reads the same render cache as the canvas, so a story
+already on screen needs no new capture, and it trails the highlight by
+120ms so holding an arrow down does not ask for a render per row it
+passes. A window too narrow for both drops the preview, not the list.
+
 ## Finding a widget in the source
 
 Click a widget on a live card and the inspector lists the project's
