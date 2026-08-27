@@ -1308,6 +1308,12 @@ class _StudioHostCommand extends Command<int> {
       if (code != 0) throw StateError('flutter create failed');
     }
     Directory('${hostDir.path}/lib').createSync(recursive: true);
+    final flutterStaticPath = argResults!['flutter-static-path'] as String;
+    // The project usually depends on flutter_static_story too, and often
+    // from another checkout of this repo. Two paths for one package name
+    // is a resolution conflict, so the host pins the copy that belongs to
+    // the flutter_static it runs: the two are versioned together.
+    final story = Directory('$flutterStaticPath/packages/flutter_static_story');
     File('${hostDir.path}/pubspec.yaml').writeAsStringSync('''
 name: ${p.basename(hostDir.path).replaceAll('-', '_')}
 description: Generated Flutter Static Studio host for $project.
@@ -1321,10 +1327,14 @@ dependencies:
   flutter:
     sdk: flutter
   flutter_static:
-    path: ${argResults!['flutter-static-path']}
+    path: $flutterStaticPath
   $packageName:
     path: $project
-
+${story.existsSync() ? '''
+dependency_overrides:
+  flutter_static_story:
+    path: ${story.path}
+''' : ''}
 flutter:
   uses-material-design: true
 ''');
