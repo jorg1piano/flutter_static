@@ -9,6 +9,14 @@ design work whose output is real widgets.
 - `docs/studio-agent-handoff.md`: where the Studio work stands.
 - `docs/design-iteration-notes.md`: what pixel-matching designs taught us.
 
+Static PNG rendering via a custom Flutter engine embedder is being explored on
+branch `engine_approach`; the current MVP renders 50 offscreen pages in one
+resident engine process.
+
+```bash
+git fetch && git switch engine_approach
+```
+
 ```text
 flutter_static up                       # catalog for the project in cwd
 flutter_static render buttons/kinds -o out.png
