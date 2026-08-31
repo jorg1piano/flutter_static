@@ -751,9 +751,8 @@ class _CatalogAppState extends State<_CatalogApp> {
     debugDefaultTargetPlatformOverride = widget.stories.platform;
     _version++;
     // Shells survive a reload (a story rarely changes how it lays out,
-    // and live cards never capture), but a story that failed offscreen
-    // for a transient reason gets another try at its next capture.
-    _needsWindow.clear();
+    // and live cards never capture); window-bound stories retry
+    // offscreen on _windowBound's schedule.
     _lastActivity = DateTime.now();
     _prewarm(widget.stories, initial: false);
     _broadcastEvent();
@@ -1145,9 +1144,12 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
 }
 
 /// Stories that need the real window (e.g. they embed a MaterialApp, whose
-/// View.of has no answer in an offscreen tree). Routed directly on later
-/// renders instead of re-attempting offscreen.
-final _needsWindow = <String>{};
+/// View.of has no answer in an offscreen tree), with the reload version at
+/// which to try offscreen again. The retry backs off in reloads (1, 2, 4,
+/// ... 32): a transient failure (an error pinned on a neighbour while
+/// captures overlapped) recovers at the next save, and a deterministic
+/// one stops costing a failed offscreen attempt after every save.
+final _windowBound = <String, ({int failures, int retryAt})>{};
 
 /// The static web build (flutter_static build-web) that /live/ serves; the
 /// pages mount stories from it as live views.
@@ -1387,14 +1389,21 @@ Future<Uint8List> _capture(
   bool offscreenOnly = false,
   RenderInspector? inspect,
 }) async {
-  if (_needsWindow.contains(story.id)) {
+  final bound = _windowBound[story.id];
+  if (bound != null && _version < bound.retryAt) {
     if (offscreenOnly) throw StateError('needs window');
     return _captureOnWindow(story, inspect: inspect);
   }
   try {
-    return await _captureOffscreen(story, inspect: inspect);
+    final png = await _captureOffscreen(story, inspect: inspect);
+    _windowBound.remove(story.id);
+    return png;
   } catch (e, st) {
-    _needsWindow.add(story.id);
+    final failures = (bound?.failures ?? 0) + 1;
+    _windowBound[story.id] = (
+      failures: failures,
+      retryAt: _version + (1 << (failures - 1)).clamp(1, 32),
+    );
     _storyShells[_baseId(story.id)] = StoryShell.window;
     final where = st.toString().split('\n').take(4).join(' | ');
     _lastTrace = 'FALLBACK ${story.id}: $e @ $where';
