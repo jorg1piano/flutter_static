@@ -6,6 +6,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'phone_mockup.dart';
 import 'story.dart';
@@ -213,26 +214,149 @@ Widget storyEnvironment(Widget child, {bool bounded = false}) =>
 /// and a canvas rebuild mounts every card on the page.
 final _defaultTheme = ThemeData();
 
-Widget _storyEnvironment(Widget inner, ThemeData theme) => MediaQuery(
-  data: const MediaQueryData(size: Size(430, 932), devicePixelRatio: 2),
-  child: Localizations(
-    locale: const Locale('en'),
-    delegates: const [
-      DefaultWidgetsLocalizations.delegate,
-      DefaultMaterialLocalizations.delegate,
-    ],
-    child: Directionality(
-      textDirection: TextDirection.ltr,
-      child: Theme(
-        data: theme,
-        child: DefaultTextStyle(
-          style: theme.textTheme.bodyMedium!,
-          child: Material(type: MaterialType.transparency, child: inner),
+Widget _storyEnvironment(Widget inner, ThemeData theme) => DefaultAssetBundle(
+  bundle: _storyBundle,
+  child: ScrollConfiguration(
+    behavior: const _StoryScrollBehavior(),
+    child: MediaQuery(
+      data: const MediaQueryData(size: Size(430, 932), devicePixelRatio: 2),
+      child: Localizations(
+        locale: const Locale('en'),
+        delegates: const [
+          DefaultWidgetsLocalizations.delegate,
+          DefaultMaterialLocalizations.delegate,
+        ],
+        child: Directionality(
+          textDirection: TextDirection.ltr,
+          child: Theme(
+            data: theme,
+            child: DefaultTextStyle(
+              style: theme.textTheme.bodyMedium!,
+              child: Material(type: MaterialType.transparency, child: inner),
+            ),
+          ),
         ),
       ),
     ),
   ),
 );
+
+/// Scroll physics that never defer image loading. Flutter's default
+/// answers [ScrollPhysics.recommendDeferredLoading] with
+/// `View.of(context)`, which an offscreen tree cannot provide, so every
+/// image inside a scrollable failed offscreen and went to the window.
+/// Physics a story passes itself chain onto this one through [applyTo].
+class _NoDeferredLoading extends ScrollPhysics {
+  const _NoDeferredLoading({super.parent});
+
+  @override
+  _NoDeferredLoading applyTo(ScrollPhysics? ancestor) =>
+      _NoDeferredLoading(parent: buildParent(ancestor));
+
+  @override
+  bool recommendDeferredLoading(
+    double velocity,
+    ScrollMetrics metrics,
+    BuildContext context,
+  ) => false;
+}
+
+class _StoryScrollBehavior extends ScrollBehavior {
+  const _StoryScrollBehavior();
+
+  @override
+  ScrollPhysics getScrollPhysics(BuildContext context) =>
+      _NoDeferredLoading(parent: super.getScrollPhysics(context));
+}
+
+/// The project's assets when the catalog runs in a Studio host. The host
+/// is its own package, so Flutter bundles the project's declared assets
+/// as `packages/<project>/...`, while its stories ask for `assets/...`
+/// the way the app does. This bundle answers those keys from the
+/// prefixed entries: the manifest gets an alias per prefixed key, so
+/// resolution variants resolve too, and a load that misses retries with
+/// the prefix. In the project's own catalog nothing is prefixed and it
+/// passes everything through.
+class _ProjectAssetBundle extends CachingAssetBundle {
+  _ProjectAssetBundle(String? package)
+    : _prefix = package == null ? null : 'packages/$package/';
+
+  final String? _prefix;
+
+  @override
+  Future<ByteData> load(String key) async {
+    try {
+      return await rootBundle.load(key);
+    } on FlutterError catch (e, st) {
+      final prefix = _prefix;
+      if (prefix == null || key.startsWith('packages/')) rethrow;
+      try {
+        return await rootBundle.load('$prefix$key');
+      } on FlutterError {
+        Error.throwWithStackTrace(e, st);
+      }
+    }
+  }
+
+  @override
+  Future<T> loadStructuredBinaryData<T>(
+    String key,
+    FutureOr<T> Function(ByteData data) parser,
+  ) {
+    final prefix = _prefix;
+    if (prefix == null || key != 'AssetManifest.bin') {
+      return super.loadStructuredBinaryData(key, parser);
+    }
+    return super.loadStructuredBinaryData(key, (data) {
+      const codec = StandardMessageCodec();
+      final manifest = codec.decodeMessage(data);
+      if (manifest is! Map) return parser(data);
+      final aliased = Map<Object?, Object?>.of(manifest);
+      for (final MapEntry(:key, :value) in manifest.entries) {
+        if (key is String && key.startsWith(prefix)) {
+          aliased.putIfAbsent(key.substring(prefix.length), () => value);
+        }
+      }
+      return parser(codec.encodeMessage(aliased)!);
+    });
+  }
+}
+
+/// What stories resolve assets through: [rootBundle] unchanged in a
+/// project's own catalog, and a [_ProjectAssetBundle] in a Studio host,
+/// where the project's assets carry a package prefix its stories do not.
+final AssetBundle _storyBundle = () {
+  final package = _hostedProjectPackage();
+  return package == null ? rootBundle : _ProjectAssetBundle(package);
+}();
+
+/// The project's package name when this catalog is a Studio host running
+/// the project as a path dependency, else null. Only a host prefixes the
+/// project's assets, and only a host defines
+/// `FLUTTER_STATIC_PROJECT_ROOT`, so nothing else pays for the lookup.
+///
+/// The read is allowed to fail. `flutter_static run` leaves the project's
+/// own runner sandboxed, where reading its pubspec is denied outright
+/// (`errno = 1`), and this is reached from the first widget build of a
+/// capture: a throw here failed every story in the catalog rather than
+/// one asset, which is what it did to a 92-story catalog before the
+/// try/catch.
+String? _hostedProjectPackage() {
+  const defined = String.fromEnvironment('FLUTTER_STATIC_PROJECT_ROOT');
+  final root = defined.isNotEmpty
+      ? defined
+      : Platform.environment['FLUTTER_STATIC_PROJECT_ROOT'];
+  if (root == null || root.isEmpty) return null;
+  try {
+    for (final line in File('$root/pubspec.yaml').readAsLinesSync()) {
+      final match = RegExp(r'^name:\s*(\S+)').firstMatch(line);
+      if (match != null) return match.group(1);
+    }
+  } catch (_) {
+    // Unreadable: no prefix, and every key passes through to rootBundle.
+  }
+  return null;
+}
 
 /// Opts the process out of App Nap. The catalog runs hidden and unfocused
 /// (flutter run launches it behind the terminal), so macOS throttles it
@@ -649,35 +773,38 @@ class _CatalogAppState extends State<_CatalogApp> {
         // Their own Material: MaterialApp's fallback text style (the
         // debug yellow underline) must never reach a window capture,
         // whatever shell the window has.
-        return Material(
-          type: MaterialType.transparency,
-          child: Stack(
-            alignment: Alignment.center,
-            children: [
-              for (final story in mounted)
-                // Window-mounted stories are app screens (they embed
-                // MaterialApp, which requires BOUNDED constraints - in
-                // an unbounded OverflowBox its layout fails and the
-                // broken render tree poisons every later window frame,
-                // which offscreen captures also flush when pumping).
-                OverflowBox(
-                  minWidth: 0,
-                  minHeight: 0,
-                  maxWidth: 430,
-                  maxHeight: 932,
-                  alignment: Alignment.center,
-                  child: RepaintBoundary(
-                    key: _windowKeys[story.id],
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(
-                        maxWidth: 430,
-                        maxHeight: 932,
+        return DefaultAssetBundle(
+          bundle: _storyBundle,
+          child: Material(
+            type: MaterialType.transparency,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                for (final story in mounted)
+                  // Window-mounted stories are app screens (they embed
+                  // MaterialApp, which requires BOUNDED constraints - in
+                  // an unbounded OverflowBox its layout fails and the
+                  // broken render tree poisons every later window frame,
+                  // which offscreen captures also flush when pumping).
+                  OverflowBox(
+                    minWidth: 0,
+                    minHeight: 0,
+                    maxWidth: 430,
+                    maxHeight: 932,
+                    alignment: Alignment.center,
+                    child: RepaintBoundary(
+                      key: _windowKeys[story.id],
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(
+                          maxWidth: 430,
+                          maxHeight: 932,
+                        ),
+                        child: story.builder(),
                       ),
-                      child: story.builder(),
                     ),
                   ),
-                ),
-            ],
+              ],
+            ),
           ),
         );
       },
