@@ -544,8 +544,8 @@ class _StoryPreview extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final png = controller.png(id);
-    if (png == null) {
+    final render = controller.render(id);
+    if (render == null) {
       return SizedBox(
         height: 120,
         child: Text(
@@ -561,10 +561,9 @@ class _StoryPreview extends StatelessWidget {
         constraints: const BoxConstraints(maxHeight: 420),
         child: ClipRRect(
           borderRadius: BorderRadius.circular(6),
-          child: Image.memory(
-            png.bytes,
+          child: RawImage(
+            image: render.image,
             scale: 2,
-            gaplessPlayback: true,
             filterQuality: FilterQuality.medium,
             fit: BoxFit.contain,
           ),

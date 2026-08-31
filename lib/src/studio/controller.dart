@@ -7,8 +7,8 @@ library;
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' as ui;
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
@@ -24,13 +24,16 @@ import 'source_edit.dart';
 enum CatalogStatus { ready, reloading, error }
 
 /// One fetched render, with the version and options it was captured at.
-class StoryPng {
-  const StoryPng(this.bytes, this.key);
+/// Owns its image handle: [dispose] once nothing paints it any more.
+class StoryRender {
+  const StoryRender(this.image, this.key);
 
-  final Uint8List bytes;
+  final ui.Image image;
 
   /// Version plus render options; a different key means stale.
   final String key;
+
+  void dispose() => image.dispose();
 }
 
 class StudioSlot {
@@ -282,8 +285,13 @@ class StudioController extends ChangeNotifier {
     notifyListeners();
   }
 
-  final _pngs = <String, StoryPng>{};
+  final _renders = <String, StoryRender>{};
   final _inflight = <String>{};
+
+  /// Renders replaced since the last notification. Disposed after the
+  /// frame that paints their replacements: painting a disposed image is
+  /// an assertion, and a repaint can come before the rebuild.
+  final _retired = <StoryRender>[];
   bool _disposed = false;
   bool _notifyScheduled = false;
 
@@ -294,7 +302,21 @@ class StudioController extends ChangeNotifier {
     _notifyScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _notifyScheduled = false;
-      if (!_disposed) notifyListeners();
+      if (_disposed) return;
+      notifyListeners();
+      _disposeRetiredAfterFrame();
+    });
+    WidgetsBinding.instance.scheduleFrame();
+  }
+
+  void _disposeRetiredAfterFrame() {
+    if (_retired.isEmpty) return;
+    final retired = List.of(_retired);
+    _retired.clear();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      for (final render in retired) {
+        render.dispose();
+      }
     });
     WidgetsBinding.instance.scheduleFrame();
   }
@@ -1417,8 +1439,8 @@ class $className extends StatelessWidget {
   /// The latest render of [id], capturing a fresh one when it is behind
   /// [version] or the render options. Returns the stale one meanwhile so
   /// cards keep their size and their last screen.
-  StoryPng? png(String id) {
-    final cached = _pngs[id];
+  StoryRender? render(String id) {
+    final cached = _renders[id];
     if (cached == null || cached.key != _renderKey) _fetch(id);
     return cached;
   }
@@ -1435,7 +1457,7 @@ class $className extends StatelessWidget {
     if (_inflight.contains(id)) return;
     _inflight.add(id);
     final key = _renderKey;
-    renderStoryPng(
+    renderStoryImage(
           stories,
           id,
           device: deviceSpec,
@@ -1443,11 +1465,15 @@ class $className extends StatelessWidget {
           knobs: Map.of(knobs),
           background: background,
         )
-        .then((bytes) {
-          if (_disposed) return;
-          _pngs[id] = StoryPng(bytes, key);
-          final size = _pngSize(bytes);
-          if (size != null) noteSize(id, size);
+        .then((image) {
+          if (_disposed) {
+            image.dispose();
+            return;
+          }
+          final old = _renders[id];
+          if (old != null) _retired.add(old);
+          _renders[id] = StoryRender(image, key);
+          noteSize(id, Size(image.width / 2, image.height / 2));
         })
         .catchError((Object e) {
           if (!_disposed) log('render $id: $e');
@@ -1462,8 +1488,8 @@ class $className extends StatelessWidget {
   /// Marks a render stale so the next paint captures it again, keeping
   /// the old one on screen meanwhile.
   void rerender(String id) {
-    final old = _pngs[id];
-    if (old != null) _pngs[id] = StoryPng(old.bytes, 'stale');
+    final old = _renders[id];
+    if (old != null) _renders[id] = StoryRender(old.image, 'stale');
     notifyListeners();
   }
 
@@ -1552,13 +1578,6 @@ class $className extends StatelessWidget {
     }
   }
 
-  /// Logical size of a 2x PNG from its header, or null.
-  static Size? _pngSize(Uint8List bytes) {
-    if (bytes.length < 24) return null;
-    final data = ByteData.sublistView(bytes, 16, 24);
-    return Size(data.getUint32(0) / 2, data.getUint32(4) / 2);
-  }
-
   // --- tokens -------------------------------------------------------------
 
   void loadTokens() {
@@ -1597,6 +1616,14 @@ class $className extends StatelessWidget {
   void dispose() {
     _disposed = true;
     _sizesSave?.cancel();
+    for (final render in _renders.values) {
+      render.dispose();
+    }
+    _renders.clear();
+    for (final render in _retired) {
+      render.dispose();
+    }
+    _retired.clear();
     HardwareKeyboard.instance.removeHandler(_onKey);
     catalogVersion.removeListener(_onVersion);
     catalogReloadTick.removeListener(notifyListeners);

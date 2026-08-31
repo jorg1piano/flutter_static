@@ -44,6 +44,9 @@ void runFlutterStatic(
   // in the background, and an unasked sweep after every save would only
   // hitch the UI thread while someone drags a slider.
   _prewarmEnabled = shell == null;
+  // Studio paints captures as images; only the hidden catalog serves
+  // PNGs alone, and drops each image once it is encoded.
+  _keepImages = shell != null;
   _prewarm(stories, initial: true);
 }
 
@@ -100,7 +103,28 @@ Future<Uint8List> renderStoryPng(
   return _renderCached(
     _onPage(story, device: device, statusBar: statusBar, knobs: knobs),
     background: background,
+  ).then((render) => render.png());
+}
+
+/// The render of story [id] as the image its capture painted, for
+/// painting straight away: no PNG encode, no decode. The handle is the
+/// caller's to dispose; the cache keeps its own.
+Future<ui.Image> renderStoryImage(
+  Stories stories,
+  String id, {
+  PhoneSpec? device,
+  bool statusBar = false,
+  Map<String, String> knobs = const {},
+  bool background = false,
+}) async {
+  final story = findStory(stories, id);
+  if (story == null) throw ArgumentError.value(id, 'id', 'no such story');
+  if (!background) _noteRequested(id);
+  final render = await _renderCached(
+    _onPage(story, device: device, statusBar: statusBar, knobs: knobs),
+    background: background,
   );
+  return render.image();
 }
 
 /// The pixel ratio renders are captured at: PNG pixels per logical pixel.
@@ -721,8 +745,143 @@ void _broadcastEvent() {
   }
 }
 
-final _renderCache = <String, Uint8List>{};
+/// One capture: the image the story painted, and its PNG once someone
+/// asked for one. Studio paints the image as it is; the HTTP API and the
+/// CLI take the PNG, encoded on first request and off the capture queue
+/// (48ms median for a phone screen, which every Studio card used to pay
+/// and then decode again).
+class _Render {
+  _Render(this.id, ui.Image image)
+    : _image = image,
+      bytes = image.width * image.height * 4;
+
+  final String id;
+
+  /// What the image holds while the cache keeps it.
+  final int bytes;
+
+  ui.Image? _image;
+  bool _dropping = false;
+  Uint8List? _png;
+  Future<Uint8List>? _encoding;
+
+  bool get hasImage => _image != null && !_dropping;
+
+  /// A handle of its own for a consumer, who disposes it: a clone while
+  /// the cache holds the image, else decoded from the PNG.
+  Future<ui.Image> image() async {
+    final held = _image;
+    if (held != null) return held.clone();
+    final codec = await ui.instantiateImageCodec(await png());
+    try {
+      return (await codec.getNextFrame()).image;
+    } finally {
+      codec.dispose();
+    }
+  }
+
+  Future<Uint8List> png() {
+    final png = _png;
+    if (png != null) return Future.value(png);
+    return _encoding ??= _encode();
+  }
+
+  Future<Uint8List> _encode() async {
+    final image = _image;
+    if (image == null) throw StateError('$id: image dropped before encoding');
+    final sw = Stopwatch()..start();
+    final data = await image.toByteData(format: ui.ImageByteFormat.png);
+    _traceLog('$id: png-encode=${sw.elapsedMilliseconds}ms');
+    return _png = data!.buffer.asUint8List();
+  }
+
+  /// Lets the image go and keeps the PNG for the API, encoding first
+  /// when nobody has asked for it yet.
+  Future<void> dropImage() async {
+    if (!hasImage) return;
+    _dropping = true;
+    try {
+      await png();
+    } finally {
+      _image?.dispose();
+      _image = null;
+    }
+  }
+
+  void dispose() {
+    _image?.dispose();
+    _image = null;
+  }
+}
+
+/// Renders of the current version, least recently used first: a hit
+/// re-inserts, so insertion order is eviction order.
+final _renderCache = <String, _Render>{};
 int _renderCacheVersion = -1;
+
+/// Whether captures keep their image once a PNG could be made. Studio
+/// paints images straight from the cache; the hidden catalog only serves
+/// PNGs and drops each image as soon as it is encoded.
+bool _keepImages = false;
+
+/// Image bytes the cache retains, and the most it may. Past the budget
+/// the least recently used images are encoded and dropped; their PNGs
+/// stay, and an image asked for after that is decoded from its PNG.
+int _imageBytes = 0;
+const _imageBudget = 256 << 20;
+
+_Render? _cacheHit(String id) {
+  final hit = _renderCache.remove(id);
+  if (hit == null) return null;
+  return _renderCache[id] = hit;
+}
+
+Future<_Render> _storeRender(String id, _Render render) async {
+  final old = _renderCache.remove(id);
+  if (old != null) _forgetRender(old);
+  _renderCache[id] = render;
+  if (_keepImages) {
+    _imageBytes += render.bytes;
+    _trimImages();
+    return render;
+  }
+  // Encode before releasing the capture queue, where the capture used to
+  // do it. Every consumer of a catalog that is not Studio wants the PNG,
+  // so nothing is saved by deferring it, and firing the encodes off the
+  // queue instead kept one frame alive per story in flight and made each
+  // encode wait out all the others: a 92-story sweep climbed from 108ms
+  // to 369ms an encode.
+  try {
+    await render.dropImage();
+  } catch (_) {
+    // Left on the render; png() hands the failure to whoever asks.
+  }
+  return render;
+}
+
+void _forgetRender(_Render render) {
+  if (render.hasImage) _imageBytes -= render.bytes;
+  render.dispose();
+}
+
+void _clearRenderCache() {
+  for (final render in _renderCache.values) {
+    render.dispose();
+  }
+  _renderCache.clear();
+  _imageBytes = 0;
+}
+
+void _trimImages() {
+  if (_imageBytes <= _imageBudget) return;
+  for (final render in _renderCache.values.toList()) {
+    if (_imageBytes <= _imageBudget) return;
+    if (!render.hasImage) continue;
+    _imageBytes -= render.bytes;
+    unawaited(render.dropImage().catchError((_) {}));
+  }
+}
+
 String _lastTrace = '';
 final List<String> _traceLines = [];
 void _traceLog(String line) {
@@ -834,13 +993,13 @@ Future<void>? _captureQueue;
 /// yields to them.
 int _foregroundWaiters = 0;
 
-Future<Uint8List> _renderCached(
+Future<_Render> _renderCached(
   Story story, {
   bool background = false,
   bool offscreenOnly = false,
 }) {
   if (_renderCacheVersion == _version) {
-    final hit = _renderCache[story.id];
+    final hit = _cacheHit(story.id);
     if (hit != null) return Future.value(hit);
   }
   if (!background) _foregroundWaiters++;
@@ -855,13 +1014,15 @@ Future<Uint8List> _renderCached(
         await _awaitFresh();
       }
       if (_renderCacheVersion != _version) {
-        _renderCache.clear();
+        _clearRenderCache();
         _renderCacheVersion = _version;
       }
-      return _renderCache[story.id] ??= await _capture(
-        story,
-        offscreenOnly: offscreenOnly,
-      );
+      final hit = _cacheHit(story.id);
+      if (hit != null) return hit;
+      final image = await _capture(story, offscreenOnly: offscreenOnly);
+      // Awaited inside the try: `return f` would run the finally, and so
+      // release the queue, before the encode it hands back has finished.
+      return await _storeRender(story.id, _Render(story.id, image!));
     } finally {
       if (!background) _foregroundWaiters--;
       completer.complete();
@@ -1035,7 +1196,7 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
             knobs: _knobsParam(request, _lineOf(stories, id)),
           );
           final capture = Stopwatch()..start();
-          final png = await _renderCached(story);
+          final png = await (await _renderCached(story)).png();
           // A fallback trace carries the exception's message, newlines and
           // all; a header value takes neither.
           response.headers.set(
@@ -1384,7 +1545,7 @@ ContentType _mimeFor(String path) {
 /// instead of its PNG (which is then not encoded).
 typedef RenderInspector = void Function(RenderRepaintBoundary boundary);
 
-Future<Uint8List> _capture(
+Future<ui.Image?> _capture(
   Story story, {
   bool offscreenOnly = false,
   RenderInspector? inspect,
@@ -1395,9 +1556,9 @@ Future<Uint8List> _capture(
     return _captureOnWindow(story, inspect: inspect);
   }
   try {
-    final png = await _captureOffscreen(story, inspect: inspect);
+    final image = await _captureOffscreen(story, inspect: inspect);
     _windowBound.remove(story.id);
-    return png;
+    return image;
   } catch (e, st) {
     final failures = (bound?.failures ?? 0) + 1;
     _windowBound[story.id] = (
@@ -1452,7 +1613,7 @@ void _installErrorHook() {
   };
 }
 
-Future<Uint8List> _captureOffscreen(
+Future<ui.Image?> _captureOffscreen(
   Story story, {
   RenderInspector? inspect,
 }) async {
@@ -1620,16 +1781,13 @@ Future<Uint8List> _captureOffscreen(
       mark('inspect');
       _lastTrace = '${story.id}: $trace';
       _traceLog(_lastTrace);
-      return Uint8List(0);
+      return null;
     }
     final image = await boundary.toImage(pixelRatio: 2);
     mark('toImage');
-    final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
-    mark('png-encode');
-    image.dispose();
     _lastTrace = '${story.id}: $trace';
     _traceLog(_lastTrace);
-    return bytes!.buffer.asUint8List();
+    return image;
   } finally {
     _capturesInFlight--;
     // Drain one binding frame while the tree is still mounted: widgets
@@ -1664,7 +1822,7 @@ Future<Uint8List> _captureOffscreen(
   }
 }
 
-Future<Uint8List> _captureOnWindow(
+Future<ui.Image?> _captureOnWindow(
   Story story, {
   RenderInspector? inspect,
 }) async {
@@ -1675,12 +1833,9 @@ Future<Uint8List> _captureOnWindow(
           as RenderRepaintBoundary;
   if (inspect != null) {
     inspect(boundary);
-    return Uint8List(0);
+    return null;
   }
-  final image = await boundary.toImage(pixelRatio: 2);
-  final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
-  image.dispose();
-  return bytes!.buffer.asUint8List();
+  return boundary.toImage(pixelRatio: 2);
 }
 
 /// One settle for the whole mounted batch: entrance animations of newly

@@ -156,6 +156,10 @@ void main() {
     await tester.pump(const Duration(milliseconds: 200));
     preview = tester.widget<SearchPreview>(find.byType(SearchPreview));
     expect(preview.item.id, 'flows/onboarding/signin/error');
+    // The previews' captures land and schedule the sizes save; wait
+    // both out so no timer outlives the test.
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump(const Duration(seconds: 1));
   });
 
   testWidgets('a narrow window drops the preview, not the list', (

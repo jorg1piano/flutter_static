@@ -1129,7 +1129,7 @@ class StoryCard extends StatelessWidget {
     // A story the catalog has not captured yet: a background capture
     // tells us how it lays out, and its PNG stands in meanwhile.
     if (live == null) controller.discover(id);
-    final png = live == true ? null : controller.png(id);
+    final render = live == true ? null : controller.render(id);
     Widget body;
     if (live == true) {
       body = _LiveSlot(
@@ -1169,7 +1169,7 @@ class StoryCard extends StatelessWidget {
     } else {
       body = _RenderSlot(
         id: id,
-        png: png,
+        render: render,
         loading: controller.isFetching(id),
         placeholder: controller.placeholderSize(id),
         onSelect: () => controller.selectStory(id),
@@ -1294,14 +1294,14 @@ class _LiveSlotState extends State<_LiveSlot> {
 class _RenderSlot extends StatelessWidget {
   const _RenderSlot({
     required this.id,
-    required this.png,
+    required this.render,
     required this.loading,
     required this.placeholder,
     required this.onSelect,
   });
 
   final String id;
-  final StoryPng? png;
+  final StoryRender? render;
   final bool loading;
   final Size placeholder;
   final VoidCallback onSelect;
@@ -1309,7 +1309,7 @@ class _RenderSlot extends StatelessWidget {
   @override
   Widget build(BuildContext context) => GestureDetector(
     onTap: onSelect,
-    child: png == null
+    child: render == null
         ? Container(
             width: placeholder.width,
             height: placeholder.height,
@@ -1322,10 +1322,9 @@ class _RenderSlot extends StatelessWidget {
           )
         : Stack(
             children: [
-              Image.memory(
-                png!.bytes,
+              RawImage(
+                image: render!.image,
                 scale: 2,
-                gaplessPlayback: true,
                 filterQuality: FilterQuality.medium,
               ),
               if (loading)
