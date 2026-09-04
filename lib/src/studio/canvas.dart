@@ -926,8 +926,8 @@ class _InsertPlus extends StatelessWidget {
 
 Size _slotSize(StudioController controller) =>
     controller.selectedPage?.isLine == true
-    ? PhoneMockup(
-        spec: controller.deviceSpec ?? PhoneSpec.fallback,
+    ? DeviceMockup(
+        spec: controller.deviceSpec ?? DeviceSpec.fallback,
         child: const SizedBox.shrink(),
       ).size
     : const Size(260, 220);

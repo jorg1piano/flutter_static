@@ -1,9 +1,11 @@
 import 'package:flutter/widgets.dart';
 
-/// A device's geometry, in pixels of a reference photo's screen width, plus
+enum DeviceFormFactor { phone, tablet }
+
+/// A device's geometry, in pixels of a reference image's screen width, plus
 /// its logical screen size. Scaled uniformly with the screen width.
-class PhoneSpec {
-  const PhoneSpec({
+class DeviceSpec {
+  const DeviceSpec({
     required this.name,
     required this.label,
     required this.screenSize,
@@ -22,7 +24,9 @@ class PhoneSpec {
     required this.rightButtons,
     required this.safeArea,
     required this.keyboardHeight,
+    this.formFactor = DeviceFormFactor.phone,
     this.islandTop,
+    this.bezelCameraDiameter = 0,
     this.rimColor = const Color(0xFF4982B2),
     this.bezelColor = const Color(0xFF000000),
     this.homeIndicatorColor = const Color(0x99000000),
@@ -32,6 +36,7 @@ class PhoneSpec {
   /// Slug used in URLs (`?device=`) and view data.
   final String name;
   final String label;
+  final DeviceFormFactor formFactor;
 
   /// Logical size of the screen the child is laid out in.
   final Size screenSize;
@@ -61,6 +66,10 @@ class PhoneSpec {
   /// Height of the software keyboard, logical px, for keyboard mode.
   final double keyboardHeight;
 
+  /// Diameter of a camera centered in the top bezel. Phones place their
+  /// camera in [notch] instead.
+  final double bezelCameraDiameter;
+
   final Color homeIndicatorColor;
   final Color keyboardColor;
 
@@ -70,9 +79,10 @@ class PhoneSpec {
   final double? islandTop;
 
   bool get hasIsland => islandTop != null;
+  bool get hasCutout => notch.width > 0 && notch.height > 0;
 
   /// Measured from docs/reference/phone.png (tool/mockup).
-  static const iphone13 = PhoneSpec(
+  static const iphone13 = DeviceSpec(
     name: 'iphone-13',
     label: 'iPhone 13',
     screenSize: Size(390, 844),
@@ -97,7 +107,7 @@ class PhoneSpec {
   /// mini): a 395x854 screen, 13px bezel and 8px rim, notch 160x33. The
   /// photo hides the left side behind a second phone, so the left buttons
   /// keep the 13's proportions.
-  static const iphone12mini = PhoneSpec(
+  static const iphone12mini = DeviceSpec(
     name: 'iphone-12-mini',
     label: 'iPhone 12 mini',
     screenSize: Size(375, 812),
@@ -130,7 +140,7 @@ class PhoneSpec {
   /// centred, and the clock's centre line sits at 32.5 pt. Those are in
   /// screen points; the values here are the same in the render's 451-wide
   /// reference units (x 451/440), which is what [refScreenWidth] scales.
-  static const iphone17ProMax = PhoneSpec(
+  static const iphone17ProMax = DeviceSpec(
     name: 'iphone-17-pro-max',
     label: 'iPhone 17 Pro Max',
     screenSize: Size(440, 956),
@@ -161,7 +171,7 @@ class PhoneSpec {
   /// 14's 3.2 mm side border also comes to at 6.0 pt/mm, and the screen
   /// corner is the 55 pt the 6.7" Pro models are documented with. Units
   /// are screen points ([refScreenWidth] is the screen width).
-  static const iphone14ProMax = PhoneSpec(
+  static const iphone14ProMax = DeviceSpec(
     name: 'iphone-14-pro-max',
     label: 'iPhone 14 Pro Max',
     screenSize: Size(430, 932),
@@ -185,11 +195,45 @@ class PhoneSpec {
     bezelColor: Color(0xFF000000),
   );
 
+  /// iPad Pro 11-inch (4th generation). Its 2388x1668 physical display is
+  /// 1194x834 logical pixels. The frame follows the body-to-display ratio;
+  /// the small details are kept plain so the silhouette reads at any zoom.
+  static const ipadPro11 = DeviceSpec(
+    name: 'ipad-pro-11',
+    label: 'iPad Pro 11-inch',
+    formFactor: DeviceFormFactor.tablet,
+    screenSize: Size(834, 1194),
+    refScreenWidth: 834,
+    frame: 46,
+    rim: 2,
+    outerRadius: 40,
+    screenRadius: 18,
+    notch: Size.zero,
+    notchRadius: 0,
+    fillet: 0,
+    camera: Offset.zero,
+    cameraDiameter: 0,
+    bezelCameraDiameter: 5,
+    buttonDepth: 3,
+    leftButtons: [],
+    rightButtons: [(0.055, 0.04)],
+    safeArea: EdgeInsets.only(top: 24, bottom: 20),
+    keyboardHeight: 398,
+    rimColor: Color(0xFF8C8C91),
+    bezelColor: Color(0xFF090909),
+  );
+
   /// The first entry is what pages open on.
-  static const all = [iphone17ProMax, iphone14ProMax, iphone13, iphone12mini];
+  static const all = [
+    iphone17ProMax,
+    iphone14ProMax,
+    iphone13,
+    iphone12mini,
+    ipadPro11,
+  ];
   static const fallback = iphone13;
 
-  static PhoneSpec? byName(String? name) {
+  static DeviceSpec? byName(String? name) {
     for (final spec in all) {
       if (spec.name == name) return spec;
     }
@@ -197,7 +241,11 @@ class PhoneSpec {
   }
 }
 
-/// The device pages and renders ask for; read by [phoneMockupFrame].
+/// The old name remains source-compatible for existing catalogs.
+@Deprecated('Use DeviceSpec instead.')
+typedef PhoneSpec = DeviceSpec;
+
+/// The device pages and renders ask for; read by [deviceMockupFrame].
 class DeviceScope extends InheritedWidget {
   const DeviceScope({
     super.key,
@@ -207,7 +255,7 @@ class DeviceScope extends InheritedWidget {
     required super.child,
   });
 
-  final PhoneSpec spec;
+  final DeviceSpec spec;
 
   /// Whether mockups in this scope show the keyboard.
   final bool keyboard;
@@ -215,9 +263,9 @@ class DeviceScope extends InheritedWidget {
   /// Whether mockups in this scope paint the status bar.
   final bool statusBar;
 
-  static PhoneSpec of(BuildContext context) =>
+  static DeviceSpec of(BuildContext context) =>
       context.dependOnInheritedWidgetOfExactType<DeviceScope>()?.spec ??
-      PhoneSpec.fallback;
+      DeviceSpec.fallback;
 
   static bool keyboardOf(BuildContext context) =>
       context.dependOnInheritedWidgetOfExactType<DeviceScope>()?.keyboard ??
@@ -234,15 +282,13 @@ class DeviceScope extends InheritedWidget {
       old.statusBar != statusBar;
 }
 
-/// A phone around a screen-sized [child]: rim, bezel, side buttons, and the
-/// notch painted over the top of the content, which runs under it as on the
-/// device. Geometry comes from [spec]; [screenSize] overrides its screen
-/// size (a reference-scale render, say) keeping the proportions.
-class PhoneMockup extends StatelessWidget {
-  const PhoneMockup({
+/// A device around a screen-sized [child]. Geometry comes from [spec];
+/// [screenSize] overrides its screen size while keeping the proportions.
+class DeviceMockup extends StatelessWidget {
+  const DeviceMockup({
     super.key,
     required this.child,
-    this.spec = PhoneSpec.iphone13,
+    this.spec = DeviceSpec.iphone13,
     this.screenSize,
     this.keyboard = false,
     this.statusBar = false,
@@ -250,7 +296,7 @@ class PhoneMockup extends StatelessWidget {
   });
 
   final Widget child;
-  final PhoneSpec spec;
+  final DeviceSpec spec;
   final Size? screenSize;
 
   /// Paints the status bar (time, signal, Wi-Fi, battery) over the content
@@ -337,10 +383,14 @@ class PhoneMockup extends StatelessWidget {
   }
 }
 
+/// The old name remains source-compatible for existing catalogs.
+@Deprecated('Use DeviceMockup instead.')
+typedef PhoneMockup = DeviceMockup;
+
 class _BodyPainter extends CustomPainter {
   const _BodyPainter({required this.spec, required this.scale});
 
-  final PhoneSpec spec;
+  final DeviceSpec spec;
   final double scale;
 
   @override
@@ -384,6 +434,13 @@ class _BodyPainter extends CustomPainter {
       ),
       Paint()..color = spec.bezelColor,
     );
+    if (spec.bezelCameraDiameter > 0) {
+      canvas.drawCircle(
+        Offset(body.center.dx, spec.frame * s / 2),
+        spec.bezelCameraDiameter * s / 2,
+        Paint()..color = const Color(0xFF2E3238),
+      );
+    }
   }
 
   @override
@@ -403,7 +460,7 @@ class _OverlayPainter extends CustomPainter {
     required this.statusBarColor,
   });
 
-  final PhoneSpec spec;
+  final DeviceSpec spec;
   final double scale;
   final double logicalScale;
   final bool keyboard;
@@ -433,7 +490,7 @@ class _OverlayPainter extends CustomPainter {
         RRect.fromRectAndRadius(rect, Radius.circular(h / 2)),
         Paint()..color = spec.bezelColor,
       );
-    } else {
+    } else if (spec.hasCutout) {
       // Rounded bottom corners, concave fillets into the bezel at the top.
       final path = Path()
         ..moveTo(left - f, top)
@@ -521,9 +578,15 @@ class _OverlayPainter extends CustomPainter {
   ) {
     final k = logicalScale;
     final s = scale;
-    final centerY = screenTop + (spec.islandTop ?? 0) * s + cutHeight / 2;
-    final leftEar = (screenLeft, cutLeft);
-    final rightEar = (cutLeft + cutWidth, screenLeft + screenWidth);
+    final centerY = spec.hasCutout
+        ? screenTop + (spec.islandTop ?? 0) * s + cutHeight / 2
+        : screenTop + spec.safeArea.top * k / 2;
+    final leftCenter = spec.hasCutout
+        ? (screenLeft + cutLeft) / 2
+        : screenLeft + 54 * k;
+    final rightCenter = spec.hasCutout
+        ? (cutLeft + cutWidth + screenLeft + screenWidth) / 2
+        : screenLeft + screenWidth - 54 * k;
     final paint = Paint()..color = statusBarColor;
     // Time.
     final text = TextPainter(
@@ -540,14 +603,11 @@ class _OverlayPainter extends CustomPainter {
     )..layout();
     text.paint(
       canvas,
-      Offset(
-        (leftEar.$1 + leftEar.$2) / 2 - text.width / 2,
-        centerY - text.height / 2,
-      ),
+      Offset(leftCenter - text.width / 2, centerY - text.height / 2),
     );
     // Icons, 17 + 16 + 27 wide with 6 between, centered in the right ear.
     final total = (17 + 6 + 16 + 6 + 27) * k;
-    var x = (rightEar.$1 + rightEar.$2) / 2 - total / 2;
+    var x = rightCenter - total / 2;
     // Signal: four bars.
     for (var i = 0; i < 4; i++) {
       final barH = (4 + 2 * i) * k;

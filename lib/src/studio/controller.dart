@@ -396,7 +396,7 @@ class StudioController extends ChangeNotifier {
     return pages.isEmpty ? null : pages.first;
   }
 
-  PhoneSpec? get deviceSpec => PhoneSpec.byName(device);
+  DeviceSpec? get deviceSpec => DeviceSpec.byName(device);
 
   void log(String line) {
     logs.add(line);
@@ -1512,8 +1512,8 @@ class $className extends StatelessWidget {
     final known = _sizes[id];
     if (known != null) return known;
     if (selectedPage?.isLine == true) {
-      return PhoneMockup(
-        spec: deviceSpec ?? PhoneSpec.fallback,
+      return DeviceMockup(
+        spec: deviceSpec ?? DeviceSpec.fallback,
         child: const SizedBox.shrink(),
       ).size;
     }

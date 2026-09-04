@@ -91,7 +91,7 @@ class _MultiViewStoriesState extends State<_MultiViewStories>
     if (matches.isEmpty) {
       return Center(child: Text('unknown story: ${id ?? '<none>'}'));
     }
-    final device = PhoneSpec.byName(data?['device'] as String?);
+    final device = DeviceSpec.byName(data?['device'] as String?);
     final statusBar = data?['status'] == true;
     final knobs = {
       for (final entry in ((data?['knobs'] as Map?) ?? const {}).entries)
@@ -100,7 +100,7 @@ class _MultiViewStoriesState extends State<_MultiViewStories>
     Widget view = matches.first.builder();
     if (device != null || statusBar) {
       view = DeviceScope(
-        spec: device ?? PhoneSpec.fallback,
+        spec: device ?? DeviceSpec.fallback,
         statusBar: statusBar,
         child: view,
       );

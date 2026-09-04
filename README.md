@@ -28,7 +28,7 @@ flutter_static studio --project <dir>   # the macOS Studio
 Package split:
 
 - `packages/flutter_static_story`: pure Flutter story primitives and generic
-  composition widgets (`Story`, `Stories`, storylines, phone mockups,
+  composition widgets (`Story`, `Stories`, storylines, device mockups,
   specimens). App repositories can depend on this from their `story/` files
   without pulling in Studio/macOS plugin dependencies.
 - `flutter_static`: CLI, catalog server, Studio runtime and macOS tooling.

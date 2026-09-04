@@ -75,7 +75,7 @@ Story? findStory(Stories stories, String id) {
 /// choices, the way a page or a render shows it. Call from a build.
 Widget storyOnPage(
   Story story, {
-  PhoneSpec? device,
+  DeviceSpec? device,
   bool statusBar = false,
   Map<String, String> knobs = const {},
 }) => _onPage(
@@ -92,7 +92,7 @@ Widget storyOnPage(
 Future<Uint8List> renderStoryPng(
   Stories stories,
   String id, {
-  PhoneSpec? device,
+  DeviceSpec? device,
   bool statusBar = false,
   Map<String, String> knobs = const {},
   bool background = false,
@@ -112,7 +112,7 @@ Future<Uint8List> renderStoryPng(
 Future<ui.Image> renderStoryImage(
   Stories stories,
   String id, {
-  PhoneSpec? device,
+  DeviceSpec? device,
   bool statusBar = false,
   Map<String, String> knobs = const {},
   bool background = false,
@@ -140,7 +140,7 @@ const renderScale = 2.0;
 Future<Map<String, Object?>> inspectStory(
   Stories stories,
   String id, {
-  PhoneSpec? device,
+  DeviceSpec? device,
   bool statusBar = false,
   Map<String, String> knobs = const {},
   Offset? at,
@@ -1151,7 +1151,7 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
           final json = await inspectStory(
             stories,
             id,
-            device: PhoneSpec.byName(params['device']),
+            device: DeviceSpec.byName(params['device']),
             statusBar: params['status'] == '1',
             knobs: _knobsParam(request, _lineOf(stories, id)),
             at: tree ? null : Offset(x! / renderScale, y! / renderScale),
@@ -1191,7 +1191,7 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
           // and capture work is serialized behind _captureQueue.
           final story = _onPage(
             matches.first,
-            device: PhoneSpec.byName(request.uri.queryParameters['device']),
+            device: DeviceSpec.byName(request.uri.queryParameters['device']),
             statusBar: request.uri.queryParameters['status'] == '1',
             knobs: _knobsParam(request, _lineOf(stories, id)),
           );
@@ -1238,7 +1238,7 @@ Future<void> _handleRequest(HttpRequest request, Stories stories) async {
             _storyDetailPage(
               all,
               index,
-              device: PhoneSpec.byName(request.uri.queryParameters['device']),
+              device: DeviceSpec.byName(request.uri.queryParameters['device']),
               statusBar: request.uri.queryParameters['status'] == '1',
               showDevices: line != null,
               knobs: line?.knobs ?? const [],
@@ -1326,13 +1326,13 @@ bool _liveBuildExists() {
 /// cache per combination; a plain request gets the story itself.
 Story _onPage(
   Story story, {
-  PhoneSpec? device,
+  DeviceSpec? device,
   bool statusBar = false,
   Map<String, String> knobs = const {},
 }) {
   final onDevice = device != null || statusBar;
   if (!onDevice && knobs.isEmpty) return story;
-  final spec = device ?? PhoneSpec.fallback;
+  final spec = device ?? DeviceSpec.fallback;
   final id = StringBuffer(story.id);
   if (onDevice) id.write('@${spec.name}${statusBar ? '+status' : ''}');
   for (final entry in knobs.entries) {
@@ -1434,7 +1434,7 @@ String _deviceToolbar({
   Map<String, String> chosen = const {},
 }) {
   final buffer = StringBuffer('<div class="toolbar"><span>Enhet</span>');
-  final device = selected ?? PhoneSpec.all.first.name;
+  final device = selected ?? DeviceSpec.all.first.name;
   final current = {
     'device': device,
     if (statusBar) 'status': '1',
@@ -1453,7 +1453,7 @@ String _deviceToolbar({
     );
   }
 
-  for (final spec in PhoneSpec.all) {
+  for (final spec in DeviceSpec.all) {
     final cls = spec.name == device ? 'device on' : 'device';
     buffer.write(
       links
@@ -1874,7 +1874,7 @@ bool get _imagesPending =>
 String _storyDetailPage(
   List<Story> all,
   int index, {
-  PhoneSpec? device,
+  DeviceSpec? device,
   bool statusBar = false,
   bool showDevices = false,
   List<Knob<Object?>> knobs = const [],
@@ -2053,7 +2053,7 @@ String _galleryPage(
 /// A storyline: its rows of cells, each cell its variants stacked, all
 /// live (near the viewport) with the device toggle on top.
 String _linePage(Storyline line, {required bool liveBuild}) {
-  final device = PhoneSpec.all.first.name;
+  final device = DeviceSpec.all.first.name;
   final buffer = StringBuffer();
   for (final row in line.rows) {
     buffer.write('<h2>${_escape(row.title)}</h2><div class="grid">');
@@ -2302,8 +2302,7 @@ function hostFor(card) {
   const img = card.querySelector('img');
   const w = Math.round(img.naturalWidth / 2), h = Math.round(img.naturalHeight / 2);
   if (!w || !h) return null;
-  // Wide enough for a phone mockup (the 13's is 440) to stay 1:1, so
-  // devices keep their real size difference on the page.
+  // Phone mockups stay 1:1. Larger devices scale down to the same cap.
   const scale = Math.min(1, 460 / w);
   const box = document.createElement('div');
   box.className = 'media';

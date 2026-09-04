@@ -76,7 +76,7 @@ by `up` is stopped first; Studio serves the same port.
 Pages come from the same index the server publishes:
 
 - Each storyline is a page. Its rows become rows on the canvas, each cell
-  a column with its variants stacked under the cell's title, in a phone
+  a column with its variants stacked under the cell's title, in a device
   mockup as the row's frame builder decides.
 - Every other id prefix is a page: `buttons/*` is the "buttons" page with
   one card per story. Three-deep ids (`cards/list/empty`) group into rows

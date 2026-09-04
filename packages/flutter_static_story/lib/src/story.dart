@@ -13,24 +13,32 @@ class Story {
 /// Wraps a storyline variant in whatever should surround it on the page.
 typedef FrameBuilder = Widget Function(BuildContext context, Widget child);
 
-/// The default frame: the variant as a screen inside a [PhoneMockup] of
+/// The default frame: the variant as a screen inside a [DeviceMockup] of
 /// the device the page asked for ([DeviceScope]).
-Widget phoneMockupFrame(BuildContext context, Widget child) => PhoneMockup(
+Widget deviceMockupFrame(BuildContext context, Widget child) => DeviceMockup(
   spec: DeviceScope.of(context),
   keyboard: DeviceScope.keyboardOf(context),
   statusBar: DeviceScope.statusBarOf(context),
   child: child,
 );
 
+@Deprecated('Use deviceMockupFrame instead.')
+Widget phoneMockupFrame(BuildContext context, Widget child) =>
+    deviceMockupFrame(context, child);
+
 /// The default frame with the keyboard up, for a variant that shows a
 /// focused field. Use as a cell's frameBuilder.
-Widget phoneMockupKeyboardFrame(BuildContext context, Widget child) =>
-    PhoneMockup(
+Widget deviceMockupKeyboardFrame(BuildContext context, Widget child) =>
+    DeviceMockup(
       spec: DeviceScope.of(context),
       keyboard: true,
       statusBar: DeviceScope.statusBarOf(context),
       child: child,
     );
+
+@Deprecated('Use deviceMockupKeyboardFrame instead.')
+Widget phoneMockupKeyboardFrame(BuildContext context, Widget child) =>
+    deviceMockupKeyboardFrame(context, child);
 
 /// No frame: the variant at its own size, like a gallery card.
 Widget bareFrame(BuildContext _, Widget child) => child;
@@ -75,13 +83,13 @@ class StorylineRow {
   const StorylineRow(
     this.title, {
     required this.cells,
-    this.frameBuilder = phoneMockupFrame,
+    this.frameBuilder = deviceMockupFrame,
   });
 
   final String title;
   final List<Cell> cells;
 
-  /// Applied to every variant in the row; [phoneMockupFrame] unless told
+  /// Applied to every variant in the row; [deviceMockupFrame] unless told
   /// otherwise, [bareFrame] for widgets shown as they are.
   final FrameBuilder frameBuilder;
 }

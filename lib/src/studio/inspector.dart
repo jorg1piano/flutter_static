@@ -58,9 +58,9 @@ class _StoryInspector extends StatelessWidget {
             const SectionLabel('Device'),
             StudioChips<String?>(
               options: [
-                for (final spec in PhoneSpec.all) (spec.name, spec.label),
+                for (final spec in DeviceSpec.all) (spec.name, spec.label),
               ],
-              selected: controller.device ?? PhoneSpec.fallback.name,
+              selected: controller.device ?? DeviceSpec.fallback.name,
               onSelect: controller.setDevice,
             ),
             const SizedBox(height: 8),

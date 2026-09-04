@@ -8,3 +8,13 @@ runner, or Flutter plugin dependencies beyond Flutter itself.
 
 Use this when you want app-specific stories to live beside app source code while
 keeping the standalone macOS Studio/tooling independent of the app.
+
+Storyline device controls include `DeviceSpec.ipadPro11`. A standalone iPad
+frame uses the same renderer:
+
+```dart
+DeviceMockup(
+  spec: DeviceSpec.ipadPro11,
+  child: MyTabletScreen(),
+)
+```
